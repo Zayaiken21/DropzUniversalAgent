@@ -1,0 +1,331 @@
+.stApp {
+    background: linear-gradient(135deg, #081a28 0%, #0a507a 50%, #19c8d1 100%);
+    color: #f2fbff !important;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.7;
+    font-size: clamp(16px, 2vw, 19px) !important;
+}
+
+html, body, [class*="css"] {
+    color: #f2fbff !important;
+    background: transparent !important;
+    line-height: 1.7;
+    font-size: clamp(16px, 2vw, 19px) !important;
+}
+
+main {
+    padding-top: 0.1rem !important;
+}
+
+.block-container {
+    padding-top: 0.35rem !important;
+    padding-bottom: 0.65rem !important;
+    max-width: 1280px !important;
+}
+
+header {
+    background: rgba(8, 26, 40, 0.95) !important;
+    color: #f2fbff !important;
+    border-bottom: 1px solid rgba(255,255,255,0.10) !important;
+}
+
+[data-testid="stHeaderBar"] {
+    background: rgba(8, 26, 40, 0.95) !important;
+}
+
+[data-testid="stSidebarCloseButton"] svg path {
+    fill: #dff8ff !important;
+    stroke: #dff8ff !important;
+}
+
+.centered-content {
+    text-align: center !important;
+}
+
+h1 {
+    color: #fbfeff !important;
+    font-weight: 800 !important;
+    font-size: clamp(2.4rem, 5.8vw, 3.7rem) !important;
+    line-height: 1.05 !important;
+    margin-bottom: 0.2rem !important;
+    text-align: center !important;
+    text-shadow: 2px 2px 8px rgba(0,0,0,0.22) !important;
+}
+
+h2 {
+    color: #e0f7ff !important;
+    font-weight: 800 !important;
+    font-size: clamp(1.9rem, 4.5vw, 2.8rem) !important;
+    line-height: 1.08 !important;
+    margin-bottom: 0.55rem !important;
+    text-align: center !important;
+    text-shadow: 2px 2px 10px rgba(144, 238, 255, 0.28) !important;
+}
+
+h3 {
+    color: #e0f7ff !important;
+    font-weight: 700 !important;
+    font-size: clamp(1.25rem, 3vw, 1.7rem) !important;
+    line-height: 1.2 !important;
+    text-align: center !important;
+}
+
+p, li, label, span, div, a {
+    color: #f1faff !important;
+    line-height: 1.7;
+    font-size: clamp(15px, 2vw, 18px) !important;
+}
+
+.brand-card,
+.glass-card {
+    background: rgba(255,255,255,0.10) !important;
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+    border: 1px solid rgba(255,255,255,0.16);
+    border-radius: 22px;
+    padding: 1.05rem 1.25rem;
+    box-shadow: 0 18px 40px rgba(0,0,0,0.18);
+    text-align: center;
+    margin-bottom: 0.7rem;
+    margin-top: 0.05rem;
+    overflow: hidden;
+    box-sizing: border-box;
+}
+
+.brand-card h1,
+.glass-card h1 {
+    margin-top: 0.05rem !important;
+    margin-bottom: 0.25rem !important;
+}
+
+.brand-card h2,
+.glass-card h2,
+.brand-card h3,
+.glass-card h3 {
+    margin-top: 0.08rem !important;
+    margin-bottom: 0.35rem !important;
+}
+
+.section-title {
+    color: #e0f7ff !important;
+    font-weight: 800 !important;
+    font-size: clamp(1.9rem, 4.5vw, 2.8rem) !important;
+    text-align: center !important;
+    margin-bottom: 0.7rem !important;
+    text-shadow: 2px 2px 10px rgba(144, 238, 255, 0.28) !important;
+}
+
+.muted {
+    color: rgba(245, 251, 255, 0.92) !important;
+    font-size: clamp(15px, 2vw, 18px) !important;
+}
+
+.stButton button,
+.stFormSubmitButton > button {
+    background: linear-gradient(90deg, #00d4ff, #0099cc) !important;
+    color: #ffffff !important;
+    border: 1px solid rgba(255,255,255,0.55) !important;
+    border-radius: 12px !important;
+    padding: 0.44rem 0.95rem !important;
+    font-weight: 700 !important;
+    font-size: 15px !important;
+    min-height: 40px !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    text-shadow: 1px 1px 3px rgba(0,0,0,0.35) !important;
+    box-shadow: 0 6px 16px rgba(0, 153, 204, 0.18) !important;
+}
+
+.stButton button:hover,
+.stFormSubmitButton > button:hover {
+    filter: brightness(1.08);
+    box-shadow: 0 8px 24px rgba(0, 212, 255, 0.28) !important;
+}
+
+.stFormSubmitButton {
+    display: flex !important;
+    justify-content: flex-start !important;
+    align-items: center !important;
+    margin-top: 0.25rem !important;
+    margin-left: 0 !important;
+    padding-left: 0 !important;
+    margin-right: 0 !important;
+    transform: none !important;
+}
+
+.stFormSubmitButton > button {
+    margin: 0 !important;
+    width: 100% !important;
+}
+
+.stFormSubmitButton > button p {
+    color: #ffffff !important;
+    font-size: 15px !important;
+    font-weight: 700 !important;
+    margin: 0 !important;
+}
+
+input[type="password"],
+input[type="text"],
+textarea {
+    border-radius: 12px !important;
+    font-size: 15px !important;
+    background: rgba(255, 255, 255, 0.08) !important;
+    border: 1px solid rgba(255,255,255,0.22) !important;
+    color: #2ab6b6 !important;
+    text-align: left;
+    padding: 0.55rem 0.8rem !important;
+    font-weight: 600 !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+    outline: none !important;
+}
+
+input::placeholder,
+textarea::placeholder {
+    color: rgb(42 182 182) !important;
+}
+
+.stTextInput div[data-baseweb="input"],
+.stTextArea div[data-baseweb="base-input"] {
+    border: 1px solid rgb(42 182 182) !important;
+    border-radius: 12px !important;
+}
+
+.stRadio label,
+.stSelectbox label,
+.stTextInput label,
+.stForm label,
+[data-testid="stSidebar"] label {
+    font-size: 15px !important;
+    font-weight: 700 !important;
+    color: #e0f7ff !important;
+}
+
+.help,
+.stHelp,
+[data-testid="stTooltipIcon"],
+button[aria-label*="help"],
+button[title*="help"] {
+    color: #ffffff !important;
+    opacity: 1 !important;
+    fill: rgb(206 221 224 / 0.28) !important;
+    background: transparent !important;
+}
+
+[data-testid="stTooltipIcon"] {
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    width: 1.15rem !important;
+    height: 1.15rem !important;
+    border-radius: 50% !important;
+    background: rgba(0, 212, 255, 0.16) !important;
+    border: 1px solid rgba(223, 248, 255, 0.55) !important;
+    color: #dff8ff !important;
+    font-size: 0.85rem !important;
+    line-height: 1 !important;
+}
+
+[data-testid="stTooltipIcon"] svg,
+button[aria-label*="help"] svg,
+button[title*="help"] svg {
+    fill: rgb(255 255 255) !important;
+    stroke: rgb(250 248 248 / 0.55) !important;
+}
+
+[data-baseweb="popover"] {
+    background: rgba(8, 26, 40, 0.98) !important;
+    color: #9feeff !important;
+    border: 1px solid rgba(255,255,255,0.18) !important;
+}
+
+[data-baseweb="popover"] *,
+[data-baseweb="tooltip"] * {
+    color: #9feeff !important;
+    background: transparent !important;
+}
+
+[data-baseweb="tooltip"] {
+    background: rgba(8, 26, 40, 0.98) !important;
+    color: #9feeff !important;
+    border: 1px solid rgba(255,255,255,0.18) !important;
+}
+
+input[type="checkbox"] {
+    background: rgba(0, 212, 255, 0.3) !important;
+    border: 2px solid #2ab6b6 !important;
+    accent-color: #00d4ff !important;
+}
+
+.stCheckbox label {
+    color: #e0f7ff !important;
+    font-weight: 700 !important;
+}
+
+.stCode {
+    background: rgba(0, 0, 0, 0.6) !important;
+    border: 1px solid rgb(206 221 224 / 0.28) !important;
+    border-radius: 12px !important;
+}
+
+.stCode code {
+    color: #00ffcc !important;
+    background: transparent !important;
+}
+
+[data-testid="stSidebar"] .stRadio {
+    margin-top: 1rem !important;
+    margin-bottom: 1rem !important;
+}
+
+[data-testid="stSidebar"] * {
+    color: #f6fcff !important;
+    font-size: 15px !important;
+}
+
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, rgba(6, 24, 37, 0.98), rgba(10, 73, 106, 0.96)) !important;
+    border-right: 1px solid rgba(255,255,255,0.12) !important;
+    overflow-y: auto !important;
+}
+
+[data-testid="stSidebar"] section {
+    background: transparent !important;
+}
+
+.stAlert, .stError, .stSuccess, .stWarning {
+    background: rgba(0, 0, 0, 0.45) !important;
+    border: 1px solid rgba(255,255,255,0.22) !important;
+    color: #ffffff !important;
+}
+
+.top-menu-wrap {
+    position: sticky;
+    top: 0;
+    z-index: 70;
+    background: rgba(8, 26, 40, 0.95);
+    backdrop-filter: blur(18px);
+    padding: 0.25rem 0 0.3rem 0;
+    border-bottom: 1px solid rgba(255,255,255,0.10);
+}
+
+.top-menu-bar {
+    display: grid;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+    gap: 0.45rem;
+    margin: 0.35rem 0 0.55rem 0;
+    width: 100%;
+}
+
+.top-menu-bar button {
+    width: 100% !important;
+    min-height: 42px !important;
+    border-radius: 14px !important;
+    font-size: 0.92rem !important;
+    white-space: nowrap !important;
+}
