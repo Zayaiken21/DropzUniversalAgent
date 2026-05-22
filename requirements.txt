@@ -14,6 +14,7 @@ emoji
 watchdog
 plotly
 altair
+aiortc
 markdown-it-py
 loguru
 httptools

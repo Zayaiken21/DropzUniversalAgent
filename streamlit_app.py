@@ -1,24 +1,14 @@
 import sys
 import time
 from pathlib import Path
+
 import streamlit as st
 
-ROOT_DIR = Path(__file__).resolve().parent
-FRONTEND_DIR = ROOT_DIR / "frontend"
+ROOT_DIR = Path(__file__).parent
 if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
+    sys.path.append(str(ROOT_DIR))
 
 from frontend.style_loader import load_theme_css
-from frontend.database import (
-    validate_ceo_password,
-    validate_token,
-    get_all_client_tokens,
-    cancel_token,
-    delete_user_by_token,
-    cancel_all_client_tokens,
-    generate_client_token,
-    get_active_token_count,
-)
 from frontend.login_page import render_frontend_login_page
 from frontend.dashboard_page import render_frontend_dashboard_page
 from frontend.accounts_page import render_frontend_accounts_page
@@ -36,11 +26,35 @@ st.set_page_config(
     menu_items=None,
 )
 
-def frontend_database():
-    pass
-
-frontend_database()
 load_theme_css()
+
+st.markdown(
+    """
+    <style>
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    .stApp {
+        font-size: clamp(13px, 1.6vw, 18px) !important;
+    }
+    html, body, [class*="css"] {
+        font-size: clamp(13px, 1.6vw, 18px) !important;
+    }
+    .block-container {
+        padding-top: 0.35rem !important;
+        padding-bottom: 0.6rem !important;
+        max-width: 100% !important;
+    }
+    @media (max-width: 768px) {
+        .block-container {
+            padding-left: 0.45rem !important;
+            padding-right: 0.45rem !important;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
@@ -67,7 +81,7 @@ if not st.session_state.authenticated:
     render_frontend_login_page()
 else:
     st.markdown(
-        '<div class="brand-card centered-content" style="max-width: 1100px; margin: 0.35rem auto 0.45rem;">',
+        '<div class="brand-card centered-content" style="max-width: 1100px; margin: 0.2rem auto 0.35rem;">',
         unsafe_allow_html=True
     )
     st.markdown('<h1>⚡ Dropz Universal Agent</h1>', unsafe_allow_html=True)
@@ -88,6 +102,7 @@ else:
                     st.rerun()
                 else:
                     _go(label.lower())
+
     st.markdown('</div>', unsafe_allow_html=True)
 
     role = st.session_state.user["role"] if st.session_state.user else "client"

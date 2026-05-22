@@ -329,3 +329,90 @@ input[type="checkbox"] {
     font-size: 0.92rem !important;
     white-space: nowrap !important;
 }
+
+/* =========================
+GLOBAL RESPONSIVE FIXES
+========================= */
+
+* {
+    box-sizing: border-box !important;
+}
+
+html,
+body,
+.stApp {
+    overflow-x: hidden !important;
+    width: 100% !important;
+}
+
+img,
+video,
+canvas {
+    max-width: 100% !important;
+    height: auto !important;
+}
+
+h1,
+h2,
+h3,
+.section-title,
+.dashboard-title {
+    text-align: center !important;
+    width: 100%;
+}
+
+/* Prevent giant overflow on mobile */
+.element-container,
+.stMarkdown,
+.stDataFrame,
+.stTable {
+    max-width: 100% !important;
+}
+
+/* Better touch scrolling */
+* {
+    -webkit-overflow-scrolling: touch;
+}
+
+/* Copy/Paste Support */
+input,
+textarea,
+[contenteditable="true"] {
+    user-select: text !important;
+    -webkit-user-select: text !important;
+}
+
+/* Enter Key Support */
+textarea {
+    resize: none !important;
+}
+
+/* Mobile scaling */
+@media (max-width: 768px) {
+
+    .block-container {
+        padding-left: 0.65rem !important;
+        padding-right: 0.65rem !important;
+    }
+
+    h1 {
+        font-size: clamp(2rem, 7vw, 2.8rem) !important;
+    }
+
+    h2 {
+        font-size: clamp(1.55rem, 5vw, 2.2rem) !important;
+    }
+
+    h3 {
+        font-size: clamp(1.05rem, 4vw, 1.45rem) !important;
+    }
+
+    .top-menu-wrap {
+        overflow-x: auto !important;
+    }
+
+    .stButton button {
+        min-height: 42px !important;
+        font-size: 14px !important;
+    }
+}
