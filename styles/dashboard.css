@@ -1,0 +1,59 @@
+html, body, [class*="css"] {
+    background: #0B0F19;
+    color: white;
+    font-family: Inter, sans-serif;
+}
+
+.dashboard-header {
+    margin-bottom: 24px;
+}
+
+.glass-card {
+    background: rgba(18, 22, 34, 0.72);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 18px;
+    padding: 20px;
+    backdrop-filter: blur(14px);
+    box-shadow: 0 0 30px rgba(0,255,163,0.05);
+}
+
+.kpi-card {
+    background: linear-gradient(
+        145deg,
+        rgba(18,22,34,0.95),
+        rgba(28,32,48,0.95)
+    );
+
+    border-radius: 18px;
+    padding: 20px;
+    min-height: 140px;
+
+    border: 1px solid rgba(255,255,255,0.06);
+
+    transition: all 0.25s ease;
+}
+
+.kpi-card:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 0 25px rgba(0,255,163,0.12);
+}
+
+.kpi-title {
+    opacity: 0.7;
+    font-size: 14px;
+}
+
+.kpi-value {
+    font-size: 36px;
+    font-weight: 700;
+    margin-top: 12px;
+}
+
+.section-space {
+    height: 24px;
+}
+
+.activity-item {
+    padding: 12px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+}

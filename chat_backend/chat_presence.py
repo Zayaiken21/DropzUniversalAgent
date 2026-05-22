@@ -1,4 +1,4 @@
-from .chat_db import set_user_online, get_online_users
+from chat_backend.chat_db import set_user_online, get_online_users
 
 def mark_join(username):
     set_user_online(username, 1)

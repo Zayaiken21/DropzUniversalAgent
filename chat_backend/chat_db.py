@@ -1,204 +1,154 @@
 import sqlite3
 from pathlib import Path
-from frontend.config import BASE_DIR
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 
-CHAT_DB_DIR = BASE_DIR / "chat_backend"
-CHAT_DB_PATH = CHAT_DB_DIR / "chat.db"
+DB_PATH = Path("dropz.db")
 
-def get_chat_connection():
-    CHAT_DB_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(CHAT_DB_PATH)
+def _conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
     return conn
 
+@contextmanager
+def get_db():
+    conn = _conn()
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
 def init_db():
-    conn = get_chat_connection()
-    c = conn.cursor()
+    with get_db() as db:
+        db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_name TEXT UNIQUE NOT NULL,
+            role TEXT DEFAULT 'client',
+            muted INTEGER DEFAULT 0,
+            active INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
+        db.execute("""
+        CREATE TABLE IF NOT EXISTS user_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_name TEXT UNIQUE NOT NULL,
+            token TEXT NOT NULL,
+            token_type TEXT DEFAULT 'client',
+            active INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
+        db.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            room_id TEXT NOT NULL,
+            user_name TEXT NOT NULL,
+            role TEXT DEFAULT 'client',
+            message TEXT,
+            media_path TEXT,
+            media_type TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
+        db.execute("""
+        CREATE TABLE IF NOT EXISTS presence (
+            user_name TEXT PRIMARY KEY,
+            role TEXT DEFAULT 'client',
+            status TEXT DEFAULT 'active',
+            muted INTEGER DEFAULT 0,
+            in_call INTEGER DEFAULT 0,
+            speaking INTEGER DEFAULT 0,
+            screen_sharing INTEGER DEFAULT 0,
+            last_seen TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
 
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS chat_users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL UNIQUE,
-        role TEXT NOT NULL,
-        active INTEGER DEFAULT 1,
-        in_chat INTEGER DEFAULT 0,
-        muted INTEGER DEFAULT 0,
-        status TEXT DEFAULT 'active',
-        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
+def upsert_user(user_name, role):
+    with get_db() as db:
+        db.execute("""
+        INSERT INTO users(user_name, role, updated_at)
+        VALUES(?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(user_name) DO UPDATE SET
+            role=excluded.role,
+            updated_at=CURRENT_TIMESTAMP
+        """, (user_name, role))
+        db.execute("""
+        INSERT INTO presence(user_name, role, status, last_seen)
+        VALUES(?, ?, 'active', CURRENT_TIMESTAMP)
+        ON CONFLICT(user_name) DO UPDATE SET
+            role=excluded.role,
+            status='active',
+            last_seen=CURRENT_TIMESTAMP
+        """, (user_name, role))
 
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS chat_messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        room_id TEXT DEFAULT 'main',
-        user_name TEXT NOT NULL,
-        role TEXT NOT NULL,
-        message TEXT,
-        media_path TEXT,
-        media_type TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
+def set_user_presence(user_name, active=1, status="active", muted=0, in_call=0, speaking=0, screen_sharing=0):
+    with get_db() as db:
+        db.execute("""
+        INSERT INTO presence(user_name, status, muted, in_call, speaking, screen_sharing, last_seen)
+        VALUES(?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(user_name) DO UPDATE SET
+            status=excluded.status,
+            muted=excluded.muted,
+            in_call=excluded.in_call,
+            speaking=excluded.speaking,
+            screen_sharing=excluded.screen_sharing,
+            last_seen=CURRENT_TIMESTAMP
+        """, (user_name, status, muted, in_call, speaking, screen_sharing))
 
-    conn.commit()
-    conn.close()
-    migrate_schema()
+def mark_user_offline(user_name):
+    with get_db() as db:
+        db.execute("UPDATE presence SET status='offline', last_seen=CURRENT_TIMESTAMP WHERE user_name=?", (user_name,))
 
-def migrate_schema():
-    conn = get_chat_connection()
-    c = conn.cursor()
+def set_user_muted(user_name, muted):
+    with get_db() as db:
+        db.execute("UPDATE users SET muted=?, updated_at=CURRENT_TIMESTAMP WHERE user_name=?", (muted, user_name))
+        db.execute("UPDATE presence SET muted=?, last_seen=CURRENT_TIMESTAMP WHERE user_name=?", (muted, user_name))
 
-    c.execute("PRAGMA table_info(chat_users)")
-    user_cols = {r["name"] for r in c.fetchall()}
-    user_alters = [
-        ("in_chat", "ALTER TABLE chat_users ADD COLUMN in_chat INTEGER DEFAULT 0"),
-        ("muted", "ALTER TABLE chat_users ADD COLUMN muted INTEGER DEFAULT 0"),
-        ("status", "ALTER TABLE chat_users ADD COLUMN status TEXT DEFAULT 'active'"),
-        ("last_seen", "ALTER TABLE chat_users ADD COLUMN last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
-    ]
-    for col, ddl in user_alters:
-        if col not in user_cols:
-            c.execute(ddl)
-
-    c.execute("PRAGMA table_info(chat_messages)")
-    msg_cols = {r["name"] for r in c.fetchall()}
-    msg_alters = [
-        ("room_id", "ALTER TABLE chat_messages ADD COLUMN room_id TEXT DEFAULT 'main'"),
-        ("media_path", "ALTER TABLE chat_messages ADD COLUMN media_path TEXT"),
-        ("media_type", "ALTER TABLE chat_messages ADD COLUMN media_type TEXT"),
-        ("created_at", "ALTER TABLE chat_messages ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
-    ]
-    for col, ddl in msg_alters:
-        if col not in msg_cols:
-            c.execute(ddl)
-
-    conn.commit()
-    conn.close()
-
-def upsert_user(name, role="client"):
-    migrate_schema()
-    conn = get_chat_connection()
-    c = conn.cursor()
-    c.execute("SELECT id FROM chat_users WHERE name = ?", (name,))
-    row = c.fetchone()
-    if row:
-        c.execute(
-            "UPDATE chat_users SET role = ?, active = 1, in_chat = 1, status = 'active', last_seen = CURRENT_TIMESTAMP WHERE name = ?",
-            (role, name),
-        )
-    else:
-        c.execute(
-            "INSERT INTO chat_users (name, role, active, in_chat, status) VALUES (?, ?, 1, 1, 'active')",
-            (name, role),
-        )
-    conn.commit()
-    conn.close()
-
-def set_user_presence(name, in_chat=1, status="active"):
-    migrate_schema()
-    conn = get_chat_connection()
-    c = conn.cursor()
-    c.execute(
-        "UPDATE chat_users SET in_chat = ?, status = ?, last_seen = CURRENT_TIMESTAMP WHERE name = ?",
-        (in_chat, status, name),
-    )
-    conn.commit()
-    conn.close()
-
-def set_user_muted(name, muted=0):
-    migrate_schema()
-    conn = get_chat_connection()
-    c = conn.cursor()
-    c.execute("UPDATE chat_users SET muted = ? WHERE name = ?", (muted, name))
-    conn.commit()
-    conn.close()
-
-def cleanup_inactive(minutes=2):
-    migrate_schema()
-    conn = get_chat_connection()
-    c = conn.cursor()
-    c.execute(
-        """
-        UPDATE chat_users
-        SET active = 0, in_chat = 0, status = 'idle'
-        WHERE last_seen < datetime('now', ?)
-        """,
-        (f"-{minutes} minutes",),
-    )
-    conn.commit()
-    conn.close()
-
-def add_message(user_name, role, message=None, media_path=None, media_type=None, room_id="main"):
-    migrate_schema()
-    conn = get_chat_connection()
-    c = conn.cursor()
-    message = message if message is not None else ""
-    c.execute(
-        """
-        INSERT INTO chat_messages (room_id, user_name, role, message, media_path, media_type)
+def add_message(user_name, role, message, media_path=None, media_type=None, room_id="main"):
+    with get_db() as db:
+        db.execute("""
+        INSERT INTO messages(room_id, user_name, role, message, media_path, media_type)
         VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (room_id, user_name, role, message, media_path, media_type),
-    )
-    conn.commit()
-    conn.close()
+        """, (room_id, user_name, role, message, media_path, media_type))
 
 def get_messages(room_id="main", limit=300):
-    migrate_schema()
-    conn = get_chat_connection()
-    c = conn.cursor()
-    c.execute(
-        """
-        SELECT * FROM chat_messages
-        WHERE room_id = ?
-        ORDER BY id ASC
+    with get_db() as db:
+        rows = db.execute("""
+        SELECT * FROM messages
+        WHERE room_id=?
+        ORDER BY id DESC
         LIMIT ?
-        """,
-        (room_id, limit),
-    )
-    rows = c.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+        """, (room_id, limit)).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+def prune_messages(keep=2000):
+    with get_db() as db:
+        db.execute("""
+        DELETE FROM messages
+        WHERE id NOT IN (
+            SELECT id FROM messages ORDER BY id DESC LIMIT ?
+        )
+        """, (keep,))
+
+def cleanup_inactive(minutes=1):
+    cutoff = (datetime.utcnow() - timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
+    with get_db() as db:
+        db.execute("UPDATE presence SET status='offline' WHERE last_seen < ?", (cutoff,))
 
 def get_active_users():
-    migrate_schema()
-    conn = get_chat_connection()
-    c = conn.cursor()
-    c.execute(
-        """
-        SELECT name, role, active, in_chat, muted, status, last_seen
-        FROM chat_users
-        WHERE active = 1
-        ORDER BY CASE status WHEN 'speaking' THEN 0 WHEN 'active' THEN 1 WHEN 'idle' THEN 2 ELSE 3 END, last_seen DESC
-        """
-    )
-    rows = c.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    with get_db() as db:
+        rows = db.execute("""
+        SELECT user_name as name, role, status, muted, in_call, speaking, screen_sharing, last_seen
+        FROM presence
+        WHERE status != 'offline'
+        ORDER BY last_seen DESC
+        """).fetchall()
+        return [dict(r) for r in rows]
 
 def get_online_count():
-    migrate_schema()
-    conn = get_chat_connection()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM chat_users WHERE active = 1")
-    count = c.fetchone()[0]
-    conn.close()
-    return count
-
-def prune_messages(keep=1000):
-    migrate_schema()
-    conn = get_chat_connection()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM chat_messages")
-    total = c.fetchone()[0]
-    if total > keep:
-        cutoff = total - keep
-        c.execute(
-            "DELETE FROM chat_messages WHERE id IN (SELECT id FROM chat_messages ORDER BY id ASC LIMIT ?)",
-            (cutoff,),
-        )
-    conn.commit()
-    conn.close()
-
-init_db()
+    with get_db() as db:
+        row = db.execute("SELECT COUNT(*) AS c FROM presence WHERE status != 'offline'").fetchone()
+        return row["c"] if row else 0
