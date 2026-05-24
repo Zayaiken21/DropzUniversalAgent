@@ -15,7 +15,6 @@ from chat_backend.chat_db import (
     init_db,
     upsert_user,
     set_user_presence,
-    mark_user_offline,
     set_user_muted,
     add_message,
     get_messages,
@@ -59,16 +58,46 @@ def _media_html(msg):
     path = Path(media_path)
     filename = escape(path.name)
 
-    if media_type.startswith("image/") and path.exists():
-        try:
-            encoded = base64.b64encode(path.read_bytes()).decode("utf-8")
-            return f"""
-            <div class="media-card">
-                <img src="data:{media_type};base64,{encoded}" alt="{filename}" />
-            </div>
-            """
-        except Exception:
-            pass
+    if not path.exists():
+        return f"""
+        <div class="attachment-chip">
+            📎 {filename}
+        </div>
+        """
+
+    try:
+        encoded = base64.b64encode(path.read_bytes()).decode("utf-8")
+    except Exception:
+        return f"""
+        <div class="attachment-chip">
+            📎 {filename}
+        </div>
+        """
+
+    if media_type.startswith("image/"):
+        return f"""
+        <div class="media-card">
+            <img src="data:{media_type};base64,{encoded}" alt="{filename}" />
+
+            <a class="download-link" download="{filename}" href="data:{media_type};base64,{encoded}">
+                Download photo
+            </a>
+        </div>
+        """
+
+    if media_type.startswith("video/"):
+        return f"""
+        <div class="media-card">
+            <video controls playsinline preload="metadata">
+                <source src="data:{media_type};base64,{encoded}" type="{media_type}">
+                Your browser does not support video playback.
+            </video>
+
+            <a class="download-link" download="{filename}" href="data:{media_type};base64,{encoded}">
+                Download video
+            </a>
+        </div>
+        """
 
     return f"""
     <div class="attachment-chip">
@@ -82,7 +111,6 @@ def _build_chat_html(messages, current_user):
 
     for msg in messages[-140:]:
         is_me = msg.get("user_name") == current_user
-
         side_class = "is-me" if is_me else "is-other"
 
         user_name = escape(str(msg.get("user_name", "User")))
@@ -170,10 +198,7 @@ def _build_chat_html(messages, current_user):
                 margin-bottom: 12px;
             }}
 
-            .msg-row.is-me {{
-                justify-content: flex-end;
-            }}
-
+            .msg-row.is-me,
             .msg-row.is-other {{
                 justify-content: flex-start;
             }}
@@ -184,25 +209,22 @@ def _build_chat_html(messages, current_user):
                 padding: 12px 14px;
                 border-radius: 18px;
                 color: #f2fbff;
-                background: rgba(255,255,255,0.10);
-                border: 1px solid rgba(255,255,255,0.12);
-                box-shadow: 0 10px 28px rgba(0,0,0,0.16);
-                box-sizing: border-box;
-            }}
-
-            .is-me .msg-bubble {{
+                text-align: left;
                 background:
                     linear-gradient(
                         135deg,
-                        rgba(0,212,255,0.30),
-                        rgba(0,153,204,0.36)
+                        rgba(0,212,255,0.24),
+                        rgba(0,153,204,0.30)
                     );
-                border-color: rgba(0,212,255,0.30);
+                border: 1px solid rgba(0,212,255,0.24);
+                box-shadow: 0 10px 28px rgba(0,0,0,0.16);
+                box-sizing: border-box;
             }}
 
             .msg-meta {{
                 display: flex;
                 align-items: center;
+                justify-content: flex-start;
                 gap: 8px;
                 flex-wrap: wrap;
                 margin-bottom: 6px;
@@ -233,6 +255,7 @@ def _build_chat_html(messages, current_user):
                 line-height: 1.45;
                 color: #f7fdff;
                 word-break: break-word;
+                text-align: left;
             }}
 
             .media-card {{
@@ -241,13 +264,36 @@ def _build_chat_html(messages, current_user):
                 overflow: hidden;
                 border: 1px solid rgba(255,255,255,0.12);
                 background: rgba(0,0,0,0.18);
+                padding: 8px;
             }}
 
             .media-card img {{
                 display: block;
                 max-width: 100%;
-                max-height: 260px;
+                max-height: 280px;
                 object-fit: contain;
+                border-radius: 12px;
+            }}
+
+            .media-card video {{
+                display: block;
+                width: 100%;
+                max-height: 280px;
+                border-radius: 12px;
+                background: rgba(0,0,0,0.35);
+            }}
+
+            .download-link {{
+                display: inline-flex;
+                margin: 10px 0 2px 0;
+                padding: 7px 11px;
+                border-radius: 999px;
+                background: rgba(0,0,0,0.24);
+                color: #ffffff;
+                font-size: 12px;
+                font-weight: 800;
+                text-decoration: none;
+                border: 1px solid rgba(255,255,255,0.14);
             }}
 
             .attachment-chip {{
