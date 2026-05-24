@@ -15,6 +15,7 @@ from chat_backend.chat_db import (
     init_db,
     upsert_user,
     set_user_presence,
+    mark_user_offline,
     set_user_muted,
     add_message,
     get_messages,
@@ -23,6 +24,9 @@ from chat_backend.chat_db import (
     get_active_users,
     get_online_count,
 )
+
+
+MAX_EMBED_MB = 35
 
 
 def _save_upload(upload):
@@ -48,6 +52,13 @@ def _status_icon(member):
     return "🟢"
 
 
+def _file_size_mb(path):
+    try:
+        return Path(path).stat().st_size / (1024 * 1024)
+    except Exception:
+        return 0
+
+
 def _media_html(msg):
     media_path = msg.get("media_path")
     media_type = (msg.get("media_type") or "").lower()
@@ -62,6 +73,19 @@ def _media_html(msg):
         return f"""
         <div class="attachment-chip">
             📎 {filename}
+        </div>
+        """
+
+    size_mb = _file_size_mb(path)
+
+    if size_mb > MAX_EMBED_MB:
+        return f"""
+        <div class="attachment-chip">
+            📎 {filename} · {size_mb:.1f} MB
+        </div>
+
+        <div class="attachment-note">
+            Preview disabled for large files to prevent Streamlit’s 200MB message limit.
         </div>
         """
 
@@ -307,6 +331,13 @@ def _build_chat_html(messages, current_user):
                 font-size: 12px;
                 border: 1px solid rgba(255,255,255,0.12);
                 word-break: break-word;
+            }}
+
+            .attachment-note {{
+                margin-top: 7px;
+                color: rgba(255,255,255,0.68);
+                font-size: 11px;
+                line-height: 1.35;
             }}
 
             .jump-btn {{
