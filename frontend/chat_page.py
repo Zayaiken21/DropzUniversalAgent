@@ -26,7 +26,8 @@ from chat_backend.chat_db import (
 )
 
 
-MAX_EMBED_MB = 25
+MAX_EMBED_MB = 8
+MAX_VISIBLE_MESSAGES = 60
 
 
 def _save_upload(upload):
@@ -74,18 +75,23 @@ def _media_html(msg):
         <div class="attachment-chip">
             📎 {filename}
         </div>
+        <div class="attachment-note">
+            File is no longer available on this device.
+        </div>
         """
 
     size_mb = _file_size_mb(path)
 
+    # CRITICAL FIX:
+    # Never base64 embed large files inside components.html.
+    # This prevents Streamlit MessageSizeError.
     if size_mb > MAX_EMBED_MB:
         return f"""
         <div class="attachment-chip">
             📎 {filename} · {size_mb:.1f} MB
         </div>
-
         <div class="attachment-note">
-            Preview/download disabled for this large file to prevent Streamlit’s 200MB message limit.
+            Large file preview disabled to protect app performance.
         </div>
         """
 
@@ -95,6 +101,9 @@ def _media_html(msg):
         return f"""
         <div class="attachment-chip">
             📎 {filename}
+        </div>
+        <div class="attachment-note">
+            File could not be previewed.
         </div>
         """
 
@@ -133,7 +142,7 @@ def _media_html(msg):
 def _build_chat_html(messages, current_user):
     bubbles = []
 
-    for msg in messages[-140:]:
+    for msg in messages[-MAX_VISIBLE_MESSAGES:]:
         is_me = msg.get("user_name") == current_user
         side_class = "is-me" if is_me else "is-other"
 
@@ -483,7 +492,7 @@ def render_frontend_chat_page():
 
     messages = get_messages(
         room_id=room_id,
-        limit=300
+        limit=MAX_VISIBLE_MESSAGES
     )
 
     st.container().markdown("### 💬 Operations Chat")
