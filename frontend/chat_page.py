@@ -1,14 +1,14 @@
-# =========================================
 # chat_page.py
-# PRODUCTION READY CRO CHAT
-# =========================================
 
 from pathlib import Path
 from datetime import datetime
+from html import escape
+import base64
+
 import streamlit as st
 import streamlit.components.v1 as components
 
-
+from frontend.style_loader import load_theme_css
 from frontend.realtime_client import RealtimeClient
 
 from chat_backend.chat_db import (
@@ -16,6 +16,7 @@ from chat_backend.chat_db import (
     upsert_user,
     set_user_presence,
     mark_user_offline,
+    set_user_muted,
     add_message,
     get_messages,
     prune_messages,
@@ -24,20 +25,13 @@ from chat_backend.chat_db import (
     get_online_count,
 )
 
-# =========================================
-# FILE SAVE
-# =========================================
 
 def _save_upload(upload):
-
     media_dir = Path("chat_backend/uploads")
+    media_dir.mkdir(parents=True, exist_ok=True)
 
-    media_dir.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    file_path = media_dir / upload.name
+    safe_name = upload.name.replace("/", "_").replace("\\", "_")
+    file_path = media_dir / safe_name
 
     with open(file_path, "wb") as f:
         f.write(upload.getbuffer())
@@ -45,142 +39,321 @@ def _save_upload(upload):
     return str(file_path), upload.type
 
 
-# =========================================
-# STATUS DOT
-# =========================================
-
-def _status_dot(status):
-
-    if status == "sharing":
+def _status_icon(member):
+    if member.get("in_call"):
         return "📞"
-
-    if status == "idle":
+    if member.get("muted"):
+        return "🔇"
+    if member.get("status") == "idle":
         return "🟡"
-
     return "🟢"
 
 
-# =========================================
-# MESSAGE RENDER
-# =========================================
+def _media_html(msg):
+    media_path = msg.get("media_path")
+    media_type = (msg.get("media_type") or "").lower()
 
-def _render_message(msg, idx, current_user):
+    if not media_path:
+        return ""
 
-    is_me = msg["user_name"] == current_user
+    path = Path(media_path)
+    filename = escape(path.name)
 
-    row_class = (
-        "message-row me-row"
-        if is_me
-        else "message-row"
-    )
+    if media_type.startswith("image/") and path.exists():
+        try:
+            encoded = base64.b64encode(path.read_bytes()).decode("utf-8")
+            return f"""
+            <div class="media-card">
+                <img src="data:{media_type};base64,{encoded}" alt="{filename}" />
+            </div>
+            """
+        except Exception:
+            pass
 
-    bubble_class = (
-        "chat-bubble my-bubble"
-        if is_me
-        else "chat-bubble"
-    )
+    return f"""
+    <div class="attachment-chip">
+        📎 {filename}
+    </div>
+    """
 
-    st.markdown(
-        f"""
-        <div class="{row_class}">
 
-            <div class="{bubble_class}">
+def _build_chat_html(messages, current_user):
+    bubbles = []
 
-                <div class="message-top">
+    for msg in messages[-140:]:
+        is_me = msg.get("user_name") == current_user
 
-                    <div class="message-user">
-                        {msg["user_name"]}
-                    </div>
+        side_class = "is-me" if is_me else "is-other"
 
-                    <div class="message-time">
-                        {msg["created_at"]}
-                    </div>
+        user_name = escape(str(msg.get("user_name", "User")))
+        role = escape(str(msg.get("role", "client")))
+        created_at = escape(str(msg.get("created_at", "")))
+        text = escape(str(msg.get("message", "") or "")).replace("\n", "<br>")
 
+        media = _media_html(msg)
+
+        bubble = f"""
+        <div class="msg-row {side_class}">
+            <div class="msg-bubble">
+                <div class="msg-meta">
+                    <span class="msg-user">{user_name}</span>
+                    <span class="msg-role">{role}</span>
+                    <span class="msg-time">{created_at}</span>
                 </div>
 
-                <div class="message-role">
-                    {msg["role"]}
-                </div>
+                {"<div class='msg-text'>" + text + "</div>" if text else ""}
 
-                <div class="message-content">
-                    {msg.get("message", "")}
-                </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-    # =========================================
-    # MEDIA
-    # =========================================
-
-    if msg.get("media_path"):
-
-        mt = (msg.get("media_type") or "").lower()
-
-        media_path = msg["media_path"]
-
-        st.markdown(
-            '<div class="media-wrap">',
-            unsafe_allow_html=True
-        )
-
-        if mt.startswith("image/"):
-
-            st.image(
-                media_path,
-                use_container_width=True
-            )
-
-        elif mt.startswith("video/"):
-
-            st.video(media_path)
-
-        else:
-
-            with open(media_path, "rb") as f:
-
-                st.download_button(
-                    "Download Attachment",
-                    data=f.read(),
-                    file_name=Path(media_path).name,
-                    use_container_width=True,
-                    key=f"download_{msg['id']}_{idx}"
-                )
-
-        st.markdown(
-            "</div>",
-            unsafe_allow_html=True
-        )
-
-    st.markdown(
-        """
+                {media}
             </div>
         </div>
-        """,
-        unsafe_allow_html=True
-    )
+        """
 
+        bubbles.append(bubble)
 
-# =========================================
-# MAIN CHAT PAGE
-# =========================================
+    body = "\n".join(bubbles)
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8" />
+
+        <style>
+            html,
+            body {{
+                margin: 0;
+                padding: 0;
+                background: transparent;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+                overflow: hidden;
+            }}
+
+            .chat-frame {{
+                position: relative;
+                height: 460px;
+                border-radius: 24px;
+                overflow: hidden;
+                background:
+                    linear-gradient(
+                        180deg,
+                        rgba(255,255,255,0.10),
+                        rgba(255,255,255,0.055)
+                    );
+                border: 1px solid rgba(255,255,255,0.14);
+                box-shadow: 0 18px 48px rgba(0,0,0,0.22);
+                backdrop-filter: blur(18px);
+            }}
+
+            .chat-scroll {{
+                height: 100%;
+                overflow-y: auto;
+                padding: 18px;
+                box-sizing: border-box;
+                scroll-behavior: smooth;
+            }}
+
+            .chat-scroll::-webkit-scrollbar {{
+                width: 8px;
+            }}
+
+            .chat-scroll::-webkit-scrollbar-track {{
+                background: transparent;
+            }}
+
+            .chat-scroll::-webkit-scrollbar-thumb {{
+                background: rgba(255,255,255,0.22);
+                border-radius: 999px;
+            }}
+
+            .msg-row {{
+                display: flex;
+                margin-bottom: 12px;
+            }}
+
+            .msg-row.is-me {{
+                justify-content: flex-end;
+            }}
+
+            .msg-row.is-other {{
+                justify-content: flex-start;
+            }}
+
+            .msg-bubble {{
+                width: fit-content;
+                max-width: 74%;
+                padding: 12px 14px;
+                border-radius: 18px;
+                color: #f2fbff;
+                background: rgba(255,255,255,0.10);
+                border: 1px solid rgba(255,255,255,0.12);
+                box-shadow: 0 10px 28px rgba(0,0,0,0.16);
+                box-sizing: border-box;
+            }}
+
+            .is-me .msg-bubble {{
+                background:
+                    linear-gradient(
+                        135deg,
+                        rgba(0,212,255,0.30),
+                        rgba(0,153,204,0.36)
+                    );
+                border-color: rgba(0,212,255,0.30);
+            }}
+
+            .msg-meta {{
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                flex-wrap: wrap;
+                margin-bottom: 6px;
+            }}
+
+            .msg-user {{
+                font-size: 13px;
+                font-weight: 800;
+                color: #ffffff;
+            }}
+
+            .msg-role {{
+                font-size: 11px;
+                font-weight: 700;
+                padding: 2px 7px;
+                border-radius: 999px;
+                background: rgba(255,255,255,0.12);
+                color: rgba(255,255,255,0.80);
+            }}
+
+            .msg-time {{
+                font-size: 11px;
+                color: rgba(255,255,255,0.62);
+            }}
+
+            .msg-text {{
+                font-size: 14px;
+                line-height: 1.45;
+                color: #f7fdff;
+                word-break: break-word;
+            }}
+
+            .media-card {{
+                margin-top: 10px;
+                border-radius: 14px;
+                overflow: hidden;
+                border: 1px solid rgba(255,255,255,0.12);
+                background: rgba(0,0,0,0.18);
+            }}
+
+            .media-card img {{
+                display: block;
+                max-width: 100%;
+                max-height: 260px;
+                object-fit: contain;
+            }}
+
+            .attachment-chip {{
+                margin-top: 10px;
+                display: inline-flex;
+                max-width: 100%;
+                padding: 7px 10px;
+                border-radius: 999px;
+                background: rgba(0,0,0,0.20);
+                color: #ffffff;
+                font-size: 12px;
+                border: 1px solid rgba(255,255,255,0.12);
+                word-break: break-word;
+            }}
+
+            .jump-btn {{
+                position: absolute;
+                right: 16px;
+                bottom: 16px;
+                width: 42px;
+                height: 42px;
+                border-radius: 999px;
+                border: 0;
+                cursor: pointer;
+                display: none;
+                align-items: center;
+                justify-content: center;
+                color: white;
+                font-size: 20px;
+                font-weight: 800;
+                background: linear-gradient(135deg, #00d4ff, #0099cc);
+                box-shadow: 0 12px 28px rgba(0,0,0,0.30);
+            }}
+
+            @media (max-width: 700px) {{
+                .chat-frame {{
+                    height: 420px;
+                    border-radius: 20px;
+                }}
+
+                .msg-bubble {{
+                    max-width: 88%;
+                }}
+
+                .chat-scroll {{
+                    padding: 14px;
+                }}
+            }}
+        </style>
+    </head>
+
+    <body>
+        <div class="chat-frame">
+            <div class="chat-scroll" id="chatScroll">
+                {body}
+            </div>
+
+            <button class="jump-btn" id="jumpBtn" onclick="scrollToLatest()">↓</button>
+        </div>
+
+        <script>
+            const chatScroll = document.getElementById("chatScroll");
+            const jumpBtn = document.getElementById("jumpBtn");
+
+            function distanceFromBottom() {{
+                return chatScroll.scrollHeight - chatScroll.scrollTop - chatScroll.clientHeight;
+            }}
+
+            function updateJumpButton() {{
+                if (distanceFromBottom() > 260) {{
+                    jumpBtn.style.display = "flex";
+                }} else {{
+                    jumpBtn.style.display = "none";
+                }}
+            }}
+
+            function scrollToLatest() {{
+                chatScroll.scrollTo({{
+                    top: chatScroll.scrollHeight,
+                    behavior: "smooth"
+                }});
+            }}
+
+            chatScroll.addEventListener("scroll", updateJumpButton);
+
+            setTimeout(() => {{
+                chatScroll.scrollTop = chatScroll.scrollHeight;
+                updateJumpButton();
+            }}, 80);
+        </script>
+    </body>
+    </html>
+    """
+
 
 def render_frontend_chat_page():
-
-    
+    load_theme_css()
 
     init_db()
-
     cleanup_inactive(minutes=1)
-
     prune_messages()
 
     user = st.session_state.get("user", {})
 
     user_name = user.get("name", "Guest")
-
     role = user.get("role", "client")
-
     user_id = str(user.get("id", user_name))
 
     room_id = "main"
@@ -192,62 +365,43 @@ def render_frontend_chat_page():
 
     rt = RealtimeClient(ws_url)
 
-    # =========================================
-    # SESSION
-    # =========================================
-
     defaults = {
-        "chat_more_menu": False,
-        "chat_mute": False,
-        "in_call": False,
+        "chat_menu_open": False,
+        "chat_muted": False,
+        "chat_in_call": False,
         "chat_last_ping": 0.0,
     }
 
-    for k, v in defaults.items():
-
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-    # =========================================
-    # PRESENCE
-    # =========================================
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
     upsert_user(user_name, role)
 
     now = datetime.now().timestamp()
 
     if now - st.session_state.chat_last_ping >= 5:
-
-        status = (
-            "sharing"
-            if st.session_state.in_call
-            else "active"
-        )
+        status = "sharing" if st.session_state.chat_in_call else "active"
 
         set_user_presence(
             user_name,
             1,
             status,
-            muted=int(st.session_state.chat_mute),
-            in_call=int(st.session_state.in_call)
+            muted=int(st.session_state.chat_muted),
+            in_call=int(st.session_state.chat_in_call)
         )
 
         rt.send_presence(
             room_id,
             user_id,
             user_name,
-            muted=st.session_state.chat_mute,
-            in_call=st.session_state.in_call
+            muted=st.session_state.chat_muted,
+            in_call=st.session_state.chat_in_call
         )
 
         st.session_state.chat_last_ping = now
 
-    # =========================================
-    # DATA
-    # =========================================
-
     active_users = get_active_users()
-
     online_count = get_online_count()
 
     messages = get_messages(
@@ -255,216 +409,90 @@ def render_frontend_chat_page():
         limit=300
     )
 
-    # =========================================
-    # MAIN SHELL
-    # =========================================
+    st.container().markdown("### 💬 Operations Chat")
+    st.caption("Secure realtime communication & collaboration")
 
-    st.markdown(
-        """
-        <div class="cro-chat-shell">
-        """,
-        unsafe_allow_html=True
-    )
+    top_left, top_right = st.columns([7, 1])
 
-    # =========================================
-    # HEADER
-    # =========================================
+    with top_left:
+        st.caption(f"🟢 {online_count} online")
 
-    left, middle, right = st.columns([5, 1.2, 0.6])
-
-    with left:
-
-        st.markdown(
-            f"""
-            <div class="chat-header-card">
-
-                <div class="chat-brand">
-                    💬 Operations Chat
-                </div>
-
-                <div class="chat-sub">
-                    Secure realtime communication & collaboration
-                </div>
-
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    with middle:
-
-        st.markdown(
-            f"""
-            <div class="online-card">
-
-                <div class="online-dot"></div>
-
-                <div class="online-text">
-                    {online_count} Online
-                </div>
-
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    with right:
-
-        if st.button(
-            "⋯",
-            key="chat_menu_button",
-            use_container_width=True
-        ):
-
-            st.session_state.chat_more_menu = (
-                not st.session_state.chat_more_menu
-            )
-
+    with top_right:
+        if st.button("⋯", key="chat_menu_toggle", use_container_width=True):
+            st.session_state.chat_menu_open = not st.session_state.chat_menu_open
             st.rerun()
 
-    # =========================================
-    # MENU
-    # =========================================
+    if st.session_state.chat_menu_open:
+        with st.container(border=True):
+            m1, m2 = st.columns(2)
 
-    if st.session_state.chat_more_menu:
+            with m1:
+                mute_label = "🔊 Unmute Chat" if st.session_state.chat_muted else "🔇 Mute Chat"
 
-        st.markdown(
-            """
-            <div class="chat-menu-card">
-            """,
-            unsafe_allow_html=True
-        )
+                if st.button(mute_label, key="chat_mute_toggle", use_container_width=True):
+                    st.session_state.chat_muted = not st.session_state.chat_muted
 
-        m1, m2 = st.columns(2)
+                    set_user_muted(
+                        user_name,
+                        int(st.session_state.chat_muted)
+                    )
 
-        with m1:
+                    st.rerun()
 
-            if st.button(
-                "🔕 Muted"
-                if st.session_state.chat_mute
-                else "🔔 Notifications",
-                use_container_width=True,
-                key="mute_toggle"
-            ):
+            with m2:
+                call_label = "❌ Leave Call" if st.session_state.chat_in_call else "📞 Join Call"
 
-                st.session_state.chat_mute = (
-                    not st.session_state.chat_mute
-                )
+                if st.button(call_label, key="chat_call_toggle", use_container_width=True):
+                    st.session_state.chat_in_call = not st.session_state.chat_in_call
 
-                st.rerun()
+                    call_text = (
+                        f"📞 {user_name} joined the call."
+                        if st.session_state.chat_in_call
+                        else f"📞 {user_name} left the call."
+                    )
 
-        with m2:
+                    add_message(
+                        user_name,
+                        role,
+                        call_text,
+                        None,
+                        None,
+                        room_id
+                    )
 
-            if st.button(
-                "📞 Leave Call"
-                if st.session_state.in_call
-                else "📞 Join Call",
-                use_container_width=True,
-                key="call_toggle"
-            ):
+                    rt.send_chat(
+                        room_id,
+                        user_id,
+                        user_name,
+                        role,
+                        call_text,
+                        None,
+                        None
+                    )
 
-                st.session_state.in_call = (
-                    not st.session_state.in_call
-                )
+                    st.rerun()
 
-                st.rerun()
+            st.caption("Active team")
 
-        st.markdown(
-            """
-            <div class="active-title">
-                Active Team
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+            for member in active_users:
+                icon = _status_icon(member)
+                member_name = member.get("name", "User")
+                member_role = member.get("role", "client")
 
-        for member in active_users:
+                st.write(f"{icon} **{member_name}** · {member_role}")
 
-            status = member.get(
-                "status",
-                "active"
-            )
-
-            st.markdown(
-                f"""
-                <div class="active-user">
-
-                    <div class="active-left">
-                        {_status_dot(status)}
-                        {member['name']}
-                    </div>
-
-                    <div class="active-right">
-                        {status}
-                    </div>
-
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
-        st.markdown(
-            "</div>",
-            unsafe_allow_html=True
-        )
-
-    # =========================================
-    # CHAT CANVAS
-    # =========================================
-
-    st.markdown(
-        """
-        <div class="chat-canvas">
-
-            <div
-                class="chat-scroll-area"
-                id="chat_scroll_area"
-            >
-        """,
-        unsafe_allow_html=True
+    chat_html = _build_chat_html(
+        messages,
+        user_name
     )
 
-    for i, msg in enumerate(messages[-140:]):
-
-        _render_message(
-            msg,
-            i,
-            user_name
-        )
-
-    st.markdown(
-        """
-            </div>
-
-            <button
-                id="scroll_bottom_btn"
-                class="scroll-bottom-btn"
-                onclick="scrollChatBottom()"
-            >
-                ↓
-            </button>
-
-        </div>
-        """,
-        unsafe_allow_html=True
+    components.html(
+        chat_html,
+        height=480,
+        scrolling=False
     )
 
-    # =========================================
-    # COMPOSER
-    # =========================================
-
-    st.markdown(
-        """
-        <div class="composer-shell">
-        """,
-        unsafe_allow_html=True
-    )
-
-    with st.form(
-        "chat_form",
-        clear_on_submit=True
-    ):
-
+    with st.form("chat_form", clear_on_submit=True):
         message = st.text_area(
             "Message",
             placeholder="Write a message...",
@@ -472,10 +500,9 @@ def render_frontend_chat_page():
             height=78
         )
 
-        c1, c2, c3 = st.columns([0.8, 0.8, 4])
+        c1, c2, c3 = st.columns([1, 1, 4])
 
         with c1:
-
             upload = st.file_uploader(
                 "Upload",
                 type=[
@@ -487,50 +514,37 @@ def render_frontend_chat_page():
                     "mov",
                     "webm",
                     "pdf",
-                    "txt"
+                    "txt",
                 ],
                 label_visibility="collapsed"
             )
 
         with c2:
-
             voice = st.form_submit_button(
                 "🎙",
                 use_container_width=True
             )
 
         with c3:
-
             send = st.form_submit_button(
-                "Send Message",
+                "Send",
                 use_container_width=True
             )
 
-        # SEND
-
         if send:
-
             media_path = None
             media_type = None
 
-            msg_text = (
-                message.strip()
-                if message
-                else ""
-            )
+            text = message.strip() if message else ""
 
             if upload is not None:
+                media_path, media_type = _save_upload(upload)
 
-                media_path, media_type = (
-                    _save_upload(upload)
-                )
-
-            if msg_text or media_path:
-
+            if text or media_path:
                 add_message(
                     user_name,
                     role,
-                    msg_text,
+                    text,
                     media_path,
                     media_type,
                     room_id
@@ -541,7 +555,7 @@ def render_frontend_chat_page():
                     user_id,
                     user_name,
                     role,
-                    msg_text,
+                    text,
                     media_path,
                     media_type
                 )
@@ -549,79 +563,4 @@ def render_frontend_chat_page():
                 st.rerun()
 
         if voice:
-
-            st.info(
-                "Voice connected through realtime backend."
-            )
-
-    st.markdown(
-        "</div></div>",
-        unsafe_allow_html=True
-    )
-
-    # =========================================
-    # SCROLL SCRIPT
-    # =========================================
-
-    components.html(
-        """
-        <script>
-
-        const parentDoc = window.parent.document;
-
-        setTimeout(() => {
-
-            const scrollArea =
-                parentDoc.querySelector(
-                    '#chat_scroll_area'
-                );
-
-            const btn =
-                parentDoc.querySelector(
-                    '#scroll_bottom_btn'
-                );
-
-            if (!scrollArea || !btn) return;
-
-            function updateButton() {
-
-                const nearBottom =
-                    scrollArea.scrollHeight
-                    - scrollArea.scrollTop
-                    - scrollArea.clientHeight
-                    < 180;
-
-                if (nearBottom) {
-                    btn.style.opacity = '0';
-                    btn.style.pointerEvents = 'none';
-                } else {
-                    btn.style.opacity = '1';
-                    btn.style.pointerEvents = 'auto';
-                }
-            }
-
-            window.scrollChatBottom = function() {
-
-                scrollArea.scrollTo({
-                    top: scrollArea.scrollHeight,
-                    behavior: 'smooth'
-                });
-
-            }
-
-            scrollArea.addEventListener(
-                'scroll',
-                updateButton
-            );
-
-            updateButton();
-
-            scrollArea.scrollTop =
-                scrollArea.scrollHeight;
-
-        }, 300);
-
-        </script>
-        """,
-        height=0
-    )
+            st.info("Voice note path is wired through the realtime client and server signals.")

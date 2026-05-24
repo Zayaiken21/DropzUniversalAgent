@@ -43,6 +43,3 @@ def render_winrate_charts(data):
         circular_chart("Weekly", data["weekly"])
 
     bottom = st.columns(3)
-
-    with bottom[0]:
-        circular_chart("Scalping", data["scalping"])
