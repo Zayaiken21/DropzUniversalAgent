@@ -1,4 +1,4 @@
-# dashboard_page.py
+# frontend/dashboard_page.py
 
 import streamlit as st
 import pandas as pd
@@ -16,18 +16,16 @@ def circular_chart(title, value):
     else:
         color = "#FF4D6D"
 
-    fig = go.Figure(
-        go.Pie(
-            values=[value, 100 - value],
-            hole=0.82,
-            marker_colors=[color, "#1c1f26"],
-            textinfo="none"
-        )
-    )
+    fig = go.Figure(go.Pie(
+        values=[value, 100 - value],
+        hole=0.82,
+        marker_colors=[color, "#1c1f26"],
+        textinfo='none'
+    ))
 
     fig.update_layout(
         height=260,
-        paper_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor='rgba(0,0,0,0)',
         showlegend=False,
         margin=dict(t=20, b=20, l=20, r=20),
         annotations=[
@@ -44,7 +42,7 @@ def circular_chart(title, value):
 
     st.plotly_chart(
         fig,
-        use_container_width=True,
+        width="stretch",
         config={
             "displayModeBar": False,
             "responsive": True,
@@ -77,8 +75,6 @@ def render_frontend_dashboard_page(role):
         '<div class="dashboard-section-space"></div>',
         unsafe_allow_html=True
     )
-
-    # KPI ROW
 
     cols = st.columns(4)
 
@@ -121,8 +117,6 @@ def render_frontend_dashboard_page(role):
             unsafe_allow_html=True,
         )
 
-        # TOP WINRATE CHARTS
-
         top = st.columns(3)
 
         with top[0]:
@@ -138,8 +132,6 @@ def render_frontend_dashboard_page(role):
             '<div class="dashboard-section-space"></div>',
             unsafe_allow_html=True
         )
-
-        # RECENT TRADES
 
         st.markdown(
             """
@@ -171,13 +163,11 @@ def render_frontend_dashboard_page(role):
 
         st.dataframe(
             df,
-            use_container_width=True,
+            width="stretch",
             height=420,
         )
 
     with right:
-
-        # PSYCHOLOGY
 
         st.markdown(
             """
@@ -201,8 +191,6 @@ def render_frontend_dashboard_page(role):
             unsafe_allow_html=True
         )
 
-        # GOALS
-
         st.markdown(
             """
             <div class="glass-card">
@@ -225,8 +213,6 @@ def render_frontend_dashboard_page(role):
             '<div class="dashboard-section-space"></div>',
             unsafe_allow_html=True
         )
-
-        # ACTIVITY FEED
 
         st.markdown(
             """
