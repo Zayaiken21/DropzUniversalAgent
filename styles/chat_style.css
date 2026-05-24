@@ -35,56 +35,73 @@ button[kind="secondary"] {
     box-shadow: 0 14px 38px rgba(0,0,0,0.16) !important;
 }
 
-/* Composer text area */
-.stTextArea textarea {
-    min-height: 78px !important;
-    border-radius: 18px !important;
-    background: rgba(255,255,255,0.08) !important;
-    border: 1px solid rgba(255,255,255,0.14) !important;
-    color: #ffffff !important;
-    caret-color: #ffffff !important;
-    font-size: 0.95rem !important;
-    padding: 0.8rem 0.9rem !important;
-    -webkit-text-fill-color: #ffffff !important;
-}
-
-.stTextArea textarea:focus {
-    color: #ffffff !important;
-    caret-color: #ffffff !important;
-    -webkit-text-fill-color: #ffffff !important;
-    border: 1px solid rgba(0,212,255,0.45) !important;
-    box-shadow: 0 0 0 2px rgba(0,212,255,0.12) !important;
-}
-
-.stTextArea textarea::placeholder {
-    color: rgba(242,251,255,0.52) !important;
-    -webkit-text-fill-color: rgba(242,251,255,0.52) !important;
-}
-
-/* Keep typed chat text visible */
+/* Text input fixed */
+.stTextArea textarea,
+.stTextArea textarea:focus,
+.stTextArea textarea:active,
 textarea,
 textarea:focus,
 textarea:active {
+    min-height: 78px !important;
+    border-radius: 18px !important;
+    background: rgba(8,26,40,0.88) !important;
+    border: 1px solid rgba(0,212,255,0.45) !important;
     color: #ffffff !important;
     caret-color: #ffffff !important;
     -webkit-text-fill-color: #ffffff !important;
+    font-size: 0.95rem !important;
+    font-weight: 600 !important;
+    padding: 0.85rem 0.95rem !important;
+    box-shadow:
+        inset 0 0 0 1px rgba(255,255,255,0.05),
+        0 0 0 1px rgba(0,212,255,0.08) !important;
 }
 
-/* Upload compact */
+.stTextArea textarea:focus,
+textarea:focus {
+    background: rgba(6,24,37,0.94) !important;
+    border: 1px solid rgba(0,212,255,0.75) !important;
+    box-shadow:
+        0 0 0 2px rgba(0,212,255,0.18),
+        inset 0 0 0 1px rgba(255,255,255,0.06) !important;
+}
+
+.stTextArea textarea::placeholder,
+textarea::placeholder {
+    color: rgba(255,255,255,0.56) !important;
+    -webkit-text-fill-color: rgba(255,255,255,0.56) !important;
+}
+
+/* Upload fixed */
 [data-testid="stFileUploader"] {
     min-height: 44px !important;
 }
 
 [data-testid="stFileUploader"] section {
-    min-height: 44px !important;
-    padding: 0.4rem !important;
-    border-radius: 16px !important;
-    background: rgba(255,255,255,0.06) !important;
-    border: 1px solid rgba(255,255,255,0.12) !important;
+    min-height: 50px !important;
+    padding: 0.45rem 0.65rem !important;
+    border-radius: 18px !important;
+    background: rgba(8,26,40,0.72) !important;
+    border: 1px solid rgba(0,212,255,0.35) !important;
+    color: #ffffff !important;
+}
+
+[data-testid="stFileUploader"] section * {
+    color: #ffffff !important;
+    -webkit-text-fill-color: #ffffff !important;
+}
+
+[data-testid="stFileUploader"] button {
+    background: rgba(0,212,255,0.18) !important;
+    color: #ffffff !important;
+    border: 1px solid rgba(0,212,255,0.45) !important;
+    border-radius: 14px !important;
+    font-weight: 800 !important;
 }
 
 [data-testid="stFileUploader"] small {
-    display: none !important;
+    color: rgba(255,255,255,0.82) !important;
+    -webkit-text-fill-color: rgba(255,255,255,0.82) !important;
 }
 
 /* Buttons */
