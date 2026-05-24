@@ -26,7 +26,7 @@ from chat_backend.chat_db import (
 )
 
 
-MAX_EMBED_MB = 35
+MAX_EMBED_MB = 25
 
 
 def _save_upload(upload):
@@ -85,7 +85,7 @@ def _media_html(msg):
         </div>
 
         <div class="attachment-note">
-            Preview disabled for large files to prevent Streamlit’s 200MB message limit.
+            Preview/download disabled for this large file to prevent Streamlit’s 200MB message limit.
         </div>
         """
 
@@ -495,7 +495,7 @@ def render_frontend_chat_page():
         st.caption(f"🟢 {online_count} online")
 
     with top_right:
-        if st.button("⋯", key="chat_menu_toggle", use_container_width=True):
+        if st.button("⋯", key="chat_menu_toggle", width="stretch"):
             st.session_state.chat_menu_open = not st.session_state.chat_menu_open
             st.rerun()
 
@@ -506,7 +506,7 @@ def render_frontend_chat_page():
             with m1:
                 mute_label = "🔊 Unmute Chat" if st.session_state.chat_muted else "🔇 Mute Chat"
 
-                if st.button(mute_label, key="chat_mute_toggle", use_container_width=True):
+                if st.button(mute_label, key="chat_mute_toggle", width="stretch"):
                     st.session_state.chat_muted = not st.session_state.chat_muted
 
                     set_user_muted(
@@ -519,7 +519,7 @@ def render_frontend_chat_page():
             with m2:
                 call_label = "❌ Leave Call" if st.session_state.chat_in_call else "📞 Join Call"
 
-                if st.button(call_label, key="chat_call_toggle", use_container_width=True):
+                if st.button(call_label, key="chat_call_toggle", width="stretch"):
                     st.session_state.chat_in_call = not st.session_state.chat_in_call
 
                     call_text = (
@@ -599,13 +599,13 @@ def render_frontend_chat_page():
         with c2:
             voice = st.form_submit_button(
                 "🎙",
-                use_container_width=True
+                width="stretch"
             )
 
         with c3:
             send = st.form_submit_button(
                 "Send",
-                use_container_width=True
+                width="stretch"
             )
 
         if send:
