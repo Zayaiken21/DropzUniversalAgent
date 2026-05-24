@@ -55,7 +55,7 @@ def _get_ceo_secret():
             secret = st.secrets.get("CEO_SECRET_PHRASE", "")
         except Exception:
             secret = ""
-    return secret.strip()
+    return (secret or "").strip()
 
 def create_ceo_user():
     conn = get_connection()
@@ -63,8 +63,11 @@ def create_ceo_user():
     c.execute("SELECT * FROM users WHERE role = 'ceo'")
     if c.fetchone() is None:
         from frontend.config import CEO_SECRET_PHRASE
-        secret = _get_ceo_secret() or CEO_SECRET_PHRASE
-        password_hash = hashlib.sha256(secret.strip().encode()).hexdigest()
+        secret = _get_ceo_secret() or (CEO_SECRET_PHRASE or "").strip()
+        if not secret:
+            conn.close()
+            return
+        password_hash = hashlib.sha256(secret.encode()).hexdigest()
         c.execute(
             "INSERT INTO users (name, role, password_hash, active) VALUES (?, ?, ?, ?)",
             ("CEO", "ceo", password_hash, 1)

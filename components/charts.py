@@ -46,9 +46,3 @@ def render_winrate_charts(data):
 
     with bottom[0]:
         circular_chart("Scalping", data["scalping"])
-
-    with bottom[1]:
-        circular_chart("Momentum", data["momentum"])
-
-    with bottom[2]:
-        circular_chart("Breakout", data["breakout"])

@@ -1,418 +1,464 @@
+/* =========================================
+DROPZ UNIVERSAL AGENT
+GLOBAL THEME CSS
+SAFE + PRODUCTION READY
+========================================= */
+
+/* =========================================
+ROOT APP
+========================================= */
+
 .stApp {
-    background: linear-gradient(135deg, #081a28 0%, #0a507a 50%, #19c8d1 100%);
-    color: #f2fbff !important;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-    line-height: 1.7;
-    font-size: clamp(16px, 2vw, 19px) !important;
+
+    background:
+        linear-gradient(
+            135deg,
+            #081a28 0%,
+            #0a507a 50%,
+            #19c8d1 100%
+        );
+
+    color: #f2fbff;
+
+    font-family:
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        Roboto,
+        "Helvetica Neue",
+        Arial,
+        sans-serif;
+
+    overflow-x: hidden;
 }
 
-html, body, [class*="css"] {
-    color: #f2fbff !important;
+/* =========================================
+BASE HTML
+========================================= */
+
+html,
+body {
+
     background: transparent !important;
-    line-height: 1.7;
-    font-size: clamp(16px, 2vw, 19px) !important;
+
+    color: #f2fbff;
+
+    overflow-x: hidden !important;
+
+    scroll-behavior: smooth;
 }
+
+/* =========================================
+STREAMLIT LAYOUT
+========================================= */
 
 main {
+
     padding-top: 0.1rem !important;
 }
 
 .block-container {
-    padding-top: 0.35rem !important;
-    padding-bottom: 0.65rem !important;
+
     max-width: 1280px !important;
+
+    padding-top: 0.45rem !important;
+
+    padding-bottom: 0.8rem !important;
+
+    padding-left: 1rem !important;
+
+    padding-right: 1rem !important;
 }
+
+/* =========================================
+HEADER
+========================================= */
 
 header {
-    background: rgba(8, 26, 40, 0.95) !important;
-    color: #f2fbff !important;
-    border-bottom: 1px solid rgba(255,255,255,0.10) !important;
+
+    background:
+        rgba(8, 26, 40, 0.92) !important;
+
+    border-bottom:
+        1px solid rgba(255,255,255,0.08) !important;
+
+    backdrop-filter: blur(14px);
 }
 
-[data-testid="stHeaderBar"] {
-    background: rgba(8, 26, 40, 0.95) !important;
+[data-testid="stHeader"] {
+
+    background:
+        rgba(8, 26, 40, 0.92) !important;
 }
 
-[data-testid="stSidebarCloseButton"] svg path {
-    fill: #dff8ff !important;
-    stroke: #dff8ff !important;
+/* =========================================
+SIDEBAR
+========================================= */
+
+[data-testid="stSidebar"] {
+
+    background:
+        linear-gradient(
+            180deg,
+            rgba(6,24,37,0.98),
+            rgba(10,73,106,0.96)
+        ) !important;
+
+    border-right:
+        1px solid rgba(255,255,255,0.08) !important;
 }
 
-.centered-content {
-    text-align: center !important;
+[data-testid="stSidebar"] * {
+
+    color: #f6fcff !important;
 }
+
+/* =========================================
+TYPOGRAPHY
+========================================= */
 
 h1 {
+
     color: #fbfeff !important;
+
     font-weight: 800 !important;
-    font-size: clamp(2.4rem, 5.8vw, 3.7rem) !important;
+
+    font-size:
+        clamp(2.2rem, 5vw, 3.4rem) !important;
+
     line-height: 1.05 !important;
-    margin-bottom: 0.2rem !important;
+
     text-align: center !important;
-    text-shadow: 2px 2px 8px rgba(0,0,0,0.22) !important;
+
+    margin-bottom: 0.3rem !important;
 }
 
 h2 {
+
     color: #e0f7ff !important;
+
     font-weight: 800 !important;
-    font-size: clamp(1.9rem, 4.5vw, 2.8rem) !important;
-    line-height: 1.08 !important;
-    margin-bottom: 0.55rem !important;
+
+    font-size:
+        clamp(1.8rem, 4vw, 2.7rem) !important;
+
     text-align: center !important;
-    text-shadow: 2px 2px 10px rgba(144, 238, 255, 0.28) !important;
 }
 
 h3 {
+
     color: #e0f7ff !important;
+
     font-weight: 700 !important;
-    font-size: clamp(1.25rem, 3vw, 1.7rem) !important;
-    line-height: 1.2 !important;
-    text-align: center !important;
+
+    font-size:
+        clamp(1.15rem, 2vw, 1.5rem) !important;
 }
 
-p, li, label, span, div, a {
+p,
+li,
+label,
+span,
+a {
+
     color: #f1faff !important;
-    line-height: 1.7;
-    font-size: clamp(15px, 2vw, 18px) !important;
+
+    line-height: 1.6;
 }
 
-.brand-card,
-.glass-card {
-    background: rgba(255,255,255,0.10) !important;
+/* =========================================
+CARDS
+========================================= */
+
+.glass-card,
+.brand-card {
+
+    background:
+        rgba(255,255,255,0.08);
+
     backdrop-filter: blur(18px);
+
     -webkit-backdrop-filter: blur(18px);
-    border: 1px solid rgba(255,255,255,0.16);
+
+    border:
+        1px solid rgba(255,255,255,0.12);
+
     border-radius: 22px;
-    padding: 1.05rem 1.25rem;
-    box-shadow: 0 18px 40px rgba(0,0,0,0.18);
-    text-align: center;
-    margin-bottom: 0.7rem;
-    margin-top: 0.05rem;
+
+    padding: 1rem 1.2rem;
+
+    box-shadow:
+        0 12px 40px rgba(0,0,0,0.16);
+
     overflow: hidden;
-    box-sizing: border-box;
 }
 
-.brand-card h1,
-.glass-card h1 {
-    margin-top: 0.05rem !important;
-    margin-bottom: 0.25rem !important;
-}
-
-.brand-card h2,
-.glass-card h2,
-.brand-card h3,
-.glass-card h3 {
-    margin-top: 0.08rem !important;
-    margin-bottom: 0.35rem !important;
-}
+/* =========================================
+SECTION TITLES
+========================================= */
 
 .section-title {
+
     color: #e0f7ff !important;
+
     font-weight: 800 !important;
-    font-size: clamp(1.9rem, 4.5vw, 2.8rem) !important;
+
+    font-size:
+        clamp(1.8rem, 4vw, 2.6rem) !important;
+
     text-align: center !important;
-    margin-bottom: 0.7rem !important;
-    text-shadow: 2px 2px 10px rgba(144, 238, 255, 0.28) !important;
+
+    margin-bottom: 0.8rem !important;
 }
 
-.muted {
-    color: rgba(245, 251, 255, 0.92) !important;
-    font-size: clamp(15px, 2vw, 18px) !important;
-}
+/* =========================================
+BUTTONS
+========================================= */
 
 .stButton button,
 .stFormSubmitButton > button {
-    background: linear-gradient(90deg, #00d4ff, #0099cc) !important;
-    color: #ffffff !important;
-    border: 1px solid rgba(255,255,255,0.55) !important;
-    border-radius: 12px !important;
-    padding: 0.44rem 0.95rem !important;
+
+    background:
+        linear-gradient(
+            90deg,
+            #00d4ff,
+            #0099cc
+        ) !important;
+
+    color: white !important;
+
+    border:
+        1px solid rgba(255,255,255,0.16) !important;
+
+    border-radius: 14px !important;
+
+    min-height: 42px !important;
+
+    padding:
+        0.45rem 1rem !important;
+
     font-weight: 700 !important;
-    font-size: 15px !important;
-    min-height: 40px !important;
-    width: 100% !important;
-    max-width: 100% !important;
-    white-space: nowrap !important;
-    overflow: hidden !important;
-    text-overflow: ellipsis !important;
-    text-shadow: 1px 1px 3px rgba(0,0,0,0.35) !important;
-    box-shadow: 0 6px 16px rgba(0, 153, 204, 0.18) !important;
+
+    font-size: 0.92rem !important;
+
+    transition:
+        all 0.2s ease !important;
+
+    box-shadow:
+        0 8px 22px rgba(0,153,204,0.16);
 }
 
 .stButton button:hover,
 .stFormSubmitButton > button:hover {
-    filter: brightness(1.08);
-    box-shadow: 0 8px 24px rgba(0, 212, 255, 0.28) !important;
+
+    transform:
+        translateY(-1px);
+
+    filter: brightness(1.05);
+
+    box-shadow:
+        0 10px 26px rgba(0,212,255,0.24);
 }
 
-.stFormSubmitButton {
-    display: flex !important;
-    justify-content: flex-start !important;
-    align-items: center !important;
-    margin-top: 0.25rem !important;
-    margin-left: 0 !important;
-    padding-left: 0 !important;
-    margin-right: 0 !important;
-    transform: none !important;
-}
+/* =========================================
+INPUTS
+========================================= */
 
-.stFormSubmitButton > button {
-    margin: 0 !important;
-    width: 100% !important;
-}
-
-.stFormSubmitButton > button p {
-    color: #ffffff !important;
-    font-size: 15px !important;
-    font-weight: 700 !important;
-    margin: 0 !important;
-}
-
-input[type="password"],
 input[type="text"],
+input[type="password"],
 textarea {
-    border-radius: 12px !important;
-    font-size: 15px !important;
-    background: rgba(255, 255, 255, 0.08) !important;
-    border: 1px solid rgba(255,255,255,0.22) !important;
-    color: #2ab6b6 !important;
-    text-align: left;
-    padding: 0.55rem 0.8rem !important;
-    font-weight: 600 !important;
-    width: 100% !important;
-    max-width: 100% !important;
-    box-sizing: border-box !important;
+
+    background:
+        rgba(255,255,255,0.08) !important;
+
+    border:
+        1px solid rgba(255,255,255,0.14) !important;
+
+    color: #f2fbff !important;
+
+    border-radius: 14px !important;
+
+    padding:
+        0.6rem 0.8rem !important;
+
+    font-size: 0.95rem !important;
+
     outline: none !important;
 }
 
 input::placeholder,
 textarea::placeholder {
-    color: rgb(42 182 182) !important;
+
+    color:
+        rgba(255,255,255,0.45) !important;
 }
+
+/* =========================================
+STREAMLIT INPUT WRAPPERS
+========================================= */
 
 .stTextInput div[data-baseweb="input"],
 .stTextArea div[data-baseweb="base-input"] {
-    border: 1px solid rgb(42 182 182) !important;
-    border-radius: 12px !important;
+
+    border-radius: 14px !important;
+
+    border:
+        1px solid rgba(255,255,255,0.14) !important;
 }
 
-.stRadio label,
-.stSelectbox label,
-.stTextInput label,
-.stForm label,
-[data-testid="stSidebar"] label {
-    font-size: 15px !important;
-    font-weight: 700 !important;
-    color: #e0f7ff !important;
+/* =========================================
+DATAFRAMES
+========================================= */
+
+[data-testid="stDataFrame"] {
+
+    border-radius: 18px !important;
+
+    overflow: hidden !important;
+
+    border:
+        1px solid rgba(255,255,255,0.10) !important;
 }
 
-.help,
-.stHelp,
-[data-testid="stTooltipIcon"],
-button[aria-label*="help"],
-button[title*="help"] {
-    color: #ffffff !important;
-    opacity: 1 !important;
-    fill: rgb(206 221 224 / 0.28) !important;
-    background: transparent !important;
+/* =========================================
+ALERTS
+========================================= */
+
+.stAlert,
+.stSuccess,
+.stError,
+.stWarning {
+
+    background:
+        rgba(0,0,0,0.35) !important;
+
+    border:
+        1px solid rgba(255,255,255,0.10) !important;
+
+    border-radius: 16px !important;
+
+    color: white !important;
 }
 
-[data-testid="stTooltipIcon"] {
-    display: inline-flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    width: 1.15rem !important;
-    height: 1.15rem !important;
-    border-radius: 50% !important;
-    background: rgba(0, 212, 255, 0.16) !important;
-    border: 1px solid rgba(223, 248, 255, 0.55) !important;
-    color: #dff8ff !important;
-    font-size: 0.85rem !important;
-    line-height: 1 !important;
-}
-
-[data-testid="stTooltipIcon"] svg,
-button[aria-label*="help"] svg,
-button[title*="help"] svg {
-    fill: rgb(255 255 255) !important;
-    stroke: rgb(250 248 248 / 0.55) !important;
-}
-
-[data-baseweb="popover"] {
-    background: rgba(8, 26, 40, 0.98) !important;
-    color: #9feeff !important;
-    border: 1px solid rgba(255,255,255,0.18) !important;
-}
-
-[data-baseweb="popover"] *,
-[data-baseweb="tooltip"] * {
-    color: #9feeff !important;
-    background: transparent !important;
-}
-
-[data-baseweb="tooltip"] {
-    background: rgba(8, 26, 40, 0.98) !important;
-    color: #9feeff !important;
-    border: 1px solid rgba(255,255,255,0.18) !important;
-}
-
-input[type="checkbox"] {
-    background: rgba(0, 212, 255, 0.3) !important;
-    border: 2px solid #2ab6b6 !important;
-    accent-color: #00d4ff !important;
-}
-
-.stCheckbox label {
-    color: #e0f7ff !important;
-    font-weight: 700 !important;
-}
+/* =========================================
+CODE BLOCKS
+========================================= */
 
 .stCode {
-    background: rgba(0, 0, 0, 0.6) !important;
-    border: 1px solid rgb(206 221 224 / 0.28) !important;
-    border-radius: 12px !important;
+
+    background:
+        rgba(0,0,0,0.5) !important;
+
+    border-radius: 14px !important;
+
+    border:
+        1px solid rgba(255,255,255,0.08) !important;
 }
 
 .stCode code {
+
     color: #00ffcc !important;
-    background: transparent !important;
 }
 
-[data-testid="stSidebar"] .stRadio {
-    margin-top: 1rem !important;
-    margin-bottom: 1rem !important;
-}
-
-[data-testid="stSidebar"] * {
-    color: #f6fcff !important;
-    font-size: 15px !important;
-}
-
-[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, rgba(6, 24, 37, 0.98), rgba(10, 73, 106, 0.96)) !important;
-    border-right: 1px solid rgba(255,255,255,0.12) !important;
-    overflow-y: auto !important;
-}
-
-[data-testid="stSidebar"] section {
-    background: transparent !important;
-}
-
-.stAlert, .stError, .stSuccess, .stWarning {
-    background: rgba(0, 0, 0, 0.45) !important;
-    border: 1px solid rgba(255,255,255,0.22) !important;
-    color: #ffffff !important;
-}
+/* =========================================
+TOP MENU
+========================================= */
 
 .top-menu-wrap {
+
     position: sticky;
+
     top: 0;
+
     z-index: 70;
-    background: rgba(8, 26, 40, 0.95);
+
+    background:
+        rgba(8,26,40,0.88);
+
     backdrop-filter: blur(18px);
-    padding: 0.25rem 0 0.3rem 0;
-    border-bottom: 1px solid rgba(255,255,255,0.10);
+
+    border-bottom:
+        1px solid rgba(255,255,255,0.08);
+
+    padding:
+        0.3rem 0;
 }
 
 .top-menu-bar {
+
     display: grid;
-    grid-template-columns: repeat(7, minmax(0, 1fr));
+
+    grid-template-columns:
+        repeat(7, minmax(0, 1fr));
+
     gap: 0.45rem;
-    margin: 0.35rem 0 0.55rem 0;
+
     width: 100%;
 }
 
-.top-menu-bar button {
-    width: 100% !important;
-    min-height: 42px !important;
-    border-radius: 14px !important;
-    font-size: 0.92rem !important;
-    white-space: nowrap !important;
-}
-
-/* =========================
-GLOBAL RESPONSIVE FIXES
-========================= */
+/* =========================================
+GLOBAL SAFETY
+========================================= */
 
 * {
-    box-sizing: border-box !important;
-}
 
-html,
-body,
-.stApp {
-    overflow-x: hidden !important;
-    width: 100% !important;
+    box-sizing: border-box !important;
 }
 
 img,
 video,
 canvas {
+
     max-width: 100% !important;
+
     height: auto !important;
 }
 
-h1,
-h2,
-h3,
-.section-title,
-.dashboard-title {
-    text-align: center !important;
-    width: 100%;
-}
-
-/* Prevent giant overflow on mobile */
 .element-container,
 .stMarkdown,
-.stDataFrame,
 .stTable {
+
     max-width: 100% !important;
 }
 
-/* Better touch scrolling */
-* {
-    -webkit-overflow-scrolling: touch;
-}
+/* =========================================
+MOBILE
+========================================= */
 
-/* Copy/Paste Support */
-input,
-textarea,
-[contenteditable="true"] {
-    user-select: text !important;
-    -webkit-user-select: text !important;
-}
-
-/* Enter Key Support */
-textarea {
-    resize: none !important;
-}
-
-/* Mobile scaling */
 @media (max-width: 768px) {
 
     .block-container {
-        padding-left: 0.65rem !important;
-        padding-right: 0.65rem !important;
+
+        padding-left: 0.7rem !important;
+
+        padding-right: 0.7rem !important;
     }
 
     h1 {
-        font-size: clamp(2rem, 7vw, 2.8rem) !important;
+
+        font-size:
+            clamp(2rem, 7vw, 2.8rem) !important;
     }
 
     h2 {
-        font-size: clamp(1.55rem, 5vw, 2.2rem) !important;
+
+        font-size:
+            clamp(1.5rem, 5vw, 2.1rem) !important;
     }
 
     h3 {
-        font-size: clamp(1.05rem, 4vw, 1.45rem) !important;
+
+        font-size:
+            clamp(1rem, 4vw, 1.3rem) !important;
     }
 
     .top-menu-wrap {
+
         overflow-x: auto !important;
     }
 
-    .stButton button {
-        min-height: 42px !important;
-        font-size: 14px !important;
+    .top-menu-bar {
+
+        min-width: 760px;
     }
 }

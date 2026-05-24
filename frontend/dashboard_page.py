@@ -1,3 +1,5 @@
+# dashboard_page.py
+
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -14,16 +16,18 @@ def circular_chart(title, value):
     else:
         color = "#FF4D6D"
 
-    fig = go.Figure(go.Pie(
-        values=[value, 100 - value],
-        hole=0.82,
-        marker_colors=[color, "#1c1f26"],
-        textinfo='none'
-    ))
+    fig = go.Figure(
+        go.Pie(
+            values=[value, 100 - value],
+            hole=0.82,
+            marker_colors=[color, "#1c1f26"],
+            textinfo="none"
+        )
+    )
 
     fig.update_layout(
         height=260,
-        paper_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor="rgba(0,0,0,0)",
         showlegend=False,
         margin=dict(t=20, b=20, l=20, r=20),
         annotations=[
@@ -117,6 +121,8 @@ def render_frontend_dashboard_page(role):
             unsafe_allow_html=True,
         )
 
+        # TOP WINRATE CHARTS
+
         top = st.columns(3)
 
         with top[0]:
@@ -127,17 +133,6 @@ def render_frontend_dashboard_page(role):
 
         with top[2]:
             circular_chart("Weekly", 74)
-
-        bottom = st.columns(3)
-
-        with bottom[0]:
-            circular_chart("Scalping", 77)
-
-        with bottom[1]:
-            circular_chart("Momentum", 65)
-
-        with bottom[2]:
-            circular_chart("Breakout", 82)
 
         st.markdown(
             '<div class="dashboard-section-space"></div>',
