@@ -15,8 +15,8 @@ class RealtimeClient:
     async def _send(self, payload: dict):
         async with websockets.connect(
             self.ws_url,
-            open_timeout=0.8,
-            close_timeout=0.8,
+            open_timeout=1.5,
+            close_timeout=1.5,
             ping_interval=None,
             max_size=None,
         ) as ws:
@@ -26,17 +26,19 @@ class RealtimeClient:
         def runner():
             try:
                 asyncio.run(self._send(payload))
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[REALTIME SEND ERROR] {e}")
 
         thread = threading.Thread(
             target=runner,
             daemon=True
         )
-
         thread.start()
-
         return True
+
+    # =========================
+    # CHAT
+    # =========================
 
     def send_chat(
         self,
@@ -48,19 +50,46 @@ class RealtimeClient:
         media_path=None,
         media_type=None
     ):
-        return self.safe_send(
-            {
-                "type": "chat_message",
-                "room_id": room_id,
-                "user_id": user_id,
-                "user_name": user_name,
-                "role": role,
-                "message": message,
-                "media_path": media_path,
-                "media_type": media_type,
-                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        )
+        return self.safe_send({
+            "type": "chat_message",
+            "room_id": room_id,
+            "user_id": user_id,
+            "user_name": user_name,
+            "role": role,
+            "message": message,
+            "media_path": media_path,
+            "media_type": media_type,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+    # =========================
+    # VOICE NOTE
+    # =========================
+
+    def send_voice_note(
+        self,
+        room_id,
+        user_id,
+        user_name,
+        role,
+        media_path,
+        media_type="audio/webm"
+    ):
+        return self.safe_send({
+            "type": "voice_note",
+            "room_id": room_id,
+            "user_id": user_id,
+            "user_name": user_name,
+            "role": role,
+            "message": "🎙️ Voice note",
+            "media_path": media_path,
+            "media_type": media_type,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+    # =========================
+    # PRESENCE
+    # =========================
 
     def send_presence(
         self,
@@ -72,55 +101,124 @@ class RealtimeClient:
         speaking=False,
         screen_sharing=False
     ):
-        return self.safe_send(
-            {
-                "type": "presence",
-                "room_id": room_id,
-                "user_id": user_id,
-                "user_name": user_name,
-                "muted": muted,
-                "in_call": in_call,
-                "speaking": speaking,
-                "screen_sharing": screen_sharing,
-            }
-        )
+        return self.safe_send({
+            "type": "presence",
+            "room_id": room_id,
+            "user_id": user_id,
+            "user_name": user_name,
+            "muted": muted,
+            "in_call": in_call,
+            "speaking": speaking,
+            "screen_sharing": screen_sharing,
+        })
 
     def send_join(self, room_id, user_id, user_name):
-        return self.safe_send(
-            {
-                "type": "join",
-                "room_id": room_id,
-                "user_id": user_id,
-                "user_name": user_name,
-            }
-        )
+        return self.safe_send({
+            "type": "join",
+            "room_id": room_id,
+            "user_id": user_id,
+            "user_name": user_name,
+        })
+
+    # =========================
+    # CALL EVENTS
+    # =========================
+
+    def start_call(self, room_id, user_id, user_name):
+        return self.safe_send({
+            "type": "call-start",
+            "room_id": room_id,
+            "user_id": user_id,
+            "user_name": user_name,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+    def end_call(self, room_id, user_id, user_name):
+        return self.safe_send({
+            "type": "call-end",
+            "room_id": room_id,
+            "user_id": user_id,
+            "user_name": user_name,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+    def send_hangup(
+        self,
+        room_id,
+        user_id,
+        user_name,
+        target_id=None
+    ):
+        return self.safe_send({
+            "type": "hangup",
+            "room_id": room_id,
+            "user_id": user_id,
+            "user_name": user_name,
+            "target_id": target_id,
+        })
+
+    # =========================
+    # SCREEN SHARE EVENTS
+    # =========================
+
+    def start_screen_share(self, room_id, user_id, user_name):
+        return self.safe_send({
+            "type": "screen_share_start",
+            "room_id": room_id,
+            "user_id": user_id,
+            "user_name": user_name,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+    def stop_screen_share(self, room_id, user_id, user_name):
+        return self.safe_send({
+            "type": "screen_share_stop",
+            "room_id": room_id,
+            "user_id": user_id,
+            "user_name": user_name,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+    # =========================
+    # WEBRTC SIGNALING
+    # =========================
 
     def send_signal(self, payload: dict):
         return self.safe_send(payload)
 
-    def send_offer(self, room_id, user_id, user_name, target_id, offer):
-        return self.safe_send(
-            {
-                "type": "offer",
-                "room_id": room_id,
-                "user_id": user_id,
-                "user_name": user_name,
-                "target_id": target_id,
-                "payload": offer,
-            }
-        )
+    def send_offer(
+        self,
+        room_id,
+        user_id,
+        user_name,
+        target_id,
+        offer
+    ):
+        return self.safe_send({
+            "type": "offer",
+            "room_id": room_id,
+            "user_id": user_id,
+            "user_name": user_name,
+            "target_id": target_id,
+            "payload": offer,
+        })
 
-    def send_answer(self, room_id, user_id, user_name, target_id, answer):
-        return self.safe_send(
-            {
-                "type": "answer",
-                "room_id": room_id,
-                "user_id": user_id,
-                "user_name": user_name,
-                "target_id": target_id,
-                "payload": answer,
-            }
-        )
+    def send_answer(
+        self,
+        room_id,
+        user_id,
+        user_name,
+        target_id,
+        answer
+    ):
+        return self.safe_send({
+            "type": "answer",
+            "room_id": room_id,
+            "user_id": user_id,
+            "user_name": user_name,
+            "target_id": target_id,
+            "payload": answer,
+        })
 
     def send_ice_candidate(
         self,
@@ -130,24 +228,11 @@ class RealtimeClient:
         target_id,
         candidate
     ):
-        return self.safe_send(
-            {
-                "type": "ice-candidate",
-                "room_id": room_id,
-                "user_id": user_id,
-                "user_name": user_name,
-                "target_id": target_id,
-                "payload": candidate,
-            }
-        )
-
-    def send_hangup(self, room_id, user_id, user_name, target_id=None):
-        return self.safe_send(
-            {
-                "type": "hangup",
-                "room_id": room_id,
-                "user_id": user_id,
-                "user_name": user_name,
-                "target_id": target_id,
-            }
-        )
+        return self.safe_send({
+            "type": "ice-candidate",
+            "room_id": room_id,
+            "user_id": user_id,
+            "user_name": user_name,
+            "target_id": target_id,
+            "payload": candidate,
+        })

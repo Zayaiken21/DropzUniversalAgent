@@ -4,11 +4,12 @@ from pathlib import Path
 from datetime import datetime
 from html import escape
 import base64
-
+from streamlit_autorefresh import st_autorefresh
 import streamlit as st
 import streamlit.components.v1 as components
 
 from frontend.style_loader import load_theme_css
+
 from frontend.realtime_client import RealtimeClient
 
 from chat_backend.chat_db import (
@@ -43,6 +44,17 @@ def _save_upload(upload):
 
     return str(file_path), upload.type
 
+def _save_voice_note(audio_file, user_id):
+    voice_dir = Path("chat_backend/uploads/voice_notes")
+    voice_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    file_path = voice_dir / f"voice_{user_id}_{timestamp}.wav"
+
+    with open(file_path, "wb") as f:
+        f.write(audio_file.getbuffer())
+
+    return str(file_path), "audio/wav"
 
 def _status_icon(member):
     if member.get("screen_sharing"):
@@ -114,6 +126,21 @@ def _media_html(msg):
         </div>
         <div class="attachment-note">
             File could not be previewed.
+        </div>
+        """
+    if media_type.startswith("audio/"):
+        return f"""
+        <div class="media-card">
+            <audio controls preload="metadata">
+                <source src="data:{media_type};base64,{encoded}" type="{media_type}">
+                Your browser does not support audio playback.
+            </audio>
+
+            <div class="media-actions">
+                <a class="download-link" download="{filename}" href="data:{media_type};base64,{encoded}">
+                    Download voice note
+                </a>
+            </div>
         </div>
         """
 
@@ -355,7 +382,7 @@ def _build_chat_html(messages, current_user, screen_share_active=False):
                 word-break: break-word;
                 text-align: left;
             }}
-
+            
             .media-card {{
                 margin-top: 10px;
                 border-radius: 14px;
@@ -381,7 +408,7 @@ def _build_chat_html(messages, current_user, screen_share_active=False):
                 border-radius: 12px;
                 background: rgba(0,0,0,0.35);
             }}
-
+            
             .media-actions {{
                 display: flex;
                 flex-wrap: wrap;
@@ -823,9 +850,16 @@ def _build_chat_html(messages, current_user, screen_share_active=False):
     """
 
 
-def render_frontend_chat_page():
+def render_frontend_chat_page(voice_note=None):
     load_theme_css()
+    if "pause_chat_refresh" not in st.session_state:
+        st.session_state.pause_chat_refresh = False
 
+    if not st.session_state.pause_chat_refresh:
+        st_autorefresh(
+            interval=2000,
+            key="chat_refresh"
+        )
     init_db()
     cleanup_inactive(minutes=1)
     prune_messages()
@@ -1003,8 +1037,9 @@ def render_frontend_chat_page():
             )
 
         with c2:
-            voice = st.form_submit_button(
-                "🎙",
+            voice_note = st.audio_input(
+                "Voice",
+                label_visibility="collapsed",
                 width="stretch"
             )
 
@@ -1051,8 +1086,68 @@ def render_frontend_chat_page():
 
                 st.rerun()
 
-        if voice:
-            st.info("Voice note path is wired through the realtime client and server signals.")
+        if "last_voice_note_signature" not in st.session_state:
+            st.session_state.last_voice_note_signature = None
+
+        if "last_voice_note_signature" not in st.session_state:
+            st.session_state.last_voice_note_signature = None
+
+        if "voice_note_input" not in st.session_state:
+            st.session_state.voice_note_input = None
+
+        if voice_note is not None:
+
+            st.session_state.pause_chat_refresh = True
+
+            voice_bytes = voice_note.getvalue()
+
+            voice_signature = str(hash(voice_bytes))
+
+            if st.session_state.last_voice_note_signature != voice_signature:
+
+                st.session_state.last_voice_note_signature = voice_signature
+
+                voice_dir = Path("chat_backend/uploads/voice_notes")
+                voice_dir.mkdir(parents=True, exist_ok=True)
+
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                file_path = voice_dir / f"voice_{user_id}_{timestamp}.wav"
+
+                with open(file_path, "wb") as f:
+                    f.write(voice_bytes)
+
+                media_path = str(file_path)
+                media_type = "audio/wav"
+
+                add_message(
+                    user_name,
+                    role,
+                    "🎙️ Voice note",
+                    media_path,
+                    media_type,
+                    room_id
+                )
+
+                rt.send_voice_note(
+                    room_id,
+                    user_id,
+                    user_name,
+                    role,
+                    media_path,
+                    media_type
+                )
+
+                st.session_state.pause_chat_refresh = False
+
+                try:
+                    del st.session_state["voice_note_input"]
+                except Exception:
+                    pass
+
+                st.rerun()
+
+        else:
+            st.session_state.pause_chat_refresh = False
 
         if share_screen:
             st.session_state.chat_screen_sharing = not st.session_state.chat_screen_sharing

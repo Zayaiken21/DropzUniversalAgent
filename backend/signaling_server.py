@@ -106,8 +106,8 @@ async def broadcast_presence(room_id: str):
     )
 
 
-@app.post("/upload_voice")
-async def upload_voice(
+@app.post("/upload_voice_note")
+async def upload_voice_note(
     file: UploadFile = File(...),
     room_id: str = Form("main"),
     user_id: str = Form("guest"),
