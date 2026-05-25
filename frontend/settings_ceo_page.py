@@ -66,3 +66,6 @@ def render_settings_ceo_page(role):
         st.success("**All client tokens cancelled.**")
         st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
+
+    from frontend.mt5_settings_component import render_mt5_credentials_settings
+    render_mt5_credentials_settings(role)

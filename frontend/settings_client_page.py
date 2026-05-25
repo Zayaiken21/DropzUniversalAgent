@@ -25,3 +25,6 @@ def render_settings_client_page(role):
         """,
         unsafe_allow_html=True,
     )
+
+    from frontend.mt5_settings_component import render_mt5_credentials_settings
+    render_mt5_credentials_settings(role)
