@@ -26,7 +26,8 @@ from chat_backend.chat_db import (
 )
 
 
-MAX_EMBED_MB = 8
+MAX_IMAGE_PREVIEW_MB = 35
+MAX_VIDEO_PREVIEW_MB = 20
 MAX_VISIBLE_MESSAGES = 60
 
 
@@ -44,6 +45,8 @@ def _save_upload(upload):
 
 
 def _status_icon(member):
+    if member.get("screen_sharing"):
+        return "🖥️"
     if member.get("in_call"):
         return "📞"
     if member.get("muted"):
@@ -82,16 +85,23 @@ def _media_html(msg):
 
     size_mb = _file_size_mb(path)
 
-    # CRITICAL FIX:
-    # Never base64 embed large files inside components.html.
-    # This prevents Streamlit MessageSizeError.
-    if size_mb > MAX_EMBED_MB:
+    if media_type.startswith("image/") and size_mb > MAX_IMAGE_PREVIEW_MB:
         return f"""
         <div class="attachment-chip">
-            📎 {filename} · {size_mb:.1f} MB
+            🖼️ {filename} · {size_mb:.1f} MB
         </div>
         <div class="attachment-note">
-            Large file preview disabled to protect app performance.
+            Image preview disabled because this file is too large for safe browser embedding.
+        </div>
+        """
+
+    if media_type.startswith("video/") and size_mb > MAX_VIDEO_PREVIEW_MB:
+        return f"""
+        <div class="attachment-chip">
+            🎬 {filename} · {size_mb:.1f} MB
+        </div>
+        <div class="attachment-note">
+            Video preview/download disabled here to prevent Streamlit’s 200MB message limit.
         </div>
         """
 
@@ -110,25 +120,48 @@ def _media_html(msg):
     if media_type.startswith("image/"):
         return f"""
         <div class="media-card">
-            <img src="data:{media_type};base64,{encoded}" alt="{filename}" />
+            <img
+                class="chat-image"
+                src="data:{media_type};base64,{encoded}"
+                alt="{filename}"
+                onclick="openImagePreview(this.src)"
+            />
 
-            <a class="download-link" download="{filename}" href="data:{media_type};base64,{encoded}">
-                Download photo
-            </a>
+            <div class="media-actions">
+                <button class="preview-link" onclick="openImagePreview(this.closest('.media-card').querySelector('img').src)">
+                    Open preview
+                </button>
+
+                <a class="download-link" download="{filename}" href="data:{media_type};base64,{encoded}">
+                    Download photo
+                </a>
+            </div>
         </div>
         """
 
     if media_type.startswith("video/"):
         return f"""
         <div class="media-card">
-            <video controls playsinline preload="metadata">
+            <video
+                class="chat-video"
+                controls
+                playsinline
+                preload="metadata"
+                onclick="event.stopPropagation();"
+            >
                 <source src="data:{media_type};base64,{encoded}" type="{media_type}">
                 Your browser does not support video playback.
             </video>
 
-            <a class="download-link" download="{filename}" href="data:{media_type};base64,{encoded}">
-                Download video
-            </a>
+            <div class="media-actions">
+                <button class="preview-link" onclick="openVideoPreview('data:{media_type};base64,{encoded}', '{media_type}')">
+                    Open preview
+                </button>
+
+                <a class="download-link" download="{filename}" href="data:{media_type};base64,{encoded}">
+                    Download video
+                </a>
+            </div>
         </div>
         """
 
@@ -139,7 +172,38 @@ def _media_html(msg):
     """
 
 
-def _build_chat_html(messages, current_user):
+def _screen_share_html(is_active, user_name):
+    active_class = "active" if is_active else ""
+    safe_user = escape(str(user_name))
+
+    return f"""
+    <div class="screen-share-dock {active_class}" id="screenShareDock">
+        <div class="screen-share-top">
+            <div>
+                <div class="screen-share-title">🖥️ Screen sharing</div>
+                <div class="screen-share-sub">{safe_user}</div>
+            </div>
+
+            <div class="screen-share-actions">
+                <button onclick="toggleScreenFullscreen()" title="Fullscreen">⛶</button>
+                <button onclick="stopLocalScreenShare()" title="Stop">×</button>
+            </div>
+        </div>
+
+        <div class="screen-share-stage">
+            <video id="screenShareVideo" autoplay muted playsinline></video>
+
+            <div class="screen-share-placeholder" id="screenSharePlaceholder">
+                <div class="screen-icon">🖥️</div>
+                <div>Screen share is starting...</div>
+                <small>Your browser may ask for permission.</small>
+            </div>
+        </div>
+    </div>
+    """
+
+
+def _build_chat_html(messages, current_user, screen_share_active=False):
     bubbles = []
 
     for msg in messages[-MAX_VISIBLE_MESSAGES:]:
@@ -172,6 +236,7 @@ def _build_chat_html(messages, current_user):
         bubbles.append(bubble)
 
     body = "\n".join(bubbles)
+    screen_share = _screen_share_html(screen_share_active, current_user)
 
     return f"""
     <!DOCTYPE html>
@@ -306,6 +371,7 @@ def _build_chat_html(messages, current_user):
                 max-height: 280px;
                 object-fit: contain;
                 border-radius: 12px;
+                cursor: zoom-in;
             }}
 
             .media-card video {{
@@ -316,9 +382,18 @@ def _build_chat_html(messages, current_user):
                 background: rgba(0,0,0,0.35);
             }}
 
+            .media-actions {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px;
+                margin-top: 10px;
+            }}
+
+            .preview-link,
             .download-link {{
                 display: inline-flex;
-                margin: 10px 0 2px 0;
+                align-items: center;
+                justify-content: center;
                 padding: 7px 11px;
                 border-radius: 999px;
                 background: rgba(0,0,0,0.24);
@@ -327,6 +402,12 @@ def _build_chat_html(messages, current_user):
                 font-weight: 800;
                 text-decoration: none;
                 border: 1px solid rgba(255,255,255,0.14);
+                cursor: pointer;
+            }}
+
+            .preview-link:hover,
+            .download-link:hover {{
+                background: rgba(0,212,255,0.22);
             }}
 
             .attachment-chip {{
@@ -347,6 +428,181 @@ def _build_chat_html(messages, current_user):
                 color: rgba(255,255,255,0.68);
                 font-size: 11px;
                 line-height: 1.35;
+            }}
+
+            .preview-overlay {{
+                position: fixed;
+                inset: 0;
+                display: none;
+                align-items: center;
+                justify-content: center;
+                background: rgba(0,0,0,0.88);
+                z-index: 9999;
+                padding: 18px;
+                box-sizing: border-box;
+            }}
+
+            .preview-overlay.active {{
+                display: flex;
+            }}
+
+            .preview-panel {{
+                position: relative;
+                width: 100%;
+                height: 100%;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }}
+
+            .preview-panel img {{
+                max-width: 96vw;
+                max-height: 88vh;
+                border-radius: 18px;
+                object-fit: contain;
+                box-shadow: 0 24px 80px rgba(0,0,0,0.48);
+            }}
+
+            .preview-panel video {{
+                max-width: 96vw;
+                max-height: 86vh;
+                border-radius: 18px;
+                background: black;
+                box-shadow: 0 24px 80px rgba(0,0,0,0.48);
+            }}
+
+            .close-preview {{
+                position: fixed;
+                top: 18px;
+                right: 18px;
+                width: 44px;
+                height: 44px;
+                border-radius: 999px;
+                border: 1px solid rgba(255,255,255,0.18);
+                background: rgba(0,0,0,0.62);
+                color: white;
+                font-size: 24px;
+                font-weight: 900;
+                cursor: pointer;
+                z-index: 10000;
+            }}
+
+            .screen-share-dock {{
+                position: absolute;
+                right: 16px;
+                top: 16px;
+                width: 285px;
+                min-height: 178px;
+                display: none;
+                z-index: 80;
+                border-radius: 20px;
+                overflow: hidden;
+                background:
+                    linear-gradient(
+                        180deg,
+                        rgba(6,24,37,0.96),
+                        rgba(8,40,62,0.94)
+                    );
+                border: 1px solid rgba(0,212,255,0.28);
+                box-shadow: 0 20px 60px rgba(0,0,0,0.42);
+                backdrop-filter: blur(18px);
+            }}
+
+            .screen-share-dock.active {{
+                display: block;
+            }}
+
+            .screen-share-top {{
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+                padding: 10px 11px;
+                border-bottom: 1px solid rgba(255,255,255,0.10);
+            }}
+
+            .screen-share-title {{
+                color: white;
+                font-size: 12px;
+                font-weight: 900;
+            }}
+
+            .screen-share-sub {{
+                color: rgba(255,255,255,0.62);
+                font-size: 11px;
+                margin-top: 2px;
+            }}
+
+            .screen-share-actions {{
+                display: flex;
+                align-items: center;
+                gap: 6px;
+            }}
+
+            .screen-share-actions button {{
+                width: 30px;
+                height: 30px;
+                border-radius: 999px;
+                border: 1px solid rgba(255,255,255,0.12);
+                background: rgba(255,255,255,0.08);
+                color: white;
+                cursor: pointer;
+                font-weight: 900;
+            }}
+
+            .screen-share-stage {{
+                position: relative;
+                height: 130px;
+                background: rgba(0,0,0,0.35);
+            }}
+
+            .screen-share-stage video {{
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
+                display: none;
+                background: black;
+            }}
+
+            .screen-share-placeholder {{
+                position: absolute;
+                inset: 0;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                color: rgba(255,255,255,0.82);
+                text-align: center;
+                font-size: 12px;
+                padding: 12px;
+            }}
+
+            .screen-share-placeholder small {{
+                color: rgba(255,255,255,0.52);
+                margin-top: 5px;
+                line-height: 1.25;
+            }}
+
+            .screen-icon {{
+                font-size: 24px;
+                margin-bottom: 5px;
+            }}
+
+            .screen-share-dock.fullscreen {{
+                position: fixed;
+                inset: 14px;
+                width: auto;
+                min-height: auto;
+                border-radius: 24px;
+                z-index: 9998;
+            }}
+
+            .screen-share-dock.fullscreen .screen-share-stage {{
+                height: calc(100% - 52px);
+            }}
+
+            .screen-share-dock.fullscreen .screen-share-stage video {{
+                object-fit: contain;
             }}
 
             .jump-btn {{
@@ -381,6 +637,12 @@ def _build_chat_html(messages, current_user):
                 .chat-scroll {{
                     padding: 14px;
                 }}
+
+                .screen-share-dock {{
+                    width: calc(100% - 28px);
+                    right: 14px;
+                    left: 14px;
+                }}
             }}
         </style>
     </head>
@@ -391,12 +653,36 @@ def _build_chat_html(messages, current_user):
                 {body}
             </div>
 
+            {screen_share}
+
             <button class="jump-btn" id="jumpBtn" onclick="scrollToLatest()">↓</button>
+        </div>
+
+        <div class="preview-overlay" id="previewOverlay">
+            <button class="close-preview" onclick="closePreview()">×</button>
+
+            <div class="preview-panel" onclick="event.stopPropagation();">
+                <img id="previewImage" src="" alt="Preview" style="display:none;" />
+
+                <video id="previewVideo" controls playsinline style="display:none;">
+                    <source id="previewVideoSource" src="" type="">
+                </video>
+            </div>
         </div>
 
         <script>
             const chatScroll = document.getElementById("chatScroll");
             const jumpBtn = document.getElementById("jumpBtn");
+            const overlay = document.getElementById("previewOverlay");
+            const previewImage = document.getElementById("previewImage");
+            const previewVideo = document.getElementById("previewVideo");
+            const previewVideoSource = document.getElementById("previewVideoSource");
+
+            const screenDock = document.getElementById("screenShareDock");
+            const screenVideo = document.getElementById("screenShareVideo");
+            const screenPlaceholder = document.getElementById("screenSharePlaceholder");
+
+            let localScreenStream = null;
 
             function distanceFromBottom() {{
                 return chatScroll.scrollHeight - chatScroll.scrollTop - chatScroll.clientHeight;
@@ -417,12 +703,120 @@ def _build_chat_html(messages, current_user):
                 }});
             }}
 
+            function openImagePreview(src) {{
+                previewVideo.pause();
+                previewVideo.style.display = "none";
+                previewVideoSource.src = "";
+
+                previewImage.src = src;
+                previewImage.style.display = "block";
+
+                overlay.classList.add("active");
+            }}
+
+            function openVideoPreview(src, type) {{
+                previewImage.style.display = "none";
+                previewImage.src = "";
+
+                previewVideoSource.src = src;
+                previewVideoSource.type = type;
+                previewVideo.load();
+                previewVideo.style.display = "block";
+
+                overlay.classList.add("active");
+            }}
+
+            function closePreview() {{
+                overlay.classList.remove("active");
+
+                previewImage.src = "";
+                previewImage.style.display = "none";
+
+                previewVideo.pause();
+                previewVideoSource.src = "";
+                previewVideo.load();
+                previewVideo.style.display = "none";
+            }}
+
+            async function startLocalScreenShare() {{
+                if (!screenDock || !screenVideo) return;
+
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {{
+                    screenPlaceholder.innerHTML =
+                        "<div class='screen-icon'>⚠️</div><div>Screen sharing is not supported in this browser.</div><small>Use Chrome or Edge on HTTPS/localhost.</small>";
+                    return;
+                }}
+
+                try {{
+                    localScreenStream = await navigator.mediaDevices.getDisplayMedia({{
+                        video: true,
+                        audio: false
+                    }});
+
+                    screenVideo.srcObject = localScreenStream;
+                    screenVideo.style.display = "block";
+                    screenPlaceholder.style.display = "none";
+
+                    localScreenStream.getVideoTracks()[0].addEventListener("ended", () => {{
+                        stopLocalScreenShare();
+                    }});
+                }} catch (error) {{
+                    screenPlaceholder.innerHTML =
+                        "<div class='screen-icon'>🖥️</div><div>Screen share permission was cancelled.</div><small>Click the screen share button again to retry.</small>";
+                }}
+            }}
+
+            function stopLocalScreenShare() {{
+                if (localScreenStream) {{
+                    localScreenStream.getTracks().forEach(track => track.stop());
+                }}
+
+                localScreenStream = null;
+
+                if (screenVideo) {{
+                    screenVideo.pause();
+                    screenVideo.srcObject = null;
+                    screenVideo.style.display = "none";
+                }}
+
+                if (screenPlaceholder) {{
+                    screenPlaceholder.style.display = "flex";
+                    screenPlaceholder.innerHTML =
+                        "<div class='screen-icon'>🖥️</div><div>Screen share stopped.</div><small>Use the screen share button to start again.</small>";
+                }}
+
+                if (screenDock) {{
+                    screenDock.classList.remove("fullscreen");
+                }}
+            }}
+
+            function toggleScreenFullscreen() {{
+                if (!screenDock) return;
+                screenDock.classList.toggle("fullscreen");
+            }}
+
+            overlay.addEventListener("click", closePreview);
+
+            document.addEventListener("keydown", function(event) {{
+                if (event.key === "Escape") {{
+                    closePreview();
+
+                    if (screenDock) {{
+                        screenDock.classList.remove("fullscreen");
+                    }}
+                }}
+            }});
+
             chatScroll.addEventListener("scroll", updateJumpButton);
 
             setTimeout(() => {{
                 chatScroll.scrollTop = chatScroll.scrollHeight;
                 updateJumpButton();
-            }}, 80);
+
+                if (screenDock && screenDock.classList.contains("active")) {{
+                    startLocalScreenShare();
+                }}
+            }}, 100);
         </script>
     </body>
     </html>
@@ -455,6 +849,7 @@ def render_frontend_chat_page():
         "chat_menu_open": False,
         "chat_muted": False,
         "chat_in_call": False,
+        "chat_screen_sharing": False,
         "chat_last_ping": 0.0,
     }
 
@@ -467,14 +862,15 @@ def render_frontend_chat_page():
     now = datetime.now().timestamp()
 
     if now - st.session_state.chat_last_ping >= 5:
-        status = "sharing" if st.session_state.chat_in_call else "active"
+        status = "sharing" if st.session_state.chat_screen_sharing else "active"
 
         set_user_presence(
             user_name,
             1,
             status,
             muted=int(st.session_state.chat_muted),
-            in_call=int(st.session_state.chat_in_call)
+            in_call=int(st.session_state.chat_in_call),
+            screen_sharing=int(st.session_state.chat_screen_sharing)
         )
 
         rt.send_presence(
@@ -569,7 +965,8 @@ def render_frontend_chat_page():
 
     chat_html = _build_chat_html(
         messages,
-        user_name
+        user_name,
+        screen_share_active=st.session_state.chat_screen_sharing
     )
 
     components.html(
@@ -586,7 +983,7 @@ def render_frontend_chat_page():
             height=78
         )
 
-        c1, c2, c3 = st.columns([1, 1, 4])
+        c1, c2, c3, c4 = st.columns([1, 1, 0.9, 1.4])
 
         with c1:
             upload = st.file_uploader(
@@ -612,6 +1009,12 @@ def render_frontend_chat_page():
             )
 
         with c3:
+            share_screen = st.form_submit_button(
+                "🖥️",
+                width="stretch"
+            )
+
+        with c4:
             send = st.form_submit_button(
                 "Send",
                 width="stretch"
@@ -650,3 +1053,33 @@ def render_frontend_chat_page():
 
         if voice:
             st.info("Voice note path is wired through the realtime client and server signals.")
+
+        if share_screen:
+            st.session_state.chat_screen_sharing = not st.session_state.chat_screen_sharing
+
+            share_text = (
+                f"🖥️ {user_name} started screen sharing."
+                if st.session_state.chat_screen_sharing
+                else f"🖥️ {user_name} stopped screen sharing."
+            )
+
+            add_message(
+                user_name,
+                role,
+                share_text,
+                None,
+                None,
+                room_id
+            )
+
+            rt.send_chat(
+                room_id,
+                user_id,
+                user_name,
+                role,
+                share_text,
+                None,
+                None
+            )
+
+            st.rerun()
