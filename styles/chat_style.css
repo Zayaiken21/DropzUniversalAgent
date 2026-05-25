@@ -101,51 +101,80 @@ textarea::placeholder {
 [data-testid="stAudioInput"] {
     min-height: 44px !important;
     border-radius: 18px !important;
-    border: 1px solid rgba(0,212,255,0.35) !important;
-    background: rgba(8,26,40,0.72) !important;
+    border: 1px solid rgba(0,212,255,0.38) !important;
+    background: rgba(8,26,40,0.88) !important;
     box-shadow:
         inset 0 0 0 1px rgba(255,255,255,0.04),
         0 10px 24px rgba(0,153,204,0.10) !important;
     overflow: hidden !important;
 }
 
+/* Remove white recorder panels */
 [data-testid="stAudioInput"] > div,
 [data-testid="stAudioInput"] section,
-[data-testid="stAudioInput"] [data-testid="stWidgetLabel"],
 [data-testid="stAudioInput"] [data-baseweb],
-[data-testid="stAudioInput"] [role="button"] {
+[data-testid="stAudioInput"] [role="button"],
+[data-testid="stAudioInput"] [data-testid="stWidgetLabel"],
+[data-testid="stAudioInput"] div,
+[data-testid="stAudioInput"] span,
+[data-testid="stAudioInput"] p {
     background: transparent !important;
     color: #ffffff !important;
-    border-radius: 18px !important;
-}
-
-[data-testid="stAudioInput"] * {
-    color: #ffffff !important;
     -webkit-text-fill-color: #ffffff !important;
+    border-color: rgba(0,212,255,0.30) !important;
 }
 
+/* Recorder timer / duration text */
+[data-testid="stAudioInput"] time,
+[data-testid="stAudioInput"] label {
+    color: rgba(255,255,255,0.92) !important;
+    -webkit-text-fill-color: rgba(255,255,255,0.92) !important;
+}
+
+/* Main recorder buttons */
 [data-testid="stAudioInput"] button,
 [data-testid="stAudioInput"] button[kind="secondary"],
 [data-testid="stAudioInput"] [role="button"] {
     background: linear-gradient(135deg, #00d4ff, #0099cc) !important;
     color: #ffffff !important;
     -webkit-text-fill-color: #ffffff !important;
-    border: 1px solid rgba(255,255,255,0.18) !important;
+    border: 1px solid rgba(255,255,255,0.20) !important;
     border-radius: 14px !important;
     font-weight: 800 !important;
     min-height: 40px !important;
     box-shadow: 0 8px 20px rgba(0,153,204,0.18) !important;
 }
 
-/* Audio recorder error/status box fix */
-[data-testid="stAudioInput"] div,
-[data-testid="stAudioInput"] span,
-[data-testid="stAudioInput"] p {
+/* Fix white save/cancel icons/buttons */
+[data-testid="stAudioInput"] svg,
+[data-testid="stAudioInput"] svg path,
+[data-testid="stAudioInput"] button svg,
+[data-testid="stAudioInput"] button svg path {
+    fill: #ffffff !important;
+    stroke: #ffffff !important;
+    color: #ffffff !important;
+}
+
+[data-testid="stAudioInput"] button:first-of-type {
+    background: linear-gradient(135deg, #00d4ff, #0099cc) !important;
+}
+
+[data-testid="stAudioInput"] button:last-of-type {
+    background: rgba(8,26,40,0.92) !important;
+    border: 1px solid rgba(255,255,255,0.22) !important;
+}
+
+/* Hide awkward white recorder status blocks if Streamlit renders them */
+[data-testid="stAudioInput"] [style*="background-color: white"],
+[data-testid="stAudioInput"] [style*="background: white"],
+[data-testid="stAudioInput"] [style*="background-color: rgb(255"],
+[data-testid="stAudioInput"] [style*="background: rgb(255"] {
+    background: rgba(8,26,40,0.88) !important;
     color: #ffffff !important;
     -webkit-text-fill-color: #ffffff !important;
 }
 
-/* Uploaded/recorded audio player theme */
+/* Audio player theme */
 audio {
     width: 100% !important;
     border-radius: 999px !important;
