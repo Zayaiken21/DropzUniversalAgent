@@ -1,5 +1,5 @@
 plotly
-dotenv
+python-dotenv
 streamlit>=1.36.0
 pandas>=2.2.0
 pytz>=2024.1
