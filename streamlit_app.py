@@ -50,6 +50,13 @@ st.markdown(
             padding-left: 0.45rem !important;
             padding-right: 0.45rem !important;
         }
+        [data-testid="stHorizontalBlock"] {
+            flex-direction: column !important;
+        }
+        [data-testid="column"] {
+            width: 100% !important;
+            flex: 1 1 100% !important;
+        }
     }
     </style>
     """,
@@ -74,8 +81,14 @@ if "chat_mute" not in st.session_state:
     st.session_state.chat_mute = False
 
 def _go(page_name: str):
+    """Switch pages through a Streamlit callback so only one rerun happens."""
     st.session_state.selected_page = page_name
-    st.rerun()
+
+def _logout():
+    """Clear the active session without leaving old page content behind."""
+    st.session_state.authenticated = False
+    st.session_state.user = None
+    st.session_state.selected_page = "dashboard"
 
 if not st.session_state.authenticated:
     render_frontend_login_page()
@@ -94,14 +107,23 @@ else:
 
     for col, label in zip(menu_cols, menu_labels):
         with col:
-            if st.button(label, use_container_width=True, key=f"top_{label}"):
-                if label == "Logout":
-                    st.session_state.authenticated = False
-                    st.session_state.user = None
-                    st.session_state.selected_page = "dashboard"
-                    st.rerun()
-                else:
-                    _go(label.lower())
+            is_active = label.lower() == st.session_state.selected_page
+            button_label = f"● {label}" if is_active and label != "Logout" else label
+            if label == "Logout":
+                st.button(
+                    button_label,
+                    use_container_width=True,
+                    key=f"top_{label}",
+                    on_click=_logout,
+                )
+            else:
+                st.button(
+                    button_label,
+                    use_container_width=True,
+                    key=f"top_{label}",
+                    on_click=_go,
+                    args=(label.lower(),),
+                )
 
     st.markdown('</div>', unsafe_allow_html=True)
 
