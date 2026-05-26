@@ -3,6 +3,9 @@ python-dotenv
 streamlit>=1.36.0
 pandas>=2.2.0
 pytz>=2024.1
+pypdf
+PyPDF2
+metatrader5
 python-dateutil>=2.9.0
 Pillow>=10.0.0
 numpy
@@ -43,3 +46,4 @@ streamlit-js-eval
 streamlit-chat
 streamlit-float
 cryptography
+strategies

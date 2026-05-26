@@ -138,8 +138,8 @@ else:
         render_frontend_tradesmart_page()
     elif page == "chat":
         now = time.time()
-        if now - st.session_state.last_chat_refresh > 30:
-            st.session_state.last_chat_refresh = now
+        if now - st.session_state.last_chat_refresh:
+            st.session_state.last_chat_refresh
         render_frontend_chat_page()
     elif page == "tools":
         render_frontend_tools_page()
