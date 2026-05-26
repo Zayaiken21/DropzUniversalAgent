@@ -42,5 +42,4 @@ streamlit-webrtc
 streamlit-js-eval
 streamlit-chat
 streamlit-float
-MetaTrader5
 cryptography
