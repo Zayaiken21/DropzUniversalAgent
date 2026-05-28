@@ -1,8 +1,228 @@
-.env
-__.pyc
+# =========================================================
+# TradeSmart AI — Advanced Production Git Ignore
+# =========================================================
+
+# ---------------------------------------------------------
+# Python
+# ---------------------------------------------------------
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 *.pyo
-.DS_Store
+*.pyd
+*.so
+.Python
+.python-version
+
+# Build / Distribution
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Packaging
+pip-wheel-metadata/
+
+# Testing / Coverage
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+
+# Environments
+.env
+.env.*
+.venv/
 venv/
-.env.backup
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# IDEs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------------------------------------------------------
+# Logs
+# ---------------------------------------------------------
+logs/
+*.log
+*.tmp
+*.bak
+*.old
+*.pid
+*.seed
+*.stackdump
+
+# ---------------------------------------------------------
+# Streamlit
+# ---------------------------------------------------------
+.streamlit/secrets.toml
+
+# ---------------------------------------------------------
+# MetaTrader5 / TradeSmart
+# ---------------------------------------------------------
+
+# MT5 terminal cache
+MQL5/Logs/
+MQL5/Profiles/
+MQL5/Bases/
+MQL5/Tester/
+MQL5/Shared Projects/
+
+# MT5 generated binaries
+*.ex5
+*.mqh~
+
+# TradeSmart bridge outputs
+TradeSmart_AI_DrawCommands.json1
+TradeSmart_AI_DrawCommands.jsonl
+TradeSmart_AI_Debug_LastSignal.json
+TradeSmart_AI_PDF_Memory.json
+
+# Runtime state
+data/
+state/
+runtime/
+cache/
+temp/
+tmp/
+
+# Local account configs
+account.json
+accounts.json
+profiles.json
+mt5_profile.json
+trade_profile.json
+*.credentials.json
+
+# Agent state
+tradesmart_agent_state.json
+session_state.json
+
+# ---------------------------------------------------------
+# AI / PDF Learning
+# ---------------------------------------------------------
+
+# Ignore extracted memory/cache
+strategies/pdfs/cache/
+strategies/pdfs/vectorstore/
+strategies/pdfs/embeddings/
+strategies/pdfs/chunks/
+strategies/pdfs/index/
+
+# Keep actual PDFs tracked if desired:
+# Uncomment next line if you DO NOT want PDFs in git
+# strategies/pdfs/*.pdf
+
+# ---------------------------------------------------------
+# Databases
+# ---------------------------------------------------------
+*.sqlite
+*.sqlite3
+*.db
+*.mdb
+
+# ---------------------------------------------------------
+# Jupyter
+# ---------------------------------------------------------
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------
+# Backtesting / ML
+# ---------------------------------------------------------
+backtests/
+optimization/
+tensorboard/
+runs/
+checkpoints/
+models/
+weights/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+
+# ---------------------------------------------------------
+# Sensitive MT5 Paths
+# ---------------------------------------------------------
+# Your local MT5 roaming paths should NEVER sync
+AppData/
+MetaQuotes/
+Terminal/
+
+# ---------------------------------------------------------
+# Trade Exports
+# ---------------------------------------------------------
+exports/
+reports/
+screenshots/
+charts/
+recordings/
+
+# ---------------------------------------------------------
+# Generated Charts / Markups
+# ---------------------------------------------------------
+chartshots/
+markup/
+drawings/
+snapshots/
+
+# ---------------------------------------------------------
+# Node / Frontend
+# ---------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ---------------------------------------------------------
+# Docker
+# ---------------------------------------------------------
+docker-compose.override.yml
+
+# ---------------------------------------------------------
+# Secrets
+# ---------------------------------------------------------
+*.pem
+*.key
+*.crt
+*.pfx
+*.secret
+*.token
+
+# ---------------------------------------------------------
+# Keep structure
+# ---------------------------------------------------------
+!.gitkeep
