@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -26,7 +26,7 @@ RATE_LIMIT_WINDOW_SECONDS = 10
 RATE_LIMIT_MAX_REQUESTS = 60
 _rate_buckets: dict[str, deque[float]] = defaultdict(deque)
 
-app = FastAPI(title="TradeSmart Safe Windows MT5 Bridge", version="1.0.0")
+app = FastAPI(title="TradeSmart Safe Windows MT5 Bridge", version="1.0.1")
 
 
 class MT5Profile(BaseModel):
@@ -59,8 +59,19 @@ class CloseRequest(BaseModel):
     profile: Optional[MT5Profile] = None
 
 
+class RatesRequest(BaseModel):
+    symbol: str = ALLOWED_SYMBOL
+    timeframe: str = "M1"
+    count: int = 100
+    profile: Optional[MT5Profile] = None
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def json_dumps(obj: Any) -> str:
+    return json.dumps(obj, default=str, separators=(",", ":"))
 
 
 def _audit(event: str, payload: Dict[str, Any] | None = None) -> None:
@@ -73,11 +84,6 @@ def _audit(event: str, payload: Dict[str, Any] | None = None) -> None:
             fh.write(json_dumps({"ts": _now(), "event": event, "payload": safe}) + "\n")
     except Exception:
         pass
-
-
-def json_dumps(obj: Any) -> str:
-    import json
-    return json.dumps(obj, default=str, separators=(",", ":"))
 
 
 def _client_key(request: Request) -> str:
@@ -158,6 +164,19 @@ def _initialize(profile: Optional[MT5Profile] = None):
     return mt5
 
 
+def _asdict(obj: Any) -> Dict[str, Any]:
+    if obj is None:
+        return {}
+    if hasattr(obj, "_asdict"):
+        return obj._asdict()
+    if isinstance(obj, dict):
+        return obj
+    try:
+        return dict(obj)
+    except Exception:
+        return {}
+
+
 def _account(mt5) -> Dict[str, Any]:
     info = mt5.account_info()
     if info is None:
@@ -168,6 +187,9 @@ def _account(mt5) -> Dict[str, Any]:
         "server": data.get("server"),
         "balance": data.get("balance"),
         "equity": data.get("equity"),
+        "profit": data.get("profit"),
+        "margin": data.get("margin"),
+        "margin_free": data.get("margin_free"),
         "currency": data.get("currency"),
         "leverage": data.get("leverage"),
         "trade_allowed": data.get("trade_allowed"),
@@ -178,14 +200,51 @@ def _positions(mt5) -> list[Dict[str, Any]]:
     raw = mt5.positions_get(symbol=ALLOWED_SYMBOL)
     if raw is None:
         return []
-    return [p._asdict() for p in raw]
+    return [_asdict(p) for p in raw]
 
 
 def _orders(mt5) -> list[Dict[str, Any]]:
     raw = mt5.orders_get(symbol=ALLOWED_SYMBOL)
     if raw is None:
         return []
-    return [o._asdict() for o in raw]
+    return [_asdict(o) for o in raw]
+
+
+def _rates(mt5, timeframe: str = "M1", count: int = 100) -> list[Dict[str, Any]]:
+    timeframe_map = {
+        "M1": mt5.TIMEFRAME_M1,
+        "M5": mt5.TIMEFRAME_M5,
+        "M15": mt5.TIMEFRAME_M15,
+        "M30": mt5.TIMEFRAME_M30,
+        "H1": mt5.TIMEFRAME_H1,
+    }
+    tf = timeframe_map.get(str(timeframe or "M1").upper(), mt5.TIMEFRAME_M1)
+    raw = mt5.copy_rates_from_pos(ALLOWED_SYMBOL, tf, 0, max(1, min(int(count or 100), 500)))
+    if raw is None:
+        return []
+    rows = []
+    names = getattr(getattr(raw, "dtype", None), "names", None)
+    for row in raw:
+        if names:
+            rows.append({str(name): row[name].item() if hasattr(row[name], "item") else row[name] for name in names})
+        else:
+            rows.append(_asdict(row))
+    rows.sort(key=lambda item: int(item.get("time", 0) or 0))
+    return rows
+
+
+def _deals(mt5, days: int = 30) -> list[Dict[str, Any]]:
+    to_dt = datetime.now()
+    from_dt = to_dt - timedelta(days=max(1, min(int(days or 30), 365)))
+    raw = mt5.history_deals_get(from_dt, to_dt)
+    deals: list[Dict[str, Any]] = []
+    if raw is not None:
+        for deal in raw:
+            data = _asdict(deal)
+            if str(data.get("symbol", "")).upper() == ALLOWED_SYMBOL:
+                deals.append(data)
+    deals.sort(key=lambda d: int(d.get("time", 0) or 0), reverse=True)
+    return deals
 
 
 @app.middleware("http")
@@ -224,7 +283,15 @@ def connect(req: ConnectRequest, request: Request, authorization: Optional[str] 
     _require_token(authorization)
     _require_symbol(req.symbol)
     mt5 = _initialize(req.profile)
-    payload = {"ok": True, "connected": True, "symbol": ALLOWED_SYMBOL, "account": _account(mt5), "positions": _positions(mt5), "orders": _orders(mt5), "ts": _now()}
+    payload = {
+        "ok": True,
+        "connected": True,
+        "symbol": ALLOWED_SYMBOL,
+        "account": _account(mt5),
+        "positions": _positions(mt5),
+        "orders": _orders(mt5),
+        "ts": _now(),
+    }
     _audit("connect", {"account": payload["account"]})
     return payload
 
@@ -250,6 +317,28 @@ def orders(request: Request, authorization: Optional[str] = Header(None)):
     _require_token(authorization)
     mt5 = _mt5()
     return {"ok": True, "symbol": ALLOWED_SYMBOL, "orders": _orders(mt5), "account": _account(mt5), "ts": _now()}
+
+
+@app.get("/history")
+def history(days: int = 30, request: Request = None, authorization: Optional[str] = Header(None)):
+    _require_token(authorization)
+    mt5 = _initialize(None)
+    return {"ok": True, "symbol": ALLOWED_SYMBOL, "deals": _deals(mt5, days), "account": _account(mt5), "ts": _now()}
+
+
+@app.post("/rates")
+def rates(req: RatesRequest, request: Request, authorization: Optional[str] = Header(None)):
+    _require_token(authorization)
+    _require_symbol(req.symbol)
+    mt5 = _initialize(req.profile)
+    return {
+        "ok": True,
+        "symbol": ALLOWED_SYMBOL,
+        "timeframe": req.timeframe,
+        "rates": _rates(mt5, req.timeframe, req.count),
+        "account": _account(mt5),
+        "ts": _now(),
+    }
 
 
 @app.post("/place_trade")
