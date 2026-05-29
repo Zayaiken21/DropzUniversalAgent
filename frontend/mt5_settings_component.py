@@ -30,6 +30,31 @@ def _clear_connection_state() -> None:
     shutdown_mt5()
 
 
+
+
+def _sync_tradesmart_profile_state(user_key: str, selected_mode: str, profile: dict) -> None:
+    """Make the freshly saved Settings profile immediately visible to TradeSmart."""
+    selected_mode = str(selected_mode or "Demo").title()
+    profile = dict(profile or {})
+    profile["mode"] = selected_mode
+
+    # Session mirrors used by TradeSmart page as an immediate refresh path.
+    st.session_state[f"tradesmart_saved_mt5_profile_{user_key}_{selected_mode}"] = profile
+    st.session_state[f"tradesmart_saved_mt5_profile_{selected_mode}"] = profile
+    st.session_state[f"mt5_saved_profile_{user_key}_{selected_mode}"] = profile
+
+    # Clear stale TradeSmart connection/snapshot state so the page reloads the new profile.
+    for key in list(st.session_state.keys()):
+        text = str(key)
+        if (
+            text.startswith("tradesmart_account_snapshot_")
+            or text.startswith("tradesmart_last_result_")
+            or text.startswith("tradesmart_connected_")
+            or text.startswith("tradesmart_connected_mode_")
+        ):
+            st.session_state.pop(key, None)
+
+
 def _set_mode(user_key: str, selected_mode: str) -> None:
     selected_mode = selected_mode.title()
     st.session_state[f"mt5_active_mode_{user_key}"] = selected_mode
@@ -173,18 +198,8 @@ def render_mt5_credentials_settings(role: str = "client") -> None:
         current_ready, current_missing = is_profile_ready(current_profile)
 
         if clear_clicked:
-            clear_mt5_profile(user_key, selected_mode, role=role)
-
-            # Remove stale widget values for this selected mode so the cleared
-            # profile does not visually repopulate from Streamlit session state.
-            for state_key in list(st.session_state.keys()):
-                key_text = str(state_key)
-                if (
-                    key_text.startswith(("mt5_login_input_", "mt5_password_input_", "mt5_server_input_", "mt5_terminal_path_", "mt5_timeout_", "mt5_portable_", "mt5_advanced_"))
-                    and f"_{user_key}_{selected_mode}_" in key_text
-                ):
-                    st.session_state.pop(state_key, None)
-
+            clear_mt5_profile(user_key, selected_mode)
+            _sync_tradesmart_profile_state(user_key, selected_mode, {})
             _set_mode(user_key, selected_mode)
             st.success(f"{selected_mode} MT5 credentials cleared.")
             st.rerun()
@@ -193,8 +208,15 @@ def render_mt5_credentials_settings(role: str = "client") -> None:
             save_mt5_profile_for_current_user(selected_mode, current_profile, role=role)
             _set_mode(user_key, selected_mode)
 
+            # Reload from encrypted store after saving. This confirms the write worked
+            # and gives TradeSmart the exact same profile Settings just saved.
+            saved_after_write = load_mt5_profile(user_key, selected_mode, role=role) or dict(current_profile)
+            if not saved_after_write.get("login") and current_profile.get("login"):
+                saved_after_write = dict(current_profile)
+            _sync_tradesmart_profile_state(user_key, selected_mode, saved_after_write)
+
             if current_ready:
-                st.success(f"{selected_mode} MT5 credentials saved.")
+                st.success(f"{selected_mode} MT5 credentials saved and sent to TradeSmart.")
             else:
                 st.warning(f"{selected_mode} MT5 profile saved but still missing: {', '.join(current_missing)}.")
 
