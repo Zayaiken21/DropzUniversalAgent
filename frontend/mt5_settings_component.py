@@ -173,7 +173,18 @@ def render_mt5_credentials_settings(role: str = "client") -> None:
         current_ready, current_missing = is_profile_ready(current_profile)
 
         if clear_clicked:
-            clear_mt5_profile(user_key, selected_mode)
+            clear_mt5_profile(user_key, selected_mode, role=role)
+
+            # Remove stale widget values for this selected mode so the cleared
+            # profile does not visually repopulate from Streamlit session state.
+            for state_key in list(st.session_state.keys()):
+                key_text = str(state_key)
+                if (
+                    key_text.startswith(("mt5_login_input_", "mt5_password_input_", "mt5_server_input_", "mt5_terminal_path_", "mt5_timeout_", "mt5_portable_", "mt5_advanced_"))
+                    and f"_{user_key}_{selected_mode}_" in key_text
+                ):
+                    st.session_state.pop(state_key, None)
+
             _set_mode(user_key, selected_mode)
             st.success(f"{selected_mode} MT5 credentials cleared.")
             st.rerun()
