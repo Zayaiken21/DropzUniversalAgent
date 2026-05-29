@@ -46,3 +46,4 @@ streamlit-chat
 streamlit-float
 cryptography
 strategies
+metatrader5
