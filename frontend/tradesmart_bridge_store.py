@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -27,6 +28,21 @@ def _get_key() -> bytes:
     Fernet = _get_crypto()
     if Fernet is None:
         return b""
+
+    env_key = (
+        os.getenv("TRADESMART_BRIDGE_FERNET_KEY")
+        or os.getenv("TRADESMART_MASTER_KEY")
+        or ""
+    ).strip()
+    if env_key:
+        return env_key.encode("utf-8")
+
+    try:
+        secret_key = str(st.secrets.get("TRADESMART_BRIDGE_FERNET_KEY", "") or st.secrets.get("TRADESMART_MASTER_KEY", "") or "").strip()
+        if secret_key:
+            return secret_key.encode("utf-8")
+    except Exception:
+        pass
 
     if KEY_PATH.exists():
         return KEY_PATH.read_bytes()
@@ -58,8 +74,22 @@ def _decrypt(value: str) -> str:
 
 
 def normalize_bridge_url(url: str) -> str:
-    url = (url or "").strip().rstrip("/")
-    return url
+    return (url or "").strip().rstrip("/")
+
+
+def _secret_or_env(*names: str) -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return str(value).strip()
+    try:
+        for name in names:
+            value = st.secrets.get(name, "")
+            if value:
+                return str(value).strip()
+    except Exception:
+        pass
+    return ""
 
 
 def get_current_user_key(scope: str = "user") -> str:
@@ -106,11 +136,26 @@ def save_bridge_settings(user_key: str, bridge_url: str, bridge_token: str) -> N
 
 
 def load_bridge_settings(user_key: Optional[str] = None) -> Dict[str, str]:
+    """
+    Load per-user saved bridge settings, with automatic fallback to env/secrets.
+
+    This is what makes the bridge automatic when you add:
+      TRADESMART_BRIDGE_URL
+      TRADESMART_BRIDGE_TOKEN
+    to Streamlit secrets or .env.
+    """
     user_key = user_key or get_current_user_key()
     data = _read_store().get(user_key, {})
+
+    saved_url = normalize_bridge_url(data.get("bridge_url", ""))
+    saved_token = _decrypt(data.get("bridge_token_encrypted", ""))
+
+    auto_url = normalize_bridge_url(_secret_or_env("TRADESMART_BRIDGE_URL", "BRIDGE_URL"))
+    auto_token = _secret_or_env("TRADESMART_BRIDGE_TOKEN", "BRIDGE_TOKEN")
+
     return {
-        "bridge_url": data.get("bridge_url", ""),
-        "bridge_token": _decrypt(data.get("bridge_token_encrypted", "")),
+        "bridge_url": saved_url or auto_url,
+        "bridge_token": saved_token or auto_token,
     }
 
 
