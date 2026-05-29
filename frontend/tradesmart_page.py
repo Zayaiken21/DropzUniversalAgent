@@ -848,14 +848,62 @@ def render_tradesmart(role: str = "client") -> None:
     if connected and agent_enabled:
         @st.fragment(run_every=TRADESMART_CHECK_INTERVAL_SECONDS)
         def _live_cycle() -> None:
-            result = _run_agent_cycle(profile, mode, risk, execution_enabled=True, user_key=user_key)
+
+            import platform
+
+            if platform.system() != "Windows":
+                from frontend.tradesmart_bridge_client import get_bridge_status
+
+                ok, bridge = get_bridge_status(profile)
+
+                if ok:
+                    result = {
+                        "ok": True,
+                        "event": "Bridge Connected",
+                        "message": "TradeSmart connected through Windows bridge.",
+                        "thinking": "Bridge is tracking XAUUSD and MT5 activity.",
+                        "account": bridge.get("account", {}),
+                        "positions": bridge.get("positions", []),
+                        "open_positions_count": len(bridge.get("positions", [])),
+                        "decision": {"action": "TRACK"},
+                    }
+                else:
+                    result = {
+                        "ok": False,
+                        "event": "Bridge Offline",
+                        "message": bridge.get("message", "Windows bridge offline."),
+                        "thinking": "Waiting for MT5 bridge connection.",
+                    }
+
+                account = _set_account_snapshot(
+                    user_key,
+                    mode,
+                    result.get("account") or {},
+                    result,
+                )
+
+                _render_metrics(account, mode, True)
+                _render_live_output(result)
+                return
+
+            result = _run_agent_cycle(
+                profile,
+                mode,
+                risk,
+                execution_enabled=True,
+                user_key=user_key,
+            )
+
             account = _get_account_snapshot(user_key, mode)
             _render_metrics(account, mode, True)
             _render_live_output(result)
 
             if result.get("max_daily_loss_reached"):
                 st.session_state[force_stop_key] = True
-                st.session_state[loss_msg_key] = result.get("message", "Max daily loss limit reached. Agent stopped.")
+                st.session_state[loss_msg_key] = result.get(
+                    "message",
+                    "Max daily loss limit reached. Agent stopped.",
+                )
                 st.error(st.session_state[loss_msg_key])
                 st.rerun()
 
@@ -863,10 +911,28 @@ def render_tradesmart(role: str = "client") -> None:
     elif connected:
         @st.fragment(run_every=TRADESMART_CHECK_INTERVAL_SECONDS)
         def _snapshot_cycle() -> None:
-            account = _refresh_account_snapshot(profile, mode, user_key)
-            _render_metrics(account, mode, True)
+            import platform
 
-        _snapshot_cycle()
+            if platform.system() != "Windows":
+                from frontend.tradesmart_bridge_client import get_bridge_status
+
+                ok, bridge = get_bridge_status(profile)
+
+                if ok:
+                    account = _set_account_snapshot(
+                        user_key,
+                        mode,
+                        bridge.get("account", {}),
+                        {
+                            "positions": bridge.get("positions", []),
+                            "open_positions_count": len(bridge.get("positions", [])),
+                        },
+                    )
+                else:
+                    account = _get_account_snapshot(user_key, mode)
+
+            else:
+                account = _refresh_account_snapshot(profile, mode, user_key)
     else:
         account = _get_account_snapshot(user_key, mode)
         _render_metrics(account, mode, connected)
