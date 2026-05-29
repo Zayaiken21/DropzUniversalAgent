@@ -742,8 +742,28 @@ def render_tradesmart(role: str = "client") -> None:
     with b1:
         if not connected:
             if st.button(f"Connect {mode} MT5", use_container_width=True, disabled=not _is_complete_profile(profile)):
-                agent = TradeSmartAgent(profile=profile, rules={"mode": mode, "symbol": SYMBOL})
-                result = agent.connect_only()
+                import platform
+
+                if platform.system() != "Windows":
+                    from frontend.tradesmart_bridge_client import connect_bridge
+
+                    ok, bridge = connect_bridge(profile)
+
+                    result = {
+                        "ok": ok,
+                        "phase": "connect",
+                        "event": "Connected" if ok else "Connection Failed",
+                        "message": "Connected through Windows bridge." if ok else bridge.get("message",
+                                                                                             "Bridge connection failed."),
+                        "thinking": "Using Windows bridge for MT5 access.",
+                        "account": bridge.get("account", {}) if ok else {},
+                        "open_positions_count": len(bridge.get("positions", [])) if ok else 0,
+                        "positions": bridge.get("positions", []) if ok else [],
+                    }
+
+                else:
+                    agent = TradeSmartAgent(profile=profile, rules={"mode": mode, "symbol": SYMBOL})
+                    result = agent.connect_only()
                 if result.get("ok"):
                     st.session_state[connected_key] = True
                     st.session_state[connected_mode_key] = mode
@@ -759,7 +779,13 @@ def render_tradesmart(role: str = "client") -> None:
                 # showing an old open-trade count after the agent is stopped.
                 if _is_complete_profile(profile):
                     _refresh_account_snapshot(profile, mode, user_key)
-                TradeSmartAgent(profile=profile, rules={"mode": mode, "symbol": SYMBOL}).disconnect()
+                import platform
+
+                if platform.system() != "Windows":
+                    from frontend.tradesmart_bridge_client import disconnect_bridge
+                    disconnect_bridge(profile)
+                else:
+                    TradeSmartAgent(profile=profile, rules={"mode": mode, "symbol": SYMBOL}).disconnect()
                 st.session_state[connected_key] = False
                 st.session_state[connected_mode_key] = None
                 _save_tradesmart_worker_state(
