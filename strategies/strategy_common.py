@@ -17,17 +17,10 @@ DRAW_JSON1 = "TradeSmart_AI_DrawCommands.json1"
 DRAW_JSONL = "TradeSmart_AI_DrawCommands.jsonl"
 DEBUG_FILE = "TradeSmart_AI_Debug_LastSignal.json"
 
-TIMEFRAMES = ["H4", "M15", "M5", "M1"]
-TF_BARS = {"H4": 260, "M15": 420, "M5": 360, "M1": 500}
-TF_WEIGHT = {"H4": 3.0, "M15": 2.0, "M5": 1.25, "M1": 1.0}
-SWING_DEPTH = 3
-
 
 def f(value: Any, default: float = 0.0) -> float:
     try:
-        if value is None:
-            return default
-        return float(value)
+        return default if value is None else float(value)
     except Exception:
         return default
 
@@ -41,6 +34,7 @@ def normalize_candle(candle: Any) -> Dict[str, Any]:
         return {}
     if isinstance(candle, dict):
         return candle
+
     out: Dict[str, Any] = {}
     for key in ("time", "open", "high", "low", "close", "tick_volume", "spread", "real_volume", "volume"):
         try:
@@ -53,7 +47,7 @@ def normalize_candle(candle: Any) -> Dict[str, Any]:
     return out
 
 
-def mt5_rates(symbol: str) -> Dict[str, List[Dict[str, Any]]]:
+def mt5_rates(symbol: str, include_forming: bool = True) -> Dict[str, List[Dict[str, Any]]]:
     out: Dict[str, List[Dict[str, Any]]] = {}
     try:
         import MetaTrader5 as mt5
@@ -65,18 +59,18 @@ def mt5_rates(symbol: str) -> Dict[str, List[Dict[str, Any]]]:
     except Exception:
         pass
 
-    tf_map = {
+    mapping = {
         "M1": getattr(mt5, "TIMEFRAME_M1", None),
         "M5": getattr(mt5, "TIMEFRAME_M5", None),
-        "M15": getattr(mt5, "TIMEFRAME_M15", None),
-        "H4": getattr(mt5, "TIMEFRAME_H4", None),
+        "H1": getattr(mt5, "TIMEFRAME_H1", None),
     }
+    bars = {"M1": 1000, "M5": 600, "H1": 200}
 
-    for tf, tf_const in tf_map.items():
+    for tf, tf_const in mapping.items():
         if tf_const is None:
             continue
         try:
-            raw = mt5.copy_rates_from_pos(symbol, tf_const, 0, TF_BARS[tf])
+            raw = mt5.copy_rates_from_pos(symbol, tf_const, 0, bars[tf])
         except Exception:
             raw = None
         if raw is None:
@@ -95,33 +89,35 @@ def mt5_rates(symbol: str) -> Dict[str, List[Dict[str, Any]]]:
                 "real_volume": int(r["real_volume"]),
             })
 
-        # Non-repaint: remove forming candle.
-        if len(rows) > 2:
+        # Keep forming data for drawing the live first-5M range.
+        # Strategy entry still uses closed candles only.
+        if not include_forming and len(rows) > 2:
             rows = rows[:-1]
+
         out[tf] = rows
 
     return out
 
 
-def get_timeframes(context: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+def get_timeframes(context: Dict[str, Any], include_forming: bool = True) -> Dict[str, List[Dict[str, Any]]]:
     out: Dict[str, List[Dict[str, Any]]] = {}
 
     raw = context.get("timeframes") or context.get("timeframe_rates") or {}
     if isinstance(raw, dict):
-        for key, value in raw.items():
-            tf = str(key).upper()
-            if tf in TIMEFRAMES:
-                rows = [normalize_candle(c) for c in list(value or [])]
+        for k, v in raw.items():
+            tf = str(k).upper()
+            if tf in ("M1", "M5", "H1"):
+                rows = [normalize_candle(c) for c in list(v or [])]
                 rows = [r for r in rows if r]
                 rows.sort(key=lambda x: int(x.get("time", 0) or 0))
-                out[tf] = rows[:-1] if len(rows) > 2 else rows
+                out[tf] = rows if include_forming else (rows[:-1] if len(rows) > 2 else rows)
 
     aliases = {
         "M1": ("rates", "closed_rates", "candles", "m1_rates", "rates_m1", "bars"),
         "M5": ("m5_rates", "rates_m5"),
-        "M15": ("m15_rates", "rates_m15"),
-        "H4": ("h4_rates", "rates_h4"),
+        "H1": ("h1_rates", "rates_h1"),
     }
+
     for tf, keys in aliases.items():
         if tf in out:
             continue
@@ -130,10 +126,10 @@ def get_timeframes(context: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
                 rows = [normalize_candle(c) for c in list(context.get(key) or [])]
                 rows = [r for r in rows if r]
                 rows.sort(key=lambda x: int(x.get("time", 0) or 0))
-                out[tf] = rows[:-1] if len(rows) > 2 else rows
+                out[tf] = rows if include_forming else (rows[:-1] if len(rows) > 2 else rows)
                 break
 
-    direct = mt5_rates(symbol_from_context(context))
+    direct = mt5_rates(symbol_from_context(context), include_forming=include_forming)
     for tf, rows in direct.items():
         if rows:
             out[tf] = rows
@@ -141,166 +137,250 @@ def get_timeframes(context: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
     return out
 
 
-def candle_direction(c: Dict[str, Any]) -> str:
-    if f(c.get("close")) > f(c.get("open")):
+def candle_direction(candle: Dict[str, Any]) -> str:
+    if f(candle.get("close")) > f(candle.get("open")):
         return BUY
-    if f(c.get("close")) < f(c.get("open")):
+    if f(candle.get("close")) < f(candle.get("open")):
         return SELL
     return HOLD
 
 
-def candle_volume(c: Dict[str, Any]) -> float:
-    return f(c.get("tick_volume") or c.get("real_volume") or c.get("volume"), 0.0)
+def hour_start(ts: int) -> int:
+    return int(ts) - (int(ts) % 3600)
 
 
-def avg_volume(rates: List[Dict[str, Any]], period: int = 30) -> float:
-    sample = list(rates or [])[-period:]
-    if not sample:
-        return 0.0
-    return sum(candle_volume(c) for c in sample) / len(sample)
+def active_hour_open_range(context: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Current-hour first-5M range.
 
+    It updates live from the current hour open using M1 candles during minute 00-04.
+    Once the first M5 candle is closed, the wick range locks until the next hour.
+    It never falls back to the previous hour unless there is no current-hour data at all.
+    """
+    tfs_live = get_timeframes(context, include_forming=True)
+    tfs_closed = get_timeframes(context, include_forming=False)
 
-def volume_confirm(rates: List[Dict[str, Any]], direction: str) -> bool:
-    if len(rates) < 12 or direction not in (BUY, SELL):
-        return False
-    last = rates[-1]
-    av = avg_volume(rates[:-1], 30)
-    vol = candle_volume(last)
-    return av > 0 and vol >= av * 1.15 and candle_direction(last) == direction
+    m1_live = tfs_live.get("M1", [])
+    m5_live = tfs_live.get("M5", [])
+    m1_closed = tfs_closed.get("M1", [])
+    m5_closed = tfs_closed.get("M5", [])
 
+    all_ref = m1_live or m5_live or m1_closed or m5_closed
+    if not all_ref:
+        return {"valid": False, "reason": "Waiting for M1/M5 candles.", "timeframes": tfs_closed, "live_timeframes": tfs_live}
 
-def confirmed_swings(rates: List[Dict[str, Any]], left: int = SWING_DEPTH, right: int = SWING_DEPTH, max_bars: int = 500) -> List[Dict[str, Any]]:
-    candles = list(rates or [])[-max_bars:]
-    swings: List[Dict[str, Any]] = []
+    reference_ts = int(all_ref[-1].get("time", 0) or time.time())
+    current_hour = hour_start(reference_ts)
+    range_start = current_hour
+    range_end = current_hour + 300
 
-    if len(candles) < left + right + 1:
-        return swings
+    first_m5_closed = [
+        c for c in m5_closed
+        if range_start <= int(c.get("time", 0) or 0) < range_end
+    ]
 
-    for i in range(left, len(candles) - right):
-        c = candles[i]
-        high = f(c.get("high"))
-        low = f(c.get("low"))
-        left_side = candles[i - left:i]
-        right_side = candles[i + 1:i + 1 + right]
+    is_locked = False
+    source = "live_m1_building"
 
-        if all(high > f(x.get("high")) for x in left_side + right_side):
-            swings.append({"type": "high", "price": high, "time": int(c.get("time", 0) or 0), "index": i})
+    if first_m5_closed:
+        candles = [first_m5_closed[-1]]
+        is_locked = True
+        source = "closed_m5_locked"
+    else:
+        # Build the current first-5M range live from M1 candles in the current hour.
+        candles = [
+            c for c in m1_live
+            if range_start <= int(c.get("time", 0) or 0) < range_end
+        ]
 
-        if all(low < f(x.get("low")) for x in left_side + right_side):
-            swings.append({"type": "low", "price": low, "time": int(c.get("time", 0) or 0), "index": i})
+        # If MT5 has the current forming M5 but no M1s yet, use that for visual only.
+        if not candles:
+            live_m5 = [
+                c for c in m5_live
+                if range_start <= int(c.get("time", 0) or 0) < range_end
+            ]
+            candles = live_m5[-1:] if live_m5 else []
 
-    return swings
+    if not candles:
+        return {
+            "valid": False,
+            "reason": "Waiting for current hour first 5-minute range to start.",
+            "timeframes": tfs_closed,
+            "live_timeframes": tfs_live,
+            "active_hour": current_hour,
+            "locked": False,
+        }
 
-
-def latest_swing(swings: List[Dict[str, Any]], kind: str) -> Optional[Dict[str, Any]]:
-    for swing in reversed(swings or []):
-        if swing.get("type") == kind:
-            return swing
-    return None
-
-
-def structure_for_tf(rates: List[Dict[str, Any]], max_bars: int) -> Dict[str, Any]:
-    swings = confirmed_swings(rates, max_bars=max_bars)
-    last_high = latest_swing(swings, "high")
-    last_low = latest_swing(swings, "low")
-
-    highs = [s for s in swings if s["type"] == "high"]
-    lows = [s for s in swings if s["type"] == "low"]
-    prev_high = highs[-2] if len(highs) >= 2 else None
-    prev_low = lows[-2] if len(lows) >= 2 else None
-
-    close = f(rates[-1].get("close")) if rates else 0.0
-    eq = 0.0
-    bias = HOLD
-    label = "neutral"
-
-    if last_high and last_low:
-        eq = (f(last_high["price"]) + f(last_low["price"])) / 2.0
-
-        if close > f(last_high["price"]):
-            bias = BUY
-            label = "bullish BOS"
-        elif close < f(last_low["price"]):
-            bias = SELL
-            label = "bearish BOS"
-        elif prev_high and prev_low:
-            if f(last_high["price"]) > f(prev_high["price"]) and f(last_low["price"]) > f(prev_low["price"]):
-                bias = BUY
-                label = "bullish structure"
-            elif f(last_high["price"]) < f(prev_high["price"]) and f(last_low["price"]) < f(prev_low["price"]):
-                bias = SELL
-                label = "bearish structure"
-            else:
-                bias = BUY if close >= eq else SELL
-                label = "above EQ" if bias == BUY else "below EQ"
-        else:
-            bias = BUY if close >= eq else SELL
-            label = "above EQ" if bias == BUY else "below EQ"
+    high = max(f(c.get("high")) for c in candles)
+    low = min(f(c.get("low")) for c in candles)
+    open_ = f(candles[0].get("open"))
+    close = f(candles[-1].get("close"))
+    direction = BUY if close > open_ else SELL if close < open_ else HOLD
 
     return {
-        "last_high": last_high,
-        "prev_high": prev_high,
-        "last_low": last_low,
-        "prev_low": prev_low,
-        "eq": eq,
-        "bias": bias,
-        "label": label,
-        "close": close,
-        "swings_count": len(swings),
+        "valid": high > low,
+        "locked": is_locked,
+        "source": source,
+        "timeframes": tfs_closed,
+        "live_timeframes": tfs_live,
+        "active_hour": current_hour,
+        "range_start": range_start,
+        "range_end": range_end,
+        "range_high": high,
+        "range_low": low,
+        "range_open": open_,
+        "range_close": close,
+        "range_mid": (high + low) / 2.0,
+        "range_size": high - low,
+        "range_direction": direction,
+        "m1_parts_count": len(candles),
+        "reason": "Current hour first-5M wick range is locked." if is_locked else "Current hour first-5M wick range is building live.",
     }
 
 
-def all_structures(context: Dict[str, Any]) -> Dict[str, Any]:
-    tfs = get_timeframes(context)
-    structures: Dict[str, Any] = {}
-    for tf in TIMEFRAMES:
-        structures[tf] = structure_for_tf(tfs.get(tf, []), TF_BARS[tf])
-    return {"timeframes": tfs, "structures": structures}
+def tolerance(context: Dict[str, Any], setup: Dict[str, Any]) -> float:
+    rules = context.get("rules") or {}
+    explicit = f(rules.get("hour_open_range_tolerance") or rules.get("ray_touch_tolerance"), 0.0)
+    if explicit > 0:
+        return explicit
+    return max(f(setup.get("range_size")) * 0.04, 0.20)
 
 
-def combined_direction(structures: Dict[str, Any]) -> str:
-    buy = 0.0
-    sell = 0.0
-    for tf, st in structures.items():
-        if st.get("bias") == BUY:
-            buy += TF_WEIGHT.get(tf, 1.0)
-        elif st.get("bias") == SELL:
-            sell += TF_WEIGHT.get(tf, 1.0)
-    if buy > sell:
-        return BUY
-    if sell > buy:
-        return SELL
-    return HOLD
+def hour_open_range_signal(context: Dict[str, Any]) -> Dict[str, Any]:
+    setup = active_hour_open_range(context)
+    if not setup.get("valid"):
+        return {**setup, "action": HOLD, "score": 0.0}
 
+    # Do not enter until first 5M candle is locked. Still draws live while building.
+    if not setup.get("locked"):
+        return {
+            **setup,
+            "action": HOLD,
+            "score": 0.0,
+            "entry_type": "building_range",
+            "reason": f"HOLD: current hour first-5M wick range is building live {setup.get('range_low'):.2f}-{setup.get('range_high'):.2f}. Wait for 5M close.",
+        }
 
-def ote_zone(low: float, high: float, direction: str) -> Dict[str, float]:
-    low = f(low)
-    high = f(high)
-    if high <= low:
-        return {}
-    rng = high - low
-    if direction == BUY:
-        return {"62": high - rng * 0.62, "705": high - rng * 0.705, "79": high - rng * 0.79}
-    if direction == SELL:
-        return {"62": low + rng * 0.62, "705": low + rng * 0.705, "79": low + rng * 0.79}
-    return {}
+    m1 = setup.get("timeframes", {}).get("M1", [])
+    if len(m1) < 3:
+        return {**setup, "action": HOLD, "score": 0.0, "reason": "Waiting for closed M1 execution candles."}
 
+    last = m1[-1]
+    prev = m1[-2]
 
-def price_in_zone(price: float, zone: Dict[str, float]) -> bool:
-    vals = [f(v) for v in zone.values() if f(v) > 0]
-    return bool(vals) and min(vals) <= price <= max(vals)
+    high = f(setup["range_high"])
+    low = f(setup["range_low"])
+    mid = f(setup["range_mid"])
+    rng = f(setup["range_size"])
+    tol = tolerance(context, setup)
 
+    last_open = f(last.get("open"))
+    last_high = f(last.get("high"))
+    last_low = f(last.get("low"))
+    last_close = f(last.get("close"))
+    prev_close = f(prev.get("close"))
 
-def build_ote(structures: Dict[str, Any], direction: str) -> Dict[str, Any]:
-    # Prefer M15 swing pair, then M5. This matches the visual EA.
-    for tf in ("M15", "M5"):
-        st = structures.get(tf, {})
-        hi = st.get("last_high")
-        lo = st.get("last_low")
-        if hi and lo:
-            zone = ote_zone(f(lo["price"]), f(hi["price"]), direction)
-            return {"tf": tf, "high": hi, "low": lo, "zone": zone}
-    return {"tf": None, "zone": {}}
+    bull = last_close >= last_open
+    bear = last_close <= last_open
+
+    buy_breakout = prev_close <= high and last_close > high and bull
+    sell_breakdown = prev_close >= low and last_close < low and bear
+
+    buy_retest_after_break = last_low <= high + tol and last_close > high and bull
+    sell_retest_after_break = last_high >= low - tol and last_close < low and bear
+
+    buy_support_respected = last_low <= low + tol and last_close > low and bull
+    sell_resistance_respected = last_high >= high - tol and last_close < high and bear
+
+    if buy_breakout:
+        return {
+            **setup,
+            "action": BUY,
+            "score": 1.0,
+            "entry_type": "breakout_above_5m_high",
+            "entry_level": high,
+            "target_level": high + rng,
+            "stop_reference": mid,
+            "tolerance": tol,
+            "reason": f"BUY: closed M1 broke above current hour first-5M wick high @ {high:.2f}.",
+        }
+
+    if sell_breakdown:
+        return {
+            **setup,
+            "action": SELL,
+            "score": 1.0,
+            "entry_type": "breakdown_below_5m_low",
+            "entry_level": low,
+            "target_level": low - rng,
+            "stop_reference": mid,
+            "tolerance": tol,
+            "reason": f"SELL: closed M1 broke below current hour first-5M wick low @ {low:.2f}.",
+        }
+
+    if buy_retest_after_break:
+        return {
+            **setup,
+            "action": BUY,
+            "score": 0.90,
+            "entry_type": "high_retest_holding_as_support",
+            "entry_level": high,
+            "target_level": high + rng,
+            "stop_reference": mid,
+            "tolerance": tol,
+            "reason": f"BUY: current hour first-5M high held as support @ {high:.2f}.",
+        }
+
+    if sell_retest_after_break:
+        return {
+            **setup,
+            "action": SELL,
+            "score": 0.90,
+            "entry_type": "low_retest_holding_as_resistance",
+            "entry_level": low,
+            "target_level": low - rng,
+            "stop_reference": mid,
+            "tolerance": tol,
+            "reason": f"SELL: current hour first-5M low held as resistance @ {low:.2f}.",
+        }
+
+    if buy_support_respected:
+        return {
+            **setup,
+            "action": BUY,
+            "score": 0.80,
+            "entry_type": "range_low_respected",
+            "entry_level": low,
+            "target_level": high,
+            "stop_reference": low - tol,
+            "tolerance": tol,
+            "reason": f"BUY: range low respected as support @ {low:.2f}.",
+        }
+
+    if sell_resistance_respected:
+        return {
+            **setup,
+            "action": SELL,
+            "score": 0.80,
+            "entry_type": "range_high_respected",
+            "entry_level": high,
+            "target_level": low,
+            "stop_reference": high + tol,
+            "tolerance": tol,
+            "reason": f"SELL: range high respected as resistance @ {high:.2f}.",
+        }
+
+    return {
+        **setup,
+        "action": HOLD,
+        "score": 0.0,
+        "entry_type": "waiting",
+        "entry_level": None,
+        "target_level": high if last_close >= mid else low,
+        "stop_reference": mid,
+        "tolerance": tol,
+        "reason": f"HOLD: waiting for current hour first-5M range respect/break {low:.2f}-{high:.2f}.",
+    }
 
 
 def make_signal(action: str, reason: str, confidence: float, context: Dict[str, Any], data: Optional[Dict[str, Any]] = None, close_ticket: Any = None) -> Dict[str, Any]:
@@ -355,88 +435,61 @@ def position_in_profit(position: Dict[str, Any], rates: List[Dict[str, Any]]) ->
     return close > entry if pos_type == 0 else close < entry
 
 
-def build_decision(context: Dict[str, Any]) -> Dict[str, Any]:
-    packed = all_structures(context)
-    tfs = packed["timeframes"]
-    structures = packed["structures"]
-    m1 = tfs.get("M1", [])
-
-    if not m1:
-        return make_signal(HOLD, "HOLD: no closed M1 candles available.", 0.0, context, data=packed)
-
+def maybe_close(context: Dict[str, Any], setup: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     positions = context.get("positions") or context.get("open_positions") or []
-    if positions:
-        pos = positions[0]
-        age = position_age_candles(pos, m1)
-        profit = position_in_profit(pos, m1)
-        ticket = pos.get("ticket")
-        pos_type = int(pos.get("type", 0) or 0)
-        close = f(m1[-1].get("close"))
-        h4 = structures.get("H4", {})
-        target = h4.get("last_high") if pos_type == 0 else h4.get("last_low")
+    if not positions:
+        return None
 
-        if target:
-            tp = f(target["price"])
-            hit = (pos_type == 0 and close >= tp) or (pos_type == 1 and close <= tp)
-            if hit:
-                return make_signal(CLOSE, "CLOSE: H4 recent swing liquidity target reached.", 1.0, context, data=packed, close_ticket=ticket)
+    m1 = setup.get("timeframes", {}).get("M1", [])
+    if not m1:
+        return None
 
-        if profit and age >= 7:
-            return make_signal(CLOSE, f"CLOSE: profit after {age} closed M1 candles.", 1.0, context, data=packed, close_ticket=ticket)
-        if not profit and age >= 4:
-            return make_signal(CLOSE, f"CLOSE: not in profit after {age} closed M1 candles.", 1.0, context, data=packed, close_ticket=ticket)
+    pos = positions[0]
+    ticket = pos.get("ticket")
+    age = position_age_candles(pos, m1)
+    profit = position_in_profit(pos, m1)
+    pos_type = int(pos.get("type", 0) or 0)
+    close = f(m1[-1].get("close"))
 
-        return make_signal(HOLD, f"HOLD: tracking open trade, candles_open={age}, in_profit={profit}.", 0.0, context, data=packed)
+    target = f(setup.get("target_level"))
+    high = f(setup.get("range_high"))
+    low = f(setup.get("range_low"))
 
-    direction = combined_direction(structures)
-    if direction not in (BUY, SELL):
-        return make_signal(HOLD, "HOLD: H4/M15/M5/M1 recent swing structure is mixed.", 0.0, context, data=packed)
+    if pos_type == 0:
+        if target > 0 and close >= target:
+            return make_signal(CLOSE, f"CLOSE: BUY reached current hour range target @ {target:.2f}.", 1.0, context, data=setup, close_ticket=ticket)
+        if profit and high > 0 and close >= high:
+            return make_signal(CLOSE, f"CLOSE: BUY reached current first-5M high @ {high:.2f}.", 0.95, context, data=setup, close_ticket=ticket)
 
-    score = 0.0
-    reasons: List[str] = []
+    if pos_type == 1:
+        if target > 0 and close <= target:
+            return make_signal(CLOSE, f"CLOSE: SELL reached current hour range target @ {target:.2f}.", 1.0, context, data=setup, close_ticket=ticket)
+        if profit and low > 0 and close <= low:
+            return make_signal(CLOSE, f"CLOSE: SELL reached current first-5M low @ {low:.2f}.", 0.95, context, data=setup, close_ticket=ticket)
 
-    h4 = structures.get("H4", {})
-    m15 = structures.get("M15", {})
-    m5 = structures.get("M5", {})
-    m1s = structures.get("M1", {})
+    # Keep your original 4/7 candle close flow.
+    if profit and age >= 7:
+        return make_signal(CLOSE, f"CLOSE: profit after {age} closed M1 candles.", 1.0, context, data=setup, close_ticket=ticket)
 
-    if h4.get("bias") == direction:
-        score += 1.25
-        reasons.append(f"H4 {h4.get('label')}")
-    if m15.get("bias") == direction:
-        score += 1.10
-        reasons.append(f"M15 {m15.get('label')}")
-    if m5.get("bias") == direction:
-        score += 0.75
-        reasons.append(f"M5 {m5.get('label')}")
-    if m1s.get("bias") == direction:
-        score += 0.50
-        reasons.append(f"M1 {m1s.get('label')}")
+    if not profit and age >= 4:
+        return make_signal(CLOSE, f"CLOSE: not in profit after {age} closed M1 candles.", 1.0, context, data=setup, close_ticket=ticket)
 
-    ote = build_ote(structures, direction)
-    packed["ote"] = ote
-    price = f(m1[-1].get("close"))
-    if price_in_zone(price, ote.get("zone") or {}):
-        score += 0.75
-        reasons.append("price inside aligned M15/M5 OTE")
+    return make_signal(HOLD, f"HOLD: tracking open position, candles_open={age}, in_profit={profit}.", 0.0, context, data=setup)
 
-    if volume_confirm(m1, direction):
-        score += 0.50
-        reasons.append("M1 volume confirms direction")
 
-    if candle_direction(m1[-1]) == direction:
-        score += 0.35
-        reasons.append("last closed M1 candle agrees")
+def build_decision(context: Dict[str, Any]) -> Dict[str, Any]:
+    setup = hour_open_range_signal(context)
 
-    min_score = f((context.get("rules") or {}).get("min_confluence_score"), 1.50)
-    action = direction if score >= min_score else HOLD
+    close_signal = maybe_close(context, setup)
+    if close_signal is not None:
+        return close_signal
 
     return make_signal(
-        action,
-        "; ".join(reasons) if reasons else "HOLD: no aligned recent swing confluence.",
-        min(score / 4.70, 1.0),
+        setup.get("action", HOLD),
+        str(setup.get("reason", "HOLD: waiting for current hour first-5M range.")),
+        f(setup.get("score"), 0.0),
         context,
-        data=packed,
+        data=setup,
     )
 
 
@@ -444,9 +497,7 @@ def draw_paths() -> List[Path]:
     raw = os.environ.get(DRAW_ENV)
     if raw:
         p = Path(raw)
-        paths = [p]
-        paths.append(p.with_suffix(".jsonl" if p.suffix.lower() == ".json1" else ".json1"))
-        return paths
+        return [p, p.with_suffix(".jsonl" if p.suffix.lower() == ".json1" else ".json1")]
     cwd = Path.cwd()
     return [cwd / DRAW_JSON1, cwd / DRAW_JSONL]
 
@@ -458,61 +509,58 @@ def write_json(path: Path, payload: Dict[str, Any]) -> None:
     tmp.replace(path)
 
 
-def seg(commands: List[Dict[str, Any]], name: str, price: float, color: str, text: str, width: int = 2, now: Optional[int] = None) -> None:
-    if price <= 0:
-        return
-    now = now or int(time.time())
-    future = now + 60 * 12
-    commands.append({"type": "segment", "name": name, "time1": now - 60 * 28, "price1": price, "time2": future, "price2": price, "color": color, "width": width})
-    commands.append({"type": "text", "name": f"{name}_TXT", "time": future, "price": price, "color": color, "text": text})
-
-
 def build_draw_commands(context: Dict[str, Any], decision: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    data = (decision or {}).get("data") or all_structures(context)
-    structures = data.get("structures", {})
-    tfs = data.get("timeframes", {})
-    m1 = tfs.get("M1", [])
-    current = f(m1[-1].get("close")) if m1 else 0.0
-    now = int(time.time())
-
+    data = (decision or {}).get("data") or active_hour_open_range(context)
     commands: List[Dict[str, Any]] = [{"type": "clear_all"}]
 
-    for tf, width in (("H4", 3), ("M15", 2), ("M5", 1)):
-        st = structures.get(tf, {})
-        low = st.get("last_low")
-        high = st.get("last_high")
-        if low and f(low.get("price")) < current:
-            seg(commands, f"TS_{tf}_RECENT_SUPPORT", f(low["price"]), "green", f"{tf} recent swing support / SSL {f(low['price']):.2f}", width, now)
-        if high and f(high.get("price")) > current:
-            seg(commands, f"TS_{tf}_RECENT_RESISTANCE", f(high["price"]), "red", f"{tf} recent swing resistance / BSL {f(high['price']):.2f}", width, now)
+    if not data.get("valid"):
+        return commands
 
-    m1s = structures.get("M1", {})
-    for kind, color in (("last_low", "green"), ("last_high", "red")):
-        sw = m1s.get(kind)
-        if sw:
-            price = f(sw.get("price"))
-            commands.append({"type": "text", "name": f"TS_M1_{kind.upper()}_LABEL", "time": int(sw.get("time") or now), "price": price, "color": color, "text": f"M1 recent swing {'low' if kind == 'last_low' else 'high'} {price:.2f}"})
+    start = int(data.get("range_start") or data.get("active_hour") or 0)
+    end = int(data.get("range_end") or start + 300)
 
-    direction = (decision or {}).get("action") or combined_direction(structures)
-    ote = data.get("ote") or build_ote(structures, direction)
-    zone = ote.get("zone") or {}
-    if direction in (BUY, SELL) and zone:
-        for key, color in (("62", "yellow"), ("705", "orange"), ("79", "yellow")):
-            price = f(zone.get(key))
-            seg(commands, f"TS_OTE_{key}", price, color, f"OTE {key} {direction} {price:.2f}", 1, now)
+    high = f(data.get("range_high"))
+    low = f(data.get("range_low"))
+    open_ = f(data.get("range_open"))
+    mid = f(data.get("range_mid"))
+    close = f(data.get("range_close"))
+    direction = data.get("range_direction", HOLD)
+    locked = bool(data.get("locked"))
 
-    if decision and current > 0:
-        action = decision.get("action", HOLD)
-        reason = str(decision.get("reason", ""))[:160]
-        color = "green" if action == BUY else "red" if action == SELL else "yellow"
-        commands.append({"type": "text", "name": "TS_DECISION_RECENT_SWING", "time": now + 60 * 8, "price": current, "color": color, "text": f"{action}: {reason}"})
+    status = "LOCKED" if locked else "LIVE BUILDING"
+    bias_color = "green" if direction == BUY else "red" if direction == SELL else "yellow"
+
+    commands.extend([
+        {"type": "box", "name": "TS_CURRENT_HOUR_5M_RANGE_BOX", "time1": start, "time2": end, "price1": high, "price2": low, "color": "gray", "text": f"{status} FIRST 5M RANGE"},
+        {"type": "ray", "name": "TS_CURRENT_HOUR_5M_HIGH", "time1": start, "price1": high, "color": "yellow", "width": 2, "text": f"{status} 5M WICK HIGH {high:.2f}"},
+        {"type": "ray", "name": "TS_CURRENT_HOUR_5M_LOW", "time1": start, "price1": low, "color": "green", "width": 2, "text": f"{status} 5M WICK LOW {low:.2f}"},
+        {"type": "ray", "name": "TS_CURRENT_HOUR_5M_MID", "time1": start, "price1": mid, "color": "gray", "width": 1, "text": f"{status} MID {mid:.2f}"},
+        {"type": "ray", "name": "TS_CURRENT_HOUR_5M_OPEN", "time1": start, "price1": open_, "color": "blue", "width": 1, "text": f"{status} OPEN {open_:.2f}"},
+        {"type": "text", "name": "TS_CURRENT_HOUR_5M_DECISION", "time": int(time.time()) + 60 * 8, "price": close, "color": bias_color, "text": f"{status} CURRENT HOUR 5M RANGE: {direction}\\n{str((decision or {}).get('reason', data.get('reason', '')))}"},
+    ])
+
+    for key, name, color in (
+        ("entry_level", "TS_ENTRY_AREA", bias_color),
+        ("target_level", "TS_TARGET", "blue"),
+        ("stop_reference", "TS_STOP_REFERENCE", "orange"),
+    ):
+        value = data.get(key)
+        if value is not None:
+            commands.append({"type": "ray", "name": name, "time1": start, "price1": f(value), "color": color, "width": 2, "text": f"{key.replace('_', ' ').upper()} {f(value):.2f}"})
 
     return commands
 
 
 def write_draws(context: Dict[str, Any], decision: Optional[Dict[str, Any]] = None) -> int:
     commands = build_draw_commands(context, decision)
-    payload = {"version": 7, "source": "TradeSmartAI", "updated": time.time(), "command_count": len(commands), "commands": commands}
+    payload = {
+        "version": 11,
+        "source": "TradeSmartAI",
+        "strategy": "live_current_hour_first_5m_range",
+        "updated": time.time(),
+        "command_count": len(commands),
+        "commands": commands,
+    }
     for p in draw_paths():
         write_json(p, payload)
     return len(commands)

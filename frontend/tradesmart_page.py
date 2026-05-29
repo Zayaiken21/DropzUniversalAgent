@@ -255,125 +255,62 @@ def _section(title: str) -> None:
 
 
 def _get_user_key() -> str:
-    user = st.session_state.get("user")
-    if isinstance(user, dict):
-        for field in ("id", "token", "email", "username", "name", "role"):
-            value = user.get(field)
-            if value not in (None, ""):
-                return f"user_{value}"
-    return str(st.session_state.get("authenticated_user") or st.session_state.get("role") or "default")
-
+    """Use the same signed-in user key as the MT5 Settings store."""
+    try:
+        from frontend.mt5_secure_store import get_signed_in_user_key
+        return get_signed_in_user_key("client")
+    except Exception:
+        user = st.session_state.get("user")
+        if isinstance(user, dict):
+            for field in ("id", "token", "email", "username", "name", "role"):
+                value = user.get(field)
+                if value not in (None, ""):
+                    return f"user_{value}"
+        return str(st.session_state.get("authenticated_user") or st.session_state.get("role") or "default")
 
 def _load_mt5_profile(mode: str) -> Dict[str, Any]:
-    """
-    Load the active MT5 profile from the same encrypted store used by Settings.
+    """Load the exact Demo/Live profile saved in Settings.
 
-    This fixes the mismatch where Settings saves under mt5_secure_store's signed-in
-    user key, while TradeSmart previously tried a different raw session key first.
+    Settings and TradeSmart must read the same secure store. Do not use a flat
+    generic fallback because that can make Live show Demo or Demo show Live.
     """
     mode = str(mode or "Demo").title()
-    page_user_key = _get_user_key()
-
-    # First: immediate session mirror written by the Settings page after Save.
-    for session_key in (
-        f"tradesmart_saved_mt5_profile_{page_user_key}_{mode}",
-        f"tradesmart_saved_mt5_profile_{mode}",
-        f"mt5_saved_profile_{page_user_key}_{mode}",
-    ):
-        profile = st.session_state.get(session_key)
-        if isinstance(profile, dict) and (profile.get("login") or profile.get("server")):
-            loaded = dict(profile)
-            loaded["mode"] = mode
-            return loaded
+    if mode not in {"Demo", "Live"}:
+        mode = "Demo"
 
     try:
-        import frontend.mt5_secure_store as store
+        from frontend.mt5_secure_store import load_mt5_profile, get_signed_in_user_key
+        secure_key = get_signed_in_user_key("client")
+
+        for key in (
+            f"tradesmart_mt5_profile_{secure_key}_{mode}",
+            f"mt5_profile_{secure_key}_{mode}",
+            f"mt5_saved_profile_{secure_key}_{mode}",
+        ):
+            profile = st.session_state.get(key)
+            if isinstance(profile, dict) and (profile.get("login") or profile.get("server")):
+                profile = dict(profile)
+                profile["mode"] = mode
+                return profile
+
+        profile = load_mt5_profile(secure_key, mode, role="client")
+        if isinstance(profile, dict):
+            profile = dict(profile)
+            profile["mode"] = mode
+            return profile
+
     except Exception:
-        return {}
+        pass
 
-    # Second: use the exact secure-store key generator Settings uses.
-    secure_keys: List[str] = []
-    for role in ("client", "ceo"):
-        fn = getattr(store, "get_signed_in_user_key", None)
-        if callable(fn):
-            try:
-                secure_keys.append(fn(role))
-            except Exception:
-                pass
-
-    # Include legacy/page keys for backward compatibility.
-    candidates = []
-    for key in [*secure_keys, page_user_key, f"{page_user_key}_{mode}", f"mt5_{page_user_key}", f"client_{page_user_key}", f"ceo_{page_user_key}", "client", "ceo"]:
-        if key and key not in candidates:
-            candidates.append(key)
-
-    # Preferred modern loader signature from mt5_secure_store:
-    load_mt5_profile = getattr(store, "load_mt5_profile", None)
-    if callable(load_mt5_profile):
-        for key in candidates:
-            for role in ("client", "ceo"):
-                try:
-                    profile = load_mt5_profile(key, mode, role=role)
-                    if isinstance(profile, dict) and (profile.get("login") or profile.get("server")):
-                        loaded = dict(profile)
-                        loaded["mode"] = mode
-                        return loaded
-                except TypeError:
-                    try:
-                        profile = load_mt5_profile(key, mode)
-                        if isinstance(profile, dict) and (profile.get("login") or profile.get("server")):
-                            loaded = dict(profile)
-                            loaded["mode"] = mode
-                            return loaded
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-
-    # Other legacy loader names/signatures.
-    for fn_name in ("load_profile", "get_mt5_profile"):
-        fn = getattr(store, fn_name, None)
-        if callable(fn):
-            for key in candidates:
-                for args in ((key, mode), (mode, key), (f"{key}_{mode}",), (key,)):
-                    try:
-                        profile = fn(*args)
-                    except Exception:
-                        continue
-                    if isinstance(profile, dict):
-                        if mode in profile and isinstance(profile[mode], dict):
-                            loaded = dict(profile[mode])
-                            loaded["mode"] = mode
-                            return loaded
-                        if profile.get("login") or profile.get("server"):
-                            loaded = dict(profile)
-                            loaded["mode"] = mode
-                            return loaded
-
-    fn = getattr(store, "load_mt5_settings", None)
-    if callable(fn):
-        for key in candidates:
-            for lookup in (f"{key}_{mode}", key):
-                try:
-                    saved = fn(lookup)
-                except Exception:
-                    continue
-                if not isinstance(saved, dict):
-                    continue
-                if mode in saved and isinstance(saved[mode], dict):
-                    loaded = dict(saved[mode])
-                    loaded["mode"] = mode
-                    return loaded
-                if saved.get("mode") == mode and (saved.get("login") or saved.get("server")):
-                    loaded = dict(saved)
-                    loaded["mode"] = mode
-                    return loaded
-                if saved.get("login") or saved.get("server"):
-                    loaded = dict(saved)
-                    loaded["mode"] = mode
-                    return loaded
-
-    return {}
+    return {
+        "mode": mode,
+        "login": "",
+        "password": "",
+        "server": "",
+        "terminal_path": "",
+        "timeout": 60000,
+        "portable": False,
+    }
 
 
 def _masked_login(profile: Dict[str, Any]) -> str:
@@ -816,8 +753,33 @@ def render_tradesmart(role: str = "client") -> None:
                     }
 
                 else:
-                    agent = TradeSmartAgent(profile=profile, rules={"mode": mode, "symbol": SYMBOL})
-                    result = agent.connect_only()
+                    # Use the same saved-profile MT5 login path as Settings/Dashboard
+                    # for the initial connection. This prevents Demo from opening
+                    # a previously attached Live/netting session.
+                    from frontend.mt5_secure_store import connect_mt5
+
+                    with st.spinner(f"Connecting {mode} MT5 with saved credentials..."):
+                        ok, message, account_info = connect_mt5(profile)
+
+                    if ok:
+                        result = {
+                            "ok": True,
+                            "phase": "connect",
+                            "event": "Connected",
+                            "message": message,
+                            "thinking": message,
+                            "account": account_info or {},
+                            "open_positions_count": 0,
+                            "positions": [],
+                        }
+                    else:
+                        result = {
+                            "ok": False,
+                            "phase": "connect",
+                            "event": "Connection Failed",
+                            "message": message,
+                            "thinking": message,
+                        }
                 if result.get("ok"):
                     st.session_state[connected_key] = True
                     st.session_state[connected_mode_key] = mode

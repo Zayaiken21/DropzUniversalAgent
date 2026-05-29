@@ -14,6 +14,8 @@ import hashlib
 import json
 import os
 import platform
+import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -80,7 +82,7 @@ def _get_fernet():
     except ImportError as exc:
         raise RuntimeError("Missing dependency: cryptography. Install it with: pip install cryptography") from exc
 
-    env_key = os.getenv("DROPZ_MT5_FERNET_KEY")
+    env_key = os.getenv("DROPZ_MT5_FERNET_KEY") or os.getenv("TRADESMART_MASTER_KEY")
     if env_key:
         return Fernet(env_key.encode())
 
@@ -239,13 +241,34 @@ def _decrypt_profile(token: str) -> Dict[str, Any]:
 
 
 def _clean_profile(profile: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    """Normalize MT5 credentials exactly before saving/connecting.
+
+    MT5 is strict: invisible spaces, copied quotes, or a stale terminal path can
+    make Demo fail while Live works. This keeps Demo/Live separated but cleans
+    the values MT5 actually receives.
+    """
+    raw_login = str(profile.get("login", "") or "").strip().replace("\\ufeff", "")
+    login = re.sub(r"\\D+", "", raw_login)
+
+    password = str(profile.get("password", "") or "").replace("\\ufeff", "").strip()
+    server = str(profile.get("server", "") or "").replace("\\ufeff", "").replace("\\u00a0", " ").strip().strip('"').strip("'")
+    server = re.sub(r"\\s+", " ", server)
+
+    terminal_path = str(profile.get("terminal_path", "") or "").replace("\\ufeff", "").strip().strip('"').strip("'")
+
+    try:
+        timeout = int(profile.get("timeout", 8000) or 8000)
+    except Exception:
+        timeout = 8000
+    timeout = max(5000, min(timeout, 20000))
+
     return {
         "mode": mode.title(),
-        "login": str(profile.get("login", "")).strip(),
-        "password": str(profile.get("password", "")),
-        "server": str(profile.get("server", "")).strip(),
-        "terminal_path": str(profile.get("terminal_path", "")).strip(),
-        "timeout": int(profile.get("timeout", 10000) or 10000),
+        "login": login,
+        "password": password,
+        "server": server,
+        "terminal_path": terminal_path,
+        "timeout": timeout,
         "portable": bool(profile.get("portable", False)),
     }
 
@@ -296,27 +319,28 @@ def _profile_from_legacy(user_key: str, mode: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def save_mt5_profile(user_key: str, mode: str, profile: Dict[str, Any], role: str = "client") -> None:
+def save_mt5_profile(user_key: str, mode: str, profile: Dict[str, Any]) -> None:
     mode = mode.title()
     if mode not in {"Demo", "Live"}:
         mode = "Demo"
 
-    primary = user_key or get_signed_in_user_key(role)
+    primary = user_key or get_signed_in_user_key()
     clean = _clean_profile(profile, mode)
 
-    # If the user cleared the form and saved, treat it as a real delete.
-    # Otherwise the loader may skip the blank primary profile and re-import an
-    # older credential from a legacy/candidate key.
-    if _is_empty_profile(clean):
-        clear_mt5_profile(primary, mode, role=role)
-        return
-
-    # Remove stale copies for this mode from all older keys first, then save the
-    # fresh selected-mode profile under the primary signed-in user key.
-    keys = [primary] + [k for k in get_user_key_candidates(role) if k != primary]
-    _clear_mt5_profile_from_store_keys(keys, mode)
-
     data = _read_store()
+
+    # Important:
+    # If the user previously saved credentials under an older candidate key
+    # (client_/ceo_/legacy/default), those stale records can be discovered by
+    # load_mt5_profile(). Remove this mode from every known candidate before
+    # writing the fresh profile under the current primary key.
+    for candidate in get_user_key_candidates():
+        bucket = data.get(candidate)
+        if isinstance(bucket, dict):
+            profiles = bucket.get("profiles")
+            if isinstance(profiles, dict):
+                profiles.pop(mode, None)
+
     bucket = data.setdefault(primary, {})
     bucket.setdefault("profiles", {})[mode] = _encrypt_profile(clean)
     bucket["active_mode"] = mode
@@ -329,7 +353,7 @@ def save_mt5_profile_for_current_user(mode: str, profile: Dict[str, Any], role: 
     Returns the key used.
     """
     key = get_signed_in_user_key(role)
-    save_mt5_profile(key, mode, profile, role=role)
+    save_mt5_profile(key, mode, profile)
     return key
 
 
@@ -414,75 +438,27 @@ def profile_fingerprint(profile: Dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
 
 
-def _is_empty_profile(profile: Dict[str, Any]) -> bool:
-    """True when the editable MT5 credential fields are all blank."""
-    return not (
-        str(profile.get("login", "")).strip()
-        or str(profile.get("password", "")).strip()
-        or str(profile.get("server", "")).strip()
-        or str(profile.get("terminal_path", "")).strip()
-    )
+def clear_mt5_profile(user_key: str, mode: str) -> None:
+    """Remove only the selected Demo/Live profile for this signed-in user.
 
-
-def _clear_mt5_profile_from_store_keys(keys: List[str], mode: str) -> None:
-    """Remove one Demo/Live profile from every matching encrypted and legacy key."""
+    Clears the current key and all known legacy/candidate keys so an older
+    profile cannot reappear after the user presses Clear.
+    """
     mode = mode.title()
-
     data = _read_store()
+    keys_to_clear = [user_key] + [k for k in get_user_key_candidates() if k != user_key]
+
     changed = False
-    for key in keys:
+    for key in keys_to_clear:
         bucket = data.get(key)
-        if not isinstance(bucket, dict):
-            continue
-        profiles = bucket.get("profiles")
-        if isinstance(profiles, dict) and mode in profiles:
-            profiles.pop(mode, None)
-            changed = True
-        if isinstance(profiles, dict) and not profiles:
-            bucket.pop("profiles", None)
-        if bucket.get("active_mode") == mode and not bucket.get("profiles"):
-            bucket.pop("active_mode", None)
+        if isinstance(bucket, dict):
+            profiles = bucket.get("profiles")
+            if isinstance(profiles, dict) and mode in profiles:
+                profiles.pop(mode, None)
+                changed = True
+
     if changed:
         _write_store(data)
-
-    if LEGACY_STORE_FILE.exists():
-        try:
-            legacy = json.loads(LEGACY_STORE_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            legacy = {}
-        legacy_changed = False
-        if isinstance(legacy, dict):
-            for key in keys:
-                bucket = legacy.get(key)
-                if not isinstance(bucket, dict):
-                    continue
-                profiles = bucket.get("profiles")
-                if isinstance(profiles, dict) and mode in profiles:
-                    profiles.pop(mode, None)
-                    legacy_changed = True
-                if str(bucket.get("mode", "")).title() == mode:
-                    for field in ("mode", "login", "password", "server", "terminal_path", "timeout", "portable"):
-                        if field in bucket:
-                            bucket.pop(field, None)
-                            legacy_changed = True
-            if legacy_changed:
-                LEGACY_STORE_FILE.write_text(json.dumps(legacy, indent=2), encoding="utf-8")
-
-
-def clear_mt5_profile(user_key: str = "", mode: str = "Demo", role: str = "client") -> None:
-    """
-    Remove only the selected Demo/Live profile for this signed-in user.
-
-    Important: older versions saved the same account under several candidate keys.
-    Clearing only the primary key allowed stale credentials from an older key to
-    be re-loaded on the next rerun. This clears the selected mode from every
-    candidate key while leaving the other mode untouched.
-    """
-    mode = mode.title()
-    primary = user_key or get_signed_in_user_key(role)
-    keys = [primary] + [k for k in get_user_key_candidates(role) if k != primary]
-    _clear_mt5_profile_from_store_keys(keys, mode)
-
 
 def is_profile_ready(profile: Dict[str, Any]) -> Tuple[bool, List[str]]:
     missing: List[str] = []
@@ -495,7 +471,34 @@ def is_profile_ready(profile: Dict[str, Any]) -> Tuple[bool, List[str]]:
     return len(missing) == 0, missing
 
 
+def _mt5_error_detail(err: Any) -> str:
+    code = None
+    msg = ""
+    if isinstance(err, tuple) and err:
+        code = str(err[0])
+        msg = str(err[1]) if len(err) > 1 else ""
+    else:
+        msg = str(err)
+
+    if code == "-6" or "Authorization failed" in msg:
+        return (
+            " Authorization failed usually means the selected Demo/Live profile has an invalid login, "
+            "wrong password, wrong broker server, or the account does not belong to that server. "
+            "Demo and Live often use different server names. The app sent the saved selected-mode credentials to MT5."
+        )
+    if code == "-10001" or "IPC" in msg:
+        return (
+            " IPC send failed usually means the MT5 terminal process is stuck or already locked by another session. "
+            "The app will retry once with a clean initialize/login sequence."
+        )
+    return ""
+
+
 def connect_mt5(profile: Dict[str, Any]) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+    # Always clean at connect time too, so Settings, Dashboard, and TradeSmart
+    # all send MT5 the same selected Demo/Live credential format.
+    profile = _clean_profile(profile or {}, str((profile or {}).get("mode", "Demo")))
+
     _log_mt5_event("connect_attempt", {
         "mode": profile.get("mode"),
         "login": profile.get("login"),
@@ -504,6 +507,7 @@ def connect_mt5(profile: Dict[str, Any]) -> Tuple[bool, str, Optional[Dict[str, 
         "portable": profile.get("portable"),
         "timeout": profile.get("timeout"),
     })
+
     ready, missing = is_profile_ready(profile)
     if not ready:
         return False, f"Missing required MT5 fields: {', '.join(missing)}.", None
@@ -516,40 +520,77 @@ def connect_mt5(profile: Dict[str, Any]) -> Tuple[bool, str, Optional[Dict[str, 
     except ImportError:
         return False, "MetaTrader5 package is not installed. Run: pip install MetaTrader5", None
 
-    kwargs = {
-        "login": int(profile["login"]),
-        "password": profile["password"],
-        "server": profile["server"],
-        "timeout": int(profile.get("timeout", 10000) or 10000),
-        "portable": bool(profile.get("portable", False)),
-    }
+    login = int(profile["login"])
+    password = str(profile["password"])
+    server = str(profile["server"])
+    timeout = int(profile.get("timeout", 8000) or 8000)
+    portable = bool(profile.get("portable", False))
+    terminal_path = str(profile.get("terminal_path", "") or "").strip()
 
-    if profile.get("terminal_path"):
-        kwargs["path"] = profile["terminal_path"]
+    def _init_then_login(use_credentials_in_initialize: bool = False) -> Tuple[bool, Any]:
+        try:
+            mt5.shutdown()
+            time.sleep(0.35)
+        except Exception:
+            pass
 
-    # Important: MT5 keeps a process-level session. Always shut down before switching
-    # between Demo and Live so a previous Live session cannot bleed into Demo.
-    try:
-        mt5.shutdown()
-    except Exception:
-        pass
+        init_kwargs: Dict[str, Any] = {"timeout": timeout, "portable": portable}
+        if terminal_path:
+            init_kwargs["path"] = terminal_path
 
-    if not mt5.initialize(**kwargs):
-        err = mt5.last_error()
-        detail = ""
-        if isinstance(err, tuple) and len(err) >= 2 and str(err[0]) == "-6":
-            detail = (
-                " Authorization failed usually means the selected Demo/Live profile has an invalid login, "
-                "wrong password, wrong broker server, or the account does not belong to that server. "
-                "Demo and Live often use different server names."
-            )
-        _log_mt5_event("connect_failed_initialize", {
+        if use_credentials_in_initialize:
+            init_kwargs.update({
+                "login": login,
+                "password": password,
+                "server": server,
+            })
+
+        try:
+            ok = mt5.initialize(**init_kwargs)
+        except Exception as exc:
+            return False, ("exception", str(exc))
+
+        if not ok:
+            return False, mt5.last_error()
+
+        # Force the selected Demo/Live account even if MT5 opened an old session.
+        try:
+            login_ok = mt5.login(login, password=password, server=server, timeout=timeout)
+        except Exception as exc:
+            return False, ("login_exception", str(exc))
+
+        if not login_ok:
+            return False, mt5.last_error()
+
+        return True, None
+
+    # Credentials-first is required for Demo/Live separation.
+    # Starting MT5 without credentials can attach to the already-open Live/netting
+    # terminal session and make Demo fail or show the wrong account.
+    ok, err = _init_then_login(True)
+
+    if not ok:
+        _log_mt5_event("connect_retry_without_initialize_credentials", {
             "mode": profile.get("mode"),
             "login": profile.get("login"),
             "server": profile.get("server"),
             "error": err,
         })
-        return False, f"MT5 initialization failed: {err}.{detail}", None
+        ok, err = _init_then_login(False)
+
+    if not ok:
+        try:
+            mt5.shutdown()
+        except Exception:
+            pass
+        detail = _mt5_error_detail(err)
+        _log_mt5_event("connect_failed_initialize_or_login", {
+            "mode": profile.get("mode"),
+            "login": profile.get("login"),
+            "server": profile.get("server"),
+            "error": err,
+        })
+        return False, f"MT5 connection failed for {login} on {server}: {err}.{detail}", None
 
     account_info = mt5.account_info()
     if account_info is None:
@@ -564,6 +605,28 @@ def connect_mt5(profile: Dict[str, Any]) -> Tuple[bool, str, Optional[Dict[str, 
         return False, f"MT5 account_info failed: {err}", None
 
     info = account_info._asdict()
+    returned_login = str(info.get("login", "")).strip()
+    if returned_login != str(login):
+        try:
+            mt5.login(login, password=password, server=server, timeout=timeout)
+            account_info = mt5.account_info()
+            info = account_info._asdict() if account_info is not None else {}
+            returned_login = str(info.get("login", "")).strip()
+        except Exception:
+            pass
+
+    if returned_login != str(login):
+        got = info.get("login", "unknown")
+        mt5.shutdown()
+        _log_mt5_event("connect_wrong_account", {
+            "mode": profile.get("mode"),
+            "requested_login": login,
+            "requested_server": server,
+            "returned_login": got,
+            "returned_server": info.get("server"),
+        })
+        return False, f"MT5 opened the wrong account. Expected {login}, but terminal is on {got}. Close MT5 and connect again."
+
     _log_mt5_event("connect_success", {
         "mode": profile.get("mode"),
         "requested_login": profile.get("login"),

@@ -9,6 +9,7 @@ os.environ["TRADESMART_MT5_BRIDGE_FILE"] = (
 
 import importlib.util
 import json
+import re
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -74,40 +75,138 @@ class TradeSmartAgent:
         except Exception as exc:
             return None, f"MetaTrader5 is not available on this Windows machine: {exc}"
 
+    def _clean_mt5_profile(self) -> Dict[str, Any]:
+        raw_login = str(self.profile.get("login", "") or "").strip().replace("\\ufeff", "")
+        login = re.sub(r"\\D+", "", raw_login)
+        password = str(self.profile.get("password", "") or "").replace("\\ufeff", "").strip()
+        server = str(self.profile.get("server", "") or "").replace("\\ufeff", "").replace("\\u00a0", " ").strip().strip('"').strip("'")
+        server = re.sub(r"\\s+", " ", server)
+        terminal_path = str(self.profile.get("terminal_path") or self.profile.get("path") or "").replace("\\ufeff", "").strip().strip('"').strip("'")
+        try:
+            timeout = int(self.profile.get("timeout", 8000) or 8000)
+        except Exception:
+            timeout = 8000
+        timeout = max(5000, min(timeout, 20000))
+        return {
+            "login": login,
+            "password": password,
+            "server": server,
+            "terminal_path": terminal_path,
+            "timeout": timeout,
+            "portable": bool(self.profile.get("portable", False)),
+        }
+
     def _connect(self) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         mt5, error = self._mt5()
         if error:
             return False, error, None
 
-        login = self.profile.get("login")
-        password = self.profile.get("password")
-        server = self.profile.get("server")
-        terminal_path = self.profile.get("terminal_path") or self.profile.get("path") or None
-        timeout = int(self.profile.get("timeout", 60000) or 60000)
-        portable = bool(self.profile.get("portable", False))
+        cleaned = self._clean_mt5_profile()
+        login = cleaned.get("login")
+        password = cleaned.get("password")
+        server = cleaned.get("server")
+        terminal_path = cleaned.get("terminal_path") or None
+        timeout = int(cleaned.get("timeout", 8000) or 8000)
+        portable = bool(cleaned.get("portable", False))
 
         if not login or not password or not server:
             return False, "Missing MT5 login, password, or server.", None
 
-        try:
-            mt5.shutdown()
-        except Exception:
-            pass
+        login_int = int(login)
 
-        try:
-            kwargs = {
-                "login": int(login),
-                "password": str(password),
-                "server": str(server),
+        def _current_account_matches() -> Tuple[bool, Optional[Dict[str, Any]]]:
+            """Accept an already-open MT5 terminal if it is already on the selected account."""
+            try:
+                account = mt5.account_info()
+                if account is None:
+                    return False, None
+                account_data = account._asdict()
+                return str(account_data.get("login", "")).strip() == str(login_int), account_data
+            except Exception:
+                return False, None
+
+        def _initialize_base() -> Tuple[bool, Any]:
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+
+            kwargs: Dict[str, Any] = {
                 "timeout": timeout,
                 "portable": portable,
             }
-            ok = mt5.initialize(path=str(terminal_path), **kwargs) if terminal_path else mt5.initialize(**kwargs)
-        except Exception as exc:
-            return False, f"MT5 initialize error: {exc}", None
+            if terminal_path:
+                kwargs["path"] = str(terminal_path)
 
+            try:
+                ok = mt5.initialize(**kwargs)
+            except Exception as exc:
+                return False, ("exception", str(exc))
+
+            if not ok:
+                return False, mt5.last_error()
+
+            return True, None
+
+        ok, err = _initialize_base()
         if not ok:
-            return False, f"MT5 initialization failed: {mt5.last_error()}", None
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+            detail = ""
+            if isinstance(err, tuple) and err:
+                if str(err[0]) == "-10001":
+                    detail = " IPC send failed. MT5 may be stuck; close terminal64.exe and retry."
+            return False, f"MT5 initialization failed for {login} on {server}: {err}.{detail}", None
+
+        # Important for Demo/Live separation:
+        # If MT5 is already open on the selected account, do not force another
+        # authorization call. Some demo servers reject duplicate API login even
+        # while the terminal is already correctly signed in.
+        matched, account_data = _current_account_matches()
+        if matched and account_data:
+            try:
+                mt5.symbol_select(self.symbol, True)
+            except Exception:
+                pass
+            return True, "Connected to MT5 successfully.", account_data
+
+        try:
+            login_ok = mt5.login(login_int, password=str(password), server=str(server), timeout=timeout)
+        except Exception as exc:
+            login_ok = False
+            err = ("login_exception", str(exc))
+        else:
+            err = mt5.last_error() if not login_ok else None
+
+        if not login_ok:
+            # One last check: MT5 may have switched/loaded the correct account
+            # even if the login call returned an authorization code.
+            matched, account_data = _current_account_matches()
+            if matched and account_data:
+                try:
+                    mt5.symbol_select(self.symbol, True)
+                except Exception:
+                    pass
+                return True, "Connected to MT5 successfully.", account_data
+
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+
+            detail = ""
+            if isinstance(err, tuple) and err:
+                if str(err[0]) == "-6":
+                    detail = (
+                        " Authorization failed. The selected profile was sent to MT5, "
+                        "but the terminal did not accept it. Confirm the Demo account uses "
+                        "the exact Demo server name shown in MT5."
+                    )
+                elif str(err[0]) == "-10001":
+                    detail = " IPC send failed. MT5 may be stuck; close terminal64.exe and retry."
+            return False, f"MT5 connection failed for {login} on {server}: {err}.{detail}", None
 
         account = mt5.account_info()
         if account is None:
@@ -115,7 +214,18 @@ class TradeSmartAgent:
             mt5.shutdown()
             return False, msg, None
 
-        return True, "Connected to MT5 successfully.", account._asdict()
+        account_data = account._asdict()
+        if str(account_data.get("login", "")).strip() != str(login_int):
+            wrong = account_data.get("login", "unknown")
+            mt5.shutdown()
+            return False, f"MT5 opened the wrong account. Expected {login}, but terminal is on {wrong}.", None
+
+        try:
+            mt5.symbol_select(self.symbol, True)
+        except Exception:
+            pass
+
+        return True, "Connected to MT5 successfully.", account_data
 
     def disconnect(self) -> None:
         mt5, error = self._mt5()

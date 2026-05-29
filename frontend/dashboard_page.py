@@ -68,10 +68,38 @@ def _render_quote(data):
     )
 
 
+def _ensure_dashboard_mt5_session(role=None):
+    """Open/refresh MT5 from the saved Settings profile before dashboard reads live data."""
+    try:
+        from frontend.mt5_secure_store import (
+            get_signed_in_user_key,
+            get_active_mt5_mode,
+            load_mt5_profile,
+            is_profile_ready,
+            connect_mt5,
+        )
+        current_role = role or "client"
+        user_key = get_signed_in_user_key(current_role)
+        mode = get_active_mt5_mode(user_key, role=current_role)
+        profile = load_mt5_profile(user_key, mode, role=current_role)
+        ready, _ = is_profile_ready(profile)
+        if ready:
+            connected, message, account = connect_mt5(profile)
+            st.session_state["dashboard_mt5_auto_connected"] = bool(connected)
+            st.session_state["dashboard_mt5_mode"] = mode
+            st.session_state["dashboard_mt5_message"] = message
+            if account:
+                st.session_state["dashboard_mt5_account"] = account
+    except Exception as exc:
+        st.session_state["dashboard_mt5_auto_connected"] = False
+        st.session_state["dashboard_mt5_message"] = str(exc)
+
+
 def render_frontend_dashboard_page(role=None):
     _inject_dashboard_styles()
 
-    # Uses the active MT5 terminal/session opened by TradeSmart or local MT5.
+    # Uses the active saved Demo/Live MT5 profile from Settings before reading dashboard data.
+    _ensure_dashboard_mt5_session(role)
     data = get_live_mt5_dashboard_data("XAUUSD")
 
     st.markdown(

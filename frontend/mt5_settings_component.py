@@ -30,29 +30,25 @@ def _clear_connection_state() -> None:
     shutdown_mt5()
 
 
-
-
-def _sync_tradesmart_profile_state(user_key: str, selected_mode: str, profile: dict) -> None:
-    """Make the freshly saved Settings profile immediately visible to TradeSmart."""
-    selected_mode = str(selected_mode or "Demo").title()
+def _sync_saved_profile_to_session(user_key: str, mode: str, profile: dict | None) -> None:
+    """Keep Settings and TradeSmart pointed at the same freshly saved profile."""
+    mode = str(mode or "Demo").title()
     profile = dict(profile or {})
-    profile["mode"] = selected_mode
+    keys = (
+        f"mt5_profile_{user_key}_{mode}",
+        f"tradesmart_mt5_profile_{user_key}_{mode}",
+        f"tradesmart_profile_{user_key}_{mode}",
+        f"mt5_saved_profile_{user_key}_{mode}",
+    )
 
-    # Session mirrors used by TradeSmart page as an immediate refresh path.
-    st.session_state[f"tradesmart_saved_mt5_profile_{user_key}_{selected_mode}"] = profile
-    st.session_state[f"tradesmart_saved_mt5_profile_{selected_mode}"] = profile
-    st.session_state[f"mt5_saved_profile_{user_key}_{selected_mode}"] = profile
-
-    # Clear stale TradeSmart connection/snapshot state so the page reloads the new profile.
-    for key in list(st.session_state.keys()):
-        text = str(key)
-        if (
-            text.startswith("tradesmart_account_snapshot_")
-            or text.startswith("tradesmart_last_result_")
-            or text.startswith("tradesmart_connected_")
-            or text.startswith("tradesmart_connected_mode_")
-        ):
+    if profile:
+        for key in keys:
+            st.session_state[key] = dict(profile)
+        st.session_state[f"mt5_profile_version_{user_key}_{mode}"] = profile.get("updated_at") or profile.get("login") or "saved"
+    else:
+        for key in keys:
             st.session_state.pop(key, None)
+        st.session_state.pop(f"mt5_profile_version_{user_key}_{mode}", None)
 
 
 def _set_mode(user_key: str, selected_mode: str) -> None:
@@ -199,29 +195,24 @@ def render_mt5_credentials_settings(role: str = "client") -> None:
 
         if clear_clicked:
             clear_mt5_profile(user_key, selected_mode)
-            _sync_tradesmart_profile_state(user_key, selected_mode, {})
+            _sync_saved_profile_to_session(user_key, selected_mode, None)
             _set_mode(user_key, selected_mode)
             st.success(f"{selected_mode} MT5 credentials cleared.")
             st.rerun()
 
         if save_clicked or test_clicked:
-            save_mt5_profile_for_current_user(selected_mode, current_profile, role=role)
+            saved_key = save_mt5_profile_for_current_user(selected_mode, current_profile, role=role)
+            refreshed_profile = load_mt5_profile(saved_key, selected_mode, role=role)
+            _sync_saved_profile_to_session(user_key, selected_mode, refreshed_profile)
             _set_mode(user_key, selected_mode)
 
-            # Reload from encrypted store after saving. This confirms the write worked
-            # and gives TradeSmart the exact same profile Settings just saved.
-            saved_after_write = load_mt5_profile(user_key, selected_mode, role=role) or dict(current_profile)
-            if not saved_after_write.get("login") and current_profile.get("login"):
-                saved_after_write = dict(current_profile)
-            _sync_tradesmart_profile_state(user_key, selected_mode, saved_after_write)
-
             if current_ready:
-                st.success(f"{selected_mode} MT5 credentials saved and sent to TradeSmart.")
+                st.success(f"{selected_mode} MT5 credentials saved.")
             else:
                 st.warning(f"{selected_mode} MT5 profile saved but still missing: {', '.join(current_missing)}.")
 
             if test_clicked and current_ready:
-                connected, message, account_info = connect_mt5(current_profile)
+                connected, message, account_info = connect_mt5(refreshed_profile)
                 if connected:
                     st.success(f"{selected_mode} MT5 connection verified.")
                     st.json({
