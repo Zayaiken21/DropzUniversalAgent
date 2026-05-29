@@ -1,159 +1,123 @@
-from __future__ import annotations
-
 import os
-from typing import Any, Dict, Tuple
-
 import requests
 
-ALLOWED_SYMBOL = "XAUUSD"
+RELAY_URL = os.getenv("TRADESMART_RELAY_URL", "").strip()
+RELAY_TOKEN = os.getenv("TRADESMART_RELAY_TOKEN", "").strip()
 
 
-def _headers(token: str) -> Dict[str, str]:
-    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
-
-def _streamlit_user_key() -> str:
-    try:
-        import streamlit as st
-        user = st.session_state.get("user")
-        if isinstance(user, dict):
-            for field in ("id", "token", "email", "username", "name", "role"):
-                value = user.get(field)
-                if value not in (None, ""):
-                    return f"user_{value}"
-        return str(st.session_state.get("authenticated_user") or st.session_state.get("role") or "default")
-    except Exception:
-        return "default"
-
-
-def _relay_lookup(user_key: str) -> Dict[str, str]:
-    relay_url = (os.getenv("TRADESMART_RELAY_URL") or "").strip().rstrip("/")
-    relay_token = (os.getenv("TRADESMART_RELAY_TOKEN") or "").strip()
-
-    if not relay_url or not relay_token:
-        return {}
+def _relay_lookup(user_key: str):
+    if not RELAY_URL or not RELAY_TOKEN:
+        return None
 
     try:
-        response = requests.post(
-            f"{relay_url}/get_bridge",
-            headers=_headers(relay_token),
-            json={"user_key": user_key},
+        r = requests.post(
+            f"{RELAY_URL}/resolve_bridge",
+            json={
+                "user_key": user_key,
+                "relay_token": RELAY_TOKEN,
+            },
             timeout=10,
         )
-        data = response.json()
-        if response.status_code >= 400 or not data.get("ok"):
-            return {}
-        return {
-            "bridge_url": data.get("bridge_url", ""),
-            "bridge_token": data.get("bridge_token", ""),
-        }
+
+        if r.status_code != 200:
+            return None
+
+        data = r.json()
+
+        if not data.get("ok"):
+            return None
+
+        return data
+
     except Exception:
-        return {}
+        return None
 
 
-def resolve_bridge_settings(settings: Dict[str, Any]) -> Dict[str, str]:
-    settings = dict(settings or {})
-    user_key = str(settings.get("user_key") or _streamlit_user_key())
+def connect_bridge(profile: dict):
+    user_key = "default"
 
-    bridge_url = str(settings.get("bridge_url") or settings.get("windows_bridge_url") or "").strip()
-    bridge_token = str(settings.get("bridge_token") or settings.get("windows_bridge_token") or "").strip()
+    relay = _relay_lookup(user_key)
 
-    if not bridge_url or not bridge_token:
-        relay = _relay_lookup(user_key)
-        bridge_url = bridge_url or relay.get("bridge_url", "")
-        bridge_token = bridge_token or relay.get("bridge_token", "")
-
-    bridge_url = bridge_url or os.getenv("TRADESMART_BRIDGE_URL", "").strip()
-    bridge_token = bridge_token or os.getenv("TRADESMART_BRIDGE_TOKEN", "").strip()
-
-    # Do not allow placeholder URLs to create confusing DNS errors.
-    if "your-tunnel" in bridge_url or "your-vps" in bridge_url or "YOUR-" in bridge_url:
-        bridge_url = ""
-
-    return {
-        "bridge_url": bridge_url.rstrip("/"),
-        "bridge_token": bridge_token,
-        "user_key": user_key,
-    }
-
-
-def bridge_request(settings: Dict[str, Any], endpoint: str, payload: Dict[str, Any] | None = None, timeout: int = 12) -> Tuple[bool, Dict[str, Any]]:
-    resolved = resolve_bridge_settings(settings)
-    bridge_url = resolved.get("bridge_url", "")
-    token = resolved.get("bridge_token", "")
-
-    if not bridge_url or not token:
+    if not relay:
         return False, {
             "message": (
-                "No Windows Bridge is registered for this user yet. "
-                "Run the TradeSmart Connector once on the user's Windows MT5 computer."
+                "Could not find your MT5 connector. "
+                "Start the local Windows connector first."
             )
         }
 
+    bridge_url = relay.get("bridge_url")
+    bridge_token = relay.get("bridge_token")
+
     try:
-        if payload is None:
-            response = requests.get(f"{bridge_url}{endpoint}", headers=_headers(token), timeout=timeout)
-        else:
-            response = requests.post(f"{bridge_url}{endpoint}", headers=_headers(token), json=payload, timeout=timeout)
+        r = requests.post(
+            f"{bridge_url}/connect",
+            json={
+                "token": bridge_token,
+                "profile": profile,
+            },
+            timeout=20,
+        )
 
-        try:
-            data = response.json()
-        except Exception:
-            data = {"message": response.text}
+        return r.status_code == 200, r.json()
 
-        if response.status_code >= 400:
-            return False, {"message": data.get("detail") or data.get("message") or response.text, "raw": data}
-
-        return True, data
-
-    except requests.exceptions.RequestException as exc:
-        return False, {"message": f"Could not reach the Windows Bridge: {exc}"}
+    except Exception as exc:
+        return False, {"message": str(exc)}
 
 
-def _profile_payload(settings: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "login": settings.get("login"),
-        "password": settings.get("password"),
-        "server": settings.get("server"),
-        "terminal_path": settings.get("terminal_path", ""),
-        "timeout": int(settings.get("timeout", 60000) or 60000),
-        "portable": bool(settings.get("portable", False)),
-    }
+def get_bridge_status(profile: dict):
+    user_key = "default"
+
+    relay = _relay_lookup(user_key)
+
+    if not relay:
+        return False, {
+            "message": "Connector offline."
+        }
+
+    bridge_url = relay.get("bridge_url")
+    bridge_token = relay.get("bridge_token")
+
+    try:
+        r = requests.post(
+            f"{bridge_url}/status",
+            json={
+                "token": bridge_token,
+                "profile": profile,
+            },
+            timeout=15,
+        )
+
+        return r.status_code == 200, r.json()
+
+    except Exception as exc:
+        return False, {"message": str(exc)}
 
 
-def connect_bridge(settings: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
-    return bridge_request(settings, "/connect", payload={"symbol": ALLOWED_SYMBOL, "profile": _profile_payload(settings)}, timeout=25)
+def disconnect_bridge(profile: dict):
+    user_key = "default"
 
+    relay = _relay_lookup(user_key)
 
-def disconnect_bridge(settings: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
-    return bridge_request(settings, "/disconnect", payload={}, timeout=10)
+    if not relay:
+        return False, {
+            "message": "Connector offline."
+        }
 
+    bridge_url = relay.get("bridge_url")
+    bridge_token = relay.get("bridge_token")
 
-def get_bridge_status(settings: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
-    return bridge_request(settings, "/status", payload=None, timeout=8)
+    try:
+        r = requests.post(
+            f"{bridge_url}/disconnect",
+            json={
+                "token": bridge_token,
+                "profile": profile,
+            },
+            timeout=15,
+        )
 
+        return r.status_code == 200, r.json()
 
-def get_bridge_positions(settings: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
-    return bridge_request(settings, "/positions", payload=None, timeout=8)
-
-
-def get_bridge_orders(settings: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
-    return bridge_request(settings, "/orders", payload=None, timeout=8)
-
-
-def place_xauusd_order(settings: Dict[str, Any], signal: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
-    payload = {
-        "symbol": ALLOWED_SYMBOL,
-        "direction": signal.get("direction") or signal.get("action"),
-        "volume": float(signal.get("volume", 0)),
-        "stop_loss": float(signal.get("stop_loss", signal.get("sl", 0)) or 0),
-        "take_profit": float(signal.get("take_profit", signal.get("tp", 0)) or 0),
-        "comment": str(signal.get("reason", "TradeSmart Agent"))[:28],
-        "profile": _profile_payload(settings),
-    }
-    return bridge_request(settings, "/place_trade", payload=payload, timeout=25)
-
-
-def close_xauusd_position(settings: Dict[str, Any], ticket: int) -> Tuple[bool, Dict[str, Any]]:
-    payload = {"symbol": ALLOWED_SYMBOL, "ticket": int(ticket), "profile": _profile_payload(settings)}
-    return bridge_request(settings, "/close_position", payload=payload, timeout=25)
+    except Exception as exc:
+        return False, {"message": str(exc)}
