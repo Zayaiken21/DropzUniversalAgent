@@ -22,7 +22,7 @@ BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN", "").strip()
 RELAY_URL = os.getenv("RELAY_URL", "").strip().rstrip("/")
 RELAY_TOKEN = os.getenv("RELAY_TOKEN", "").strip()
 PAIRING_CODE = os.getenv("PAIRING_CODE", "").strip()
-USER_KEY = os.getenv("TRADESMART_USER_KEY", "").strip()
+USER_KEY = os.getenv("TRADESMART_USER_KEY", "default").strip() or "default"
 NGROK_PATH = os.getenv("NGROK_PATH", "ngrok").strip()
 REGISTER_INTERVAL_SECONDS = int(os.getenv("REGISTER_INTERVAL_SECONDS", "30"))
 
@@ -81,7 +81,7 @@ def _register_bridge(url: str) -> bool:
         headers["Authorization"] = f"Bearer {RELAY_TOKEN}"
 
     try:
-        response = requests.post(f"{RELAY_URL}/register_bridge", headers=headers, json=payload, timeout=12)
+        response = requests.post(f"{RELAY_URL}/register_bridge", headers=headers, json=payload, timeout=20)
         if response.status_code >= 400:
             print("Bridge registration failed:", response.status_code, response.text)
             return False
