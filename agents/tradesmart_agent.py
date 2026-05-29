@@ -52,11 +52,27 @@ class TradeSmartAgent:
 
     # ---------- platform ----------
     def _mt5(self):
+        """
+        Local MT5 loader.
+
+        This agent only works directly with MT5 when running on the Windows machine/VPS
+        that has MetaTrader5 installed. Streamlit Cloud should call the Windows bridge
+        instead and should not run this direct MT5 path.
+        """
         try:
+            import platform
+
+            if platform.system() != "Windows":
+                return None, (
+                    "MetaTrader5 direct mode is only available on Windows. "
+                    "Use the Windows bridge from Streamlit Cloud."
+                )
+
             import MetaTrader5 as mt5
             return mt5, None
+
         except Exception as exc:
-            return None, f"MetaTrader5 is not available here: {exc}"
+            return None, f"MetaTrader5 is not available on this Windows machine: {exc}"
 
     def _connect(self) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         mt5, error = self._mt5()
