@@ -14,8 +14,6 @@ import hashlib
 import json
 import os
 import platform
-import re
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -240,35 +238,43 @@ def _decrypt_profile(token: str) -> Dict[str, Any]:
     return json.loads(payload)
 
 
-def _clean_profile(profile: Dict[str, Any], mode: str) -> Dict[str, Any]:
-    """Normalize MT5 credentials exactly before saving/connecting.
 
-    MT5 is strict: invisible spaces, copied quotes, or a stale terminal path can
-    make Demo fail while Live works. This keeps Demo/Live separated but cleans
-    the values MT5 actually receives.
+def _valid_terminal_path(value: Any) -> str:
+    """Return a usable MT5 terminal64.exe path or an empty string.
+
+    Desktop EXE rule:
+    - Empty is safe because MetaTrader5 will use the user's installed/open terminal.
+    - A bad path causes IPC/authorization-style failures, so never pass it to mt5.initialize().
+    - Keep this helper local to the store so Settings, Dashboard, and TradeSmart share one behavior.
     """
-    raw_login = str(profile.get("login", "") or "").strip().replace("\\ufeff", "")
-    login = re.sub(r"\\D+", "", raw_login)
-
-    password = str(profile.get("password", "") or "").replace("\\ufeff", "").strip()
-    server = str(profile.get("server", "") or "").replace("\\ufeff", "").replace("\\u00a0", " ").strip().strip('"').strip("'")
-    server = re.sub(r"\\s+", " ", server)
-
-    terminal_path = str(profile.get("terminal_path", "") or "").replace("\\ufeff", "").strip().strip('"').strip("'")
+    raw = str(value or "").strip().strip('"').strip("'")
+    if not raw:
+        return ""
 
     try:
-        timeout = int(profile.get("timeout", 8000) or 8000)
+        path = Path(raw).expanduser()
     except Exception:
-        timeout = 8000
-    timeout = max(5000, min(timeout, 20000))
+        return ""
 
+    if not path.exists() or not path.is_file():
+        _log_mt5_event("invalid_terminal_path_ignored", {"terminal_path": raw})
+        return ""
+
+    if path.name.lower() not in {"terminal64.exe", "terminal.exe"}:
+        _log_mt5_event("non_mt5_terminal_path_ignored", {"terminal_path": raw})
+        return ""
+
+    return str(path)
+
+
+def _clean_profile(profile: Dict[str, Any], mode: str) -> Dict[str, Any]:
     return {
         "mode": mode.title(),
-        "login": login,
-        "password": password,
-        "server": server,
-        "terminal_path": terminal_path,
-        "timeout": timeout,
+        "login": str(profile.get("login", "")).strip(),
+        "password": str(profile.get("password", "")),
+        "server": str(profile.get("server", "")).strip(),
+        "terminal_path": _valid_terminal_path(profile.get("terminal_path")),
+        "timeout": int(profile.get("timeout", 10000) or 10000),
         "portable": bool(profile.get("portable", False)),
     }
 
@@ -471,33 +477,28 @@ def is_profile_ready(profile: Dict[str, Any]) -> Tuple[bool, List[str]]:
     return len(missing) == 0, missing
 
 
-def _mt5_error_detail(err: Any) -> str:
-    code = None
-    msg = ""
-    if isinstance(err, tuple) and err:
-        code = str(err[0])
-        msg = str(err[1]) if len(err) > 1 else ""
-    else:
-        msg = str(err)
-
-    if code == "-6" or "Authorization failed" in msg:
-        return (
-            " Authorization failed usually means the selected Demo/Live profile has an invalid login, "
-            "wrong password, wrong broker server, or the account does not belong to that server. "
-            "Demo and Live often use different server names. The app sent the saved selected-mode credentials to MT5."
-        )
-    if code == "-10001" or "IPC" in msg:
-        return (
-            " IPC send failed usually means the MT5 terminal process is stuck or already locked by another session. "
-            "The app will retry once with a clean initialize/login sequence."
-        )
-    return ""
-
-
 def connect_mt5(profile: Dict[str, Any]) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
-    # Always clean at connect time too, so Settings, Dashboard, and TradeSmart
-    # all send MT5 the same selected Demo/Live credential format.
-    profile = _clean_profile(profile or {}, str((profile or {}).get("mode", "Demo")))
+    """Connect MT5 locally with the selected Demo/Live profile.
+
+    Desktop behavior:
+    - Uses only the saved selected-mode credentials.
+    - Shuts down the previous MT5 Python session before switching modes.
+    - Initializes MT5 quickly.
+    - Forces mt5.login(...), but accepts an already-open terminal session when
+      account_info() already matches the requested login. This prevents Demo
+      from failing when MT5 opens the correct Demo account but rejects a second
+      login command.
+    """
+    profile = dict(profile or {})
+    profile["mode"] = str(profile.get("mode") or "Demo").title()
+    profile["login"] = str(profile.get("login", "")).strip()
+    profile["password"] = str(profile.get("password", ""))
+    profile["server"] = str(profile.get("server", "")).strip()
+    profile["terminal_path"] = _valid_terminal_path(profile.get("terminal_path"))
+    timeout = int(profile.get("timeout", 12000) or 12000)
+    if timeout > 15000:
+        timeout = 15000
+    profile["timeout"] = timeout
 
     _log_mt5_event("connect_attempt", {
         "mode": profile.get("mode"),
@@ -513,129 +514,157 @@ def connect_mt5(profile: Dict[str, Any]) -> Tuple[bool, str, Optional[Dict[str, 
         return False, f"Missing required MT5 fields: {', '.join(missing)}.", None
 
     if platform.system() != "Windows":
-        return False, "MetaTrader5 Python connections normally require Windows with the MT5 desktop terminal installed.", None
+        return False, "Direct MetaTrader5 automation requires Windows with the MT5 desktop terminal installed.", None
 
     try:
         import MetaTrader5 as mt5
     except ImportError:
         return False, "MetaTrader5 package is not installed. Run: pip install MetaTrader5", None
 
-    login = int(profile["login"])
-    password = str(profile["password"])
-    server = str(profile["server"])
-    timeout = int(profile.get("timeout", 8000) or 8000)
-    portable = bool(profile.get("portable", False))
-    terminal_path = str(profile.get("terminal_path", "") or "").strip()
+    requested_login = profile["login"]
+    requested_server = profile["server"]
+    password = profile["password"]
 
-    def _init_then_login(use_credentials_in_initialize: bool = False) -> Tuple[bool, Any]:
-        try:
-            mt5.shutdown()
-            time.sleep(0.35)
-        except Exception:
-            pass
+    init_variants = []
+    if profile.get("terminal_path"):
+        init_variants.append({"path": profile["terminal_path"]})
+    init_variants.append({})
 
-        init_kwargs: Dict[str, Any] = {"timeout": timeout, "portable": portable}
-        if terminal_path:
-            init_kwargs["path"] = terminal_path
+    last_err: Any = None
 
-        if use_credentials_in_initialize:
-            init_kwargs.update({
-                "login": login,
-                "password": password,
-                "server": server,
+    for attempt in range(1, 3):
+        for init_kwargs in init_variants:
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+
+            try:
+                import time
+                time.sleep(0.20 * attempt)
+            except Exception:
+                pass
+
+            try:
+                ok = mt5.initialize(
+                    timeout=timeout,
+                    portable=bool(profile.get("portable", False)),
+                    **init_kwargs,
+                )
+            except Exception as exc:
+                ok = False
+                last_err = f"MT5 initialize exception: {exc}"
+
+            if not ok:
+                last_err = mt5.last_error()
+                _log_mt5_event("connect_failed_initialize_retry", {
+                    "mode": profile.get("mode"),
+                    "login": requested_login,
+                    "server": requested_server,
+                    "attempt": attempt,
+                    "init_kwargs": {k: str(v) for k, v in init_kwargs.items()},
+                    "error": last_err,
+                })
+                continue
+
+            try:
+                login_ok = mt5.login(
+                    int(requested_login),
+                    password=password,
+                    server=requested_server,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                login_ok = False
+                last_err = f"MT5 login exception: {exc}"
+            else:
+                last_err = mt5.last_error()
+
+            account_info = mt5.account_info()
+
+            # Accept the correct already-open terminal session. This is the key
+            # Demo/Live fix: never accept the wrong account, but do not fail if
+            # MT5 is already on the requested login and only the second login()
+            # call failed.
+            if account_info is not None:
+                info = account_info._asdict()
+                returned_login = str(info.get("login", "")).strip()
+                returned_server = str(info.get("server", "")).strip()
+                if returned_login == requested_login:
+                    _log_mt5_event("connect_success", {
+                        "mode": profile.get("mode"),
+                        "requested_login": requested_login,
+                        "requested_server": requested_server,
+                        "returned_login": returned_login,
+                        "returned_server": returned_server,
+                        "login_ok": bool(login_ok),
+                        "login_error": last_err if not login_ok else None,
+                    })
+                    return True, f"MT5 connected successfully to {requested_login}.", info
+
+            if not login_ok:
+                _log_mt5_event("connect_failed_login_retry", {
+                    "mode": profile.get("mode"),
+                    "login": requested_login,
+                    "server": requested_server,
+                    "attempt": attempt,
+                    "error": last_err,
+                })
+                continue
+
+            if account_info is None:
+                last_err = mt5.last_error()
+                _log_mt5_event("connect_failed_account_info_retry", {
+                    "mode": profile.get("mode"),
+                    "login": requested_login,
+                    "server": requested_server,
+                    "attempt": attempt,
+                    "error": last_err,
+                })
+                continue
+
+            info = account_info._asdict()
+            returned_login = str(info.get("login", "")).strip()
+            returned_server = str(info.get("server", "")).strip()
+            last_err = (
+                "MT5 opened a different account than requested. "
+                f"Requested {requested_login} on {requested_server}, "
+                f"but terminal returned {returned_login} on {returned_server}."
+            )
+            _log_mt5_event("connect_wrong_account_retry", {
+                "mode": profile.get("mode"),
+                "requested_login": requested_login,
+                "requested_server": requested_server,
+                "returned_login": returned_login,
+                "returned_server": returned_server,
+                "attempt": attempt,
             })
 
-        try:
-            ok = mt5.initialize(**init_kwargs)
-        except Exception as exc:
-            return False, ("exception", str(exc))
-
-        if not ok:
-            return False, mt5.last_error()
-
-        # Force the selected Demo/Live account even if MT5 opened an old session.
-        try:
-            login_ok = mt5.login(login, password=password, server=server, timeout=timeout)
-        except Exception as exc:
-            return False, ("login_exception", str(exc))
-
-        if not login_ok:
-            return False, mt5.last_error()
-
-        return True, None
-
-    # Credentials-first is required for Demo/Live separation.
-    # Starting MT5 without credentials can attach to the already-open Live/netting
-    # terminal session and make Demo fail or show the wrong account.
-    ok, err = _init_then_login(True)
-
-    if not ok:
-        _log_mt5_event("connect_retry_without_initialize_credentials", {
-            "mode": profile.get("mode"),
-            "login": profile.get("login"),
-            "server": profile.get("server"),
-            "error": err,
-        })
-        ok, err = _init_then_login(False)
-
-    if not ok:
-        try:
-            mt5.shutdown()
-        except Exception:
-            pass
-        detail = _mt5_error_detail(err)
-        _log_mt5_event("connect_failed_initialize_or_login", {
-            "mode": profile.get("mode"),
-            "login": profile.get("login"),
-            "server": profile.get("server"),
-            "error": err,
-        })
-        return False, f"MT5 connection failed for {login} on {server}: {err}.{detail}", None
-
-    account_info = mt5.account_info()
-    if account_info is None:
-        err = mt5.last_error()
+    try:
         mt5.shutdown()
-        _log_mt5_event("connect_failed_account_info", {
-            "mode": profile.get("mode"),
-            "login": profile.get("login"),
-            "server": profile.get("server"),
-            "error": err,
-        })
-        return False, f"MT5 account_info failed: {err}", None
+    except Exception:
+        pass
 
-    info = account_info._asdict()
-    returned_login = str(info.get("login", "")).strip()
-    if returned_login != str(login):
-        try:
-            mt5.login(login, password=password, server=server, timeout=timeout)
-            account_info = mt5.account_info()
-            info = account_info._asdict() if account_info is not None else {}
-            returned_login = str(info.get("login", "")).strip()
-        except Exception:
-            pass
+    detail = ""
+    if isinstance(last_err, tuple) and len(last_err) >= 2 and str(last_err[0]) == "-6":
+        detail = (
+            " Authorization failed usually means the selected Demo/Live profile has an invalid login, "
+            "wrong password, wrong broker server, or the account does not belong to that server. "
+            "Demo and Live often use different server names."
+        )
+    if isinstance(last_err, tuple) and len(last_err) >= 2 and str(last_err[0]) == "-10001":
+        detail = (
+            " IPC send failed means MT5 did not accept the local Python command. "
+            "Close every terminal64.exe process once, reopen MT5, and reconnect."
+        )
 
-    if returned_login != str(login):
-        got = info.get("login", "unknown")
-        mt5.shutdown()
-        _log_mt5_event("connect_wrong_account", {
-            "mode": profile.get("mode"),
-            "requested_login": login,
-            "requested_server": server,
-            "returned_login": got,
-            "returned_server": info.get("server"),
-        })
-        return False, f"MT5 opened the wrong account. Expected {login}, but terminal is on {got}. Close MT5 and connect again."
-
-    _log_mt5_event("connect_success", {
+    _log_mt5_event("connect_failed", {
         "mode": profile.get("mode"),
-        "requested_login": profile.get("login"),
-        "requested_server": profile.get("server"),
-        "returned_login": info.get("login"),
-        "returned_server": info.get("server"),
+        "login": requested_login,
+        "server": requested_server,
+        "error": last_err,
     })
-    return True, "MT5 connected successfully.", info
-
+    return False, f"MT5 connection failed for {requested_login} on {requested_server}: {last_err}.{detail}", None
 
 def get_mt5_positions() -> List[Dict[str, Any]]:
     try:

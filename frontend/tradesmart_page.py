@@ -255,62 +255,52 @@ def _section(title: str) -> None:
 
 
 def _get_user_key() -> str:
-    """Use the same signed-in user key as the MT5 Settings store."""
-    try:
-        from frontend.mt5_secure_store import get_signed_in_user_key
-        return get_signed_in_user_key("client")
-    except Exception:
-        user = st.session_state.get("user")
-        if isinstance(user, dict):
-            for field in ("id", "token", "email", "username", "name", "role"):
-                value = user.get(field)
-                if value not in (None, ""):
-                    return f"user_{value}"
-        return str(st.session_state.get("authenticated_user") or st.session_state.get("role") or "default")
+    user = st.session_state.get("user")
+    if isinstance(user, dict):
+        for field in ("id", "token", "email", "username", "name", "role"):
+            value = user.get(field)
+            if value not in (None, ""):
+                return f"user_{value}"
+    return str(st.session_state.get("authenticated_user") or st.session_state.get("role") or "default")
+
 
 def _load_mt5_profile(mode: str) -> Dict[str, Any]:
-    """Load the exact Demo/Live profile saved in Settings.
-
-    Settings and TradeSmart must read the same secure store. Do not use a flat
-    generic fallback because that can make Live show Demo or Demo show Live.
-    """
+    """Load the exact Demo/Live profile saved in Settings using mt5_secure_store."""
     mode = str(mode or "Demo").title()
-    if mode not in {"Demo", "Live"}:
-        mode = "Demo"
-
     try:
-        from frontend.mt5_secure_store import load_mt5_profile, get_signed_in_user_key
-        secure_key = get_signed_in_user_key("client")
+        import frontend.mt5_secure_store as store
 
-        for key in (
-            f"tradesmart_mt5_profile_{secure_key}_{mode}",
-            f"mt5_profile_{secure_key}_{mode}",
-            f"mt5_saved_profile_{secure_key}_{mode}",
-        ):
-            profile = st.session_state.get(key)
-            if isinstance(profile, dict) and (profile.get("login") or profile.get("server")):
+        # Use the same key system as Settings. This is what keeps Dashboard and
+        # TradeSmart reading the same encrypted saved MT5 profile.
+        for role in ("client", "ceo"):
+            try:
+                user_key = store.get_signed_in_user_key(role)
+                profile = store.load_mt5_profile(user_key, mode, role=role)
+                if isinstance(profile, dict) and (
+                    profile.get("login") or profile.get("password") or profile.get("server")
+                ):
+                    profile = dict(profile)
+                    profile["mode"] = mode
+                    return profile
+            except Exception:
+                continue
+
+        # Store-level fallback for migrated/legacy keys.
+        try:
+            profile = store.load_mt5_profile("", mode, role="client")
+            if isinstance(profile, dict) and (
+                profile.get("login") or profile.get("password") or profile.get("server")
+            ):
                 profile = dict(profile)
                 profile["mode"] = mode
                 return profile
-
-        profile = load_mt5_profile(secure_key, mode, role="client")
-        if isinstance(profile, dict):
-            profile = dict(profile)
-            profile["mode"] = mode
-            return profile
-
+        except Exception:
+            pass
     except Exception:
         pass
 
-    return {
-        "mode": mode,
-        "login": "",
-        "password": "",
-        "server": "",
-        "terminal_path": "",
-        "timeout": 60000,
-        "portable": False,
-    }
+    return {}
+
 
 
 def _masked_login(profile: Dict[str, Any]) -> str:
@@ -548,6 +538,52 @@ def _set_account_snapshot(user_key: str, mode: str, account: Optional[Dict[str, 
     return account
 
 
+
+def _connect_profile_for_tradesmart(profile: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    """
+    Use the same MT5 auto-login path as Dashboard/Settings for the initial
+    TradeSmart connection. This avoids the Demo IPC issue caused by initializing
+    MT5 through a different code path.
+    """
+    try:
+        import frontend.mt5_secure_store as store
+
+        profile = dict(profile or {})
+        profile["mode"] = mode
+        ok, message, account = store.connect_mt5(profile)
+        positions = []
+        if ok:
+            try:
+                positions = [
+                    p for p in store.get_mt5_positions()
+                    if str(p.get("symbol", "")).upper() == SYMBOL
+                ]
+            except Exception:
+                positions = []
+
+        return {
+            "ok": bool(ok),
+            "phase": "connect",
+            "event": "Connected" if ok else "Connection Failed",
+            "message": message,
+            "thinking": message,
+            "account": account or {},
+            "open_positions_count": len(positions),
+            "positions": positions,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "phase": "connect",
+            "event": "Connection Failed",
+            "message": f"MT5 auto-login failed: {exc}",
+            "thinking": str(exc),
+            "account": {},
+            "open_positions_count": 0,
+            "positions": [],
+        }
+
+
 def _refresh_account_snapshot(profile: Dict[str, Any], mode: str, user_key: str) -> Dict[str, Any]:
     agent = TradeSmartAgent(profile=profile, rules={"mode": mode, "symbol": SYMBOL})
     result = agent.snapshot_only()
@@ -733,53 +769,7 @@ def render_tradesmart(role: str = "client") -> None:
     with b1:
         if not connected:
             if st.button(f"Connect {mode} MT5", use_container_width=True, disabled=not _is_complete_profile(profile)):
-                import platform
-
-                if platform.system() != "Windows":
-                    from frontend.tradesmart_bridge_client import connect_bridge
-
-                    ok, bridge = connect_bridge(profile)
-
-                    result = {
-                        "ok": ok,
-                        "phase": "connect",
-                        "event": "Connected" if ok else "Connection Failed",
-                        "message": "Connected through Windows bridge." if ok else bridge.get("message",
-                                                                                             "Bridge connection failed."),
-                        "thinking": "Using Windows bridge for MT5 access.",
-                        "account": bridge.get("account", {}) if ok else {},
-                        "open_positions_count": len(bridge.get("positions", [])) if ok else 0,
-                        "positions": bridge.get("positions", []) if ok else [],
-                    }
-
-                else:
-                    # Use the same saved-profile MT5 login path as Settings/Dashboard
-                    # for the initial connection. This prevents Demo from opening
-                    # a previously attached Live/netting session.
-                    from frontend.mt5_secure_store import connect_mt5
-
-                    with st.spinner(f"Connecting {mode} MT5 with saved credentials..."):
-                        ok, message, account_info = connect_mt5(profile)
-
-                    if ok:
-                        result = {
-                            "ok": True,
-                            "phase": "connect",
-                            "event": "Connected",
-                            "message": message,
-                            "thinking": message,
-                            "account": account_info or {},
-                            "open_positions_count": 0,
-                            "positions": [],
-                        }
-                    else:
-                        result = {
-                            "ok": False,
-                            "phase": "connect",
-                            "event": "Connection Failed",
-                            "message": message,
-                            "thinking": message,
-                        }
+                result = _connect_profile_for_tradesmart(profile, mode)
                 if result.get("ok"):
                     st.session_state[connected_key] = True
                     st.session_state[connected_mode_key] = mode
@@ -795,13 +785,7 @@ def render_tradesmart(role: str = "client") -> None:
                 # showing an old open-trade count after the agent is stopped.
                 if _is_complete_profile(profile):
                     _refresh_account_snapshot(profile, mode, user_key)
-                import platform
-
-                if platform.system() != "Windows":
-                    from frontend.tradesmart_bridge_client import disconnect_bridge
-                    disconnect_bridge(profile)
-                else:
-                    TradeSmartAgent(profile=profile, rules={"mode": mode, "symbol": SYMBOL}).disconnect()
+                TradeSmartAgent(profile=profile, rules={"mode": mode, "symbol": SYMBOL}).disconnect()
                 st.session_state[connected_key] = False
                 st.session_state[connected_mode_key] = None
                 _save_tradesmart_worker_state(
@@ -891,43 +875,6 @@ def render_tradesmart(role: str = "client") -> None:
         @st.fragment(run_every=TRADESMART_CHECK_INTERVAL_SECONDS)
         def _live_cycle() -> None:
 
-            import platform
-
-            if platform.system() != "Windows":
-                from frontend.tradesmart_bridge_client import get_bridge_status
-
-                ok, bridge = get_bridge_status(profile)
-
-                if ok:
-                    result = {
-                        "ok": True,
-                        "event": "Bridge Connected",
-                        "message": "TradeSmart connected through Windows bridge.",
-                        "thinking": "Bridge is tracking XAUUSD and MT5 activity.",
-                        "account": bridge.get("account", {}),
-                        "positions": bridge.get("positions", []),
-                        "open_positions_count": len(bridge.get("positions", [])),
-                        "decision": {"action": "TRACK"},
-                    }
-                else:
-                    result = {
-                        "ok": False,
-                        "event": "Bridge Offline",
-                        "message": bridge.get("message", "Windows bridge offline."),
-                        "thinking": "Waiting for MT5 bridge connection.",
-                    }
-
-                account = _set_account_snapshot(
-                    user_key,
-                    mode,
-                    result.get("account") or {},
-                    result,
-                )
-
-                _render_metrics(account, mode, True)
-                _render_live_output(result)
-                return
-
             result = _run_agent_cycle(
                 profile,
                 mode,
@@ -953,28 +900,10 @@ def render_tradesmart(role: str = "client") -> None:
     elif connected:
         @st.fragment(run_every=TRADESMART_CHECK_INTERVAL_SECONDS)
         def _snapshot_cycle() -> None:
-            import platform
+            account = _refresh_account_snapshot(profile, mode, user_key)
+            _render_metrics(account, mode, True)
 
-            if platform.system() != "Windows":
-                from frontend.tradesmart_bridge_client import get_bridge_status
-
-                ok, bridge = get_bridge_status(profile)
-
-                if ok:
-                    account = _set_account_snapshot(
-                        user_key,
-                        mode,
-                        bridge.get("account", {}),
-                        {
-                            "positions": bridge.get("positions", []),
-                            "open_positions_count": len(bridge.get("positions", [])),
-                        },
-                    )
-                else:
-                    account = _get_account_snapshot(user_key, mode)
-
-            else:
-                account = _refresh_account_snapshot(profile, mode, user_key)
+        _snapshot_cycle()
     else:
         account = _get_account_snapshot(user_key, mode)
         _render_metrics(account, mode, connected)
