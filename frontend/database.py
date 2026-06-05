@@ -1,13 +1,27 @@
 import sqlite3
 import os
 import hashlib
-import secrets
-from datetime import datetime
+import random
+import string
 from pathlib import Path
+from typing import Any, Dict, List
 
-from frontend.config import DATABASE_URL, BASE_DIR
+from frontend.config import (
+    DATABASE_URL,
+    BASE_DIR,
+    SUPABASE_URL,
+    SUPABASE_ANON_KEY,
+    SUPABASE_SERVICE_ROLE_KEY,
+)
 
 DB_PATH = BASE_DIR / "dropz.db"
+SUPABASE_TABLE = "client_licenses"
+TOKEN_LENGTH = 15
+
+
+# ============================================================
+# SQLite fallback
+# ============================================================
 
 def get_connection():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -17,6 +31,7 @@ def get_connection():
     conn.execute("PRAGMA busy_timeout=5000;")
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
+
 
 def init_db():
     conn = get_connection()
@@ -47,15 +62,105 @@ def init_db():
     conn.commit()
     conn.close()
 
+
+# ============================================================
+# Shared helpers
+# ============================================================
+
+def _secret_or_env(name: str, default: str = "") -> str:
+    value = os.getenv(name)
+    if value not in (None, ""):
+        return str(value).strip()
+
+    try:
+        import streamlit as st
+        value = st.secrets.get(name, "")
+        if value not in (None, ""):
+            return str(value).strip()
+    except Exception:
+        pass
+
+    return default
+
+
 def _get_ceo_secret():
-    secret = os.getenv("CEO_SECRET_PHRASE")
-    if not secret:
-        try:
-            import streamlit as st
-            secret = st.secrets.get("CEO_SECRET_PHRASE", "")
-        except Exception:
-            secret = ""
+    secret = _secret_or_env("CEO_SECRET_PHRASE", "")
     return (secret or "").strip()
+
+
+def _supabase_available() -> bool:
+    return bool(SUPABASE_URL and (SUPABASE_ANON_KEY or SUPABASE_SERVICE_ROLE_KEY))
+
+
+def _supabase_headers(admin: bool = False) -> Dict[str, str]:
+    # Admin operations use service role when provided.
+    # Client validation can use anon key, but service role is used if anon is missing.
+    key = SUPABASE_SERVICE_ROLE_KEY if admin and SUPABASE_SERVICE_ROLE_KEY else SUPABASE_ANON_KEY
+    key = key or SUPABASE_SERVICE_ROLE_KEY
+    return {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+
+def _supabase_rest_url(path: str) -> str:
+    return f"{SUPABASE_URL.rstrip('/')}/rest/v1/{path.lstrip('/')}"
+
+
+def _supabase_request(method: str, path: str, *, admin: bool = False, **kwargs):
+    import requests
+
+    if not _supabase_available():
+        raise RuntimeError("Supabase is not configured.")
+
+    headers = kwargs.pop("headers", {})
+    merged = _supabase_headers(admin=admin)
+    merged.update(headers)
+
+    return requests.request(
+        method,
+        _supabase_rest_url(path),
+        headers=merged,
+        timeout=12,
+        **kwargs,
+    )
+
+
+def _token_row(token: str, name: str = "Client", active: bool = True, created_at: str = "") -> Dict[str, Any]:
+    return {
+        "id": token,
+        "name": name or "Client",
+        "role": "client",
+        "token": token,
+        "active": 1 if active else 0,
+        "created_at": created_at or "",
+    }
+
+
+def _normalize_token(token: Any) -> str:
+    return str(token or "").strip().upper()
+
+
+def _generate_token() -> str:
+    # Original Dropz-style token: exactly 15 random uppercase letters/numbers.
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(random.SystemRandom().choice(alphabet) for _ in range(TOKEN_LENGTH))
+
+
+def _unique_token(existing_check) -> str:
+    for _ in range(25):
+        token = _generate_token()
+        if not existing_check(token):
+            return token
+    # Extremely unlikely fallback
+    return _generate_token()
+
+
+# ============================================================
+# CEO login stays local and unchanged
+# ============================================================
 
 def create_ceo_user():
     conn = get_connection()
@@ -75,60 +180,211 @@ def create_ceo_user():
         conn.commit()
     conn.close()
 
-def generate_client_token(name, num_tokens=1):
-    conn = get_connection()
-    c = conn.cursor()
-    tokens = []
-    for _ in range(num_tokens):
-        token = secrets.token_urlsafe(11)[:15]
-        c.execute(
-            "INSERT INTO users (name, role, token, active) VALUES (?, ?, ?, ?)",
-            (name, "client", token, 1)
-        )
-        tokens.append(token)
-    conn.commit()
-    conn.close()
-    return tokens
 
 def validate_ceo_password(password):
     conn = get_connection()
     c = conn.cursor()
-    password_hash = hashlib.sha256(password.strip().encode()).hexdigest()
+    password_hash = hashlib.sha256(str(password or "").strip().encode()).hexdigest()
     c.execute("SELECT * FROM users WHERE role = 'ceo' AND password_hash = ?", (password_hash,))
     user = c.fetchone()
     conn.close()
     return user
 
-def validate_token(token):
+
+# ============================================================
+# Client token functions — Supabase first, SQLite fallback
+# ============================================================
+
+def _supabase_token_exists(token: str) -> bool:
+    try:
+        response = _supabase_request(
+            "GET",
+            f"{SUPABASE_TABLE}?token=eq.{token}&select=token",
+            admin=True,
+        )
+        return response.status_code == 200 and bool(response.json())
+    except Exception:
+        return False
+
+
+def generate_client_token(name, num_tokens=1):
+    name = str(name or "Client").strip() or "Client"
+    tokens = []
+
+    if _supabase_available():
+        try:
+            payload = []
+            for _ in range(int(num_tokens or 1)):
+                token = _unique_token(_supabase_token_exists)
+                payload.append({"name": name, "token": token, "active": True})
+                tokens.append(token)
+
+            response = _supabase_request(
+                "POST",
+                SUPABASE_TABLE,
+                admin=True,
+                json=payload,
+            )
+
+            if response.status_code in (200, 201):
+                return tokens
+
+            print(f"Supabase token insert failed: {response.status_code} {response.text}")
+            tokens = []
+        except Exception as exc:
+            print(f"Supabase token insert error: {exc}")
+            tokens = []
+
     conn = get_connection()
     c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE token = ? AND active = 1", (token.strip(),))
+
+    def local_exists(t: str) -> bool:
+        c.execute("SELECT 1 FROM users WHERE token = ?", (t,))
+        return c.fetchone() is not None
+
+    for _ in range(int(num_tokens or 1)):
+        token = _unique_token(local_exists)
+        c.execute(
+            "INSERT INTO users (name, role, token, active) VALUES (?, ?, ?, ?)",
+            (name, "client", token, 1)
+        )
+        tokens.append(token)
+
+    conn.commit()
+    conn.close()
+    return tokens
+
+
+def validate_token(token):
+    token = _normalize_token(token)
+    if not token:
+        return None
+
+    if _supabase_available():
+        try:
+            path = f"{SUPABASE_TABLE}?token=eq.{token}&active=eq.true&select=name,token,active,created_at"
+            response = _supabase_request("GET", path, admin=False)
+
+            if response.status_code == 200:
+                rows = response.json()
+                if rows:
+                    row = rows[0]
+                    return _token_row(
+                        token=row.get("token", token),
+                        name=row.get("name") or "Client",
+                        active=bool(row.get("active", True)),
+                        created_at=str(row.get("created_at") or ""),
+                    )
+
+            print(f"Supabase token validation failed: {response.status_code} {response.text}")
+        except Exception as exc:
+            print(f"Supabase token validation error: {exc}")
+
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE token = ? AND active = 1", (token,))
     user = c.fetchone()
     conn.close()
     return user
 
+
 def cancel_token(token):
+    token = _normalize_token(token)
+    if not token:
+        return
+
+    if _supabase_available():
+        try:
+            response = _supabase_request(
+                "PATCH",
+                f"{SUPABASE_TABLE}?token=eq.{token}",
+                admin=True,
+                json={"active": False},
+            )
+            if response.status_code in (200, 204):
+                return
+            print(f"Supabase cancel token failed: {response.status_code} {response.text}")
+        except Exception as exc:
+            print(f"Supabase cancel token error: {exc}")
+
     conn = get_connection()
     c = conn.cursor()
     c.execute("UPDATE users SET active = 0 WHERE token = ?", (token,))
     conn.commit()
     conn.close()
 
+
 def delete_user_by_token(token):
+    token = _normalize_token(token)
+    if not token:
+        return
+
+    if _supabase_available():
+        try:
+            response = _supabase_request(
+                "DELETE",
+                f"{SUPABASE_TABLE}?token=eq.{token}",
+                admin=True,
+            )
+            if response.status_code in (200, 204):
+                return
+            print(f"Supabase delete token failed: {response.status_code} {response.text}")
+        except Exception as exc:
+            print(f"Supabase delete token error: {exc}")
+
     conn = get_connection()
     c = conn.cursor()
     c.execute("DELETE FROM users WHERE token = ?", (token,))
     conn.commit()
     conn.close()
 
+
 def cancel_all_client_tokens():
+    if _supabase_available():
+        try:
+            response = _supabase_request(
+                "PATCH",
+                f"{SUPABASE_TABLE}?active=eq.true",
+                admin=True,
+                json={"active": False},
+            )
+            if response.status_code in (200, 204):
+                return
+            print(f"Supabase cancel all tokens failed: {response.status_code} {response.text}")
+        except Exception as exc:
+            print(f"Supabase cancel all tokens error: {exc}")
+
     conn = get_connection()
     c = conn.cursor()
     c.execute("UPDATE users SET active = 0 WHERE role = 'client'")
     conn.commit()
     conn.close()
 
+
 def get_all_client_tokens():
+    if _supabase_available():
+        try:
+            response = _supabase_request(
+                "GET",
+                f"{SUPABASE_TABLE}?select=name,token,active,created_at&order=created_at.desc",
+                admin=True,
+            )
+            if response.status_code == 200:
+                rows = response.json()
+                return [
+                    _token_row(
+                        token=row.get("token"),
+                        name=row.get("name") or "Client",
+                        active=bool(row.get("active", False)),
+                        created_at=str(row.get("created_at") or ""),
+                    )
+                    for row in rows
+                    if row.get("token")
+                ]
+            print(f"Supabase list tokens failed: {response.status_code} {response.text}")
+        except Exception as exc:
+            print(f"Supabase list tokens error: {exc}")
+
     conn = get_connection()
     c = conn.cursor()
     c.execute("SELECT * FROM users WHERE role = 'client' ORDER BY created_at DESC")
@@ -136,7 +392,24 @@ def get_all_client_tokens():
     conn.close()
     return users
 
+
 def get_active_token_count():
+    if _supabase_available():
+        try:
+            response = _supabase_request(
+                "GET",
+                f"{SUPABASE_TABLE}?active=eq.true&select=token",
+                admin=True,
+                headers={"Prefer": "count=exact"},
+            )
+            if response.status_code == 200:
+                content_range = response.headers.get("content-range", "")
+                if "/" in content_range:
+                    return int(content_range.rsplit("/", 1)[-1])
+                return len(response.json())
+        except Exception as exc:
+            print(f"Supabase active count error: {exc}")
+
     conn = get_connection()
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM users WHERE role = 'client' AND active = 1")
@@ -144,8 +417,10 @@ def get_active_token_count():
     conn.close()
     return count
 
+
 init_db()
 create_ceo_user()
+
 
 def frontend_database():
     return None
