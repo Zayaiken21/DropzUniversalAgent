@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 APP_NAME = "DropzUniversalAgent"
-APP_VERSION = os.environ.get("DROPZ_APP_VERSION", "1.0.2")
+APP_VERSION = os.environ.get("DROPZ_APP_VERSION", "1.0.1")
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("DROPZ_DESKTOP_PORT", "8501"))
 URL = f"http://{HOST}:{PORT}"

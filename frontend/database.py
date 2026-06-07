@@ -4,7 +4,7 @@ import hashlib
 import random
 import string
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from frontend.config import (
     DATABASE_URL,
@@ -93,8 +93,8 @@ def _supabase_available() -> bool:
 
 
 def _supabase_headers(admin: bool = False) -> Dict[str, str]:
-    # Admin operations use service role when provided.
-    # Client validation can use anon key, but service role is used if anon is missing.
+    # Public distributed builds should normally use anon + RLS policies.
+    # Private CEO builds may use service role if you intentionally put it in .env.
     key = SUPABASE_SERVICE_ROLE_KEY if admin and SUPABASE_SERVICE_ROLE_KEY else SUPABASE_ANON_KEY
     key = key or SUPABASE_SERVICE_ROLE_KEY
     return {
@@ -113,19 +113,36 @@ def _supabase_request(method: str, path: str, *, admin: bool = False, **kwargs):
     import requests
 
     if not _supabase_available():
-        raise RuntimeError("Supabase is not configured.")
+        raise RuntimeError("Supabase is not configured. SUPABASE_URL/SUPABASE_ANON_KEY missing.")
 
     headers = kwargs.pop("headers", {})
     merged = _supabase_headers(admin=admin)
     merged.update(headers)
 
-    return requests.request(
+    response = requests.request(
         method,
         _supabase_rest_url(path),
         headers=merged,
-        timeout=12,
+        timeout=15,
         **kwargs,
     )
+    return response
+
+
+def _report_supabase_error(action: str, response=None, exc: Exception | None = None) -> None:
+    message = f"Supabase {action} failed."
+    if response is not None:
+        message += f" Status {getattr(response, 'status_code', 'unknown')}: {getattr(response, 'text', '')}"
+    if exc is not None:
+        message += f" Error: {exc}"
+
+    # Keep app from crashing, but make the issue visible in logs/UI.
+    print(message)
+    try:
+        import streamlit as st
+        st.error(message)
+    except Exception:
+        pass
 
 
 def _token_row(token: str, name: str = "Client", active: bool = True, created_at: str = "") -> Dict[str, Any]:
@@ -139,6 +156,17 @@ def _token_row(token: str, name: str = "Client", active: bool = True, created_at
     }
 
 
+def _sqlite_row_to_dict(row: Any) -> Optional[Dict[str, Any]]:
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return row
+    try:
+        return dict(row)
+    except Exception:
+        return None
+
+
 def _normalize_token(token: Any) -> str:
     return str(token or "").strip().upper()
 
@@ -150,11 +178,10 @@ def _generate_token() -> str:
 
 
 def _unique_token(existing_check) -> str:
-    for _ in range(25):
+    for _ in range(50):
         token = _generate_token()
         if not existing_check(token):
             return token
-    # Extremely unlikely fallback
     return _generate_token()
 
 
@@ -209,12 +236,13 @@ def _supabase_token_exists(token: str) -> bool:
 
 def generate_client_token(name, num_tokens=1):
     name = str(name or "Client").strip() or "Client"
-    tokens = []
+    amount = int(num_tokens or 1)
+    tokens: List[str] = []
 
     if _supabase_available():
         try:
             payload = []
-            for _ in range(int(num_tokens or 1)):
+            for _ in range(amount):
                 token = _unique_token(_supabase_token_exists)
                 payload.append({"name": name, "token": token, "active": True})
                 tokens.append(token)
@@ -229,12 +257,13 @@ def generate_client_token(name, num_tokens=1):
             if response.status_code in (200, 201):
                 return tokens
 
-            print(f"Supabase token insert failed: {response.status_code} {response.text}")
-            tokens = []
+            _report_supabase_error("insert token", response=response)
+            return []
         except Exception as exc:
-            print(f"Supabase token insert error: {exc}")
-            tokens = []
+            _report_supabase_error("insert token", exc=exc)
+            return []
 
+    # Local fallback only when Supabase is not configured.
     conn = get_connection()
     c = conn.cursor()
 
@@ -242,7 +271,7 @@ def generate_client_token(name, num_tokens=1):
         c.execute("SELECT 1 FROM users WHERE token = ?", (t,))
         return c.fetchone() is not None
 
-    for _ in range(int(num_tokens or 1)):
+    for _ in range(amount):
         token = _unique_token(local_exists)
         c.execute(
             "INSERT INTO users (name, role, token, active) VALUES (?, ?, ?, ?)",
@@ -275,23 +304,26 @@ def validate_token(token):
                         active=bool(row.get("active", True)),
                         created_at=str(row.get("created_at") or ""),
                     )
+                return None
 
-            print(f"Supabase token validation failed: {response.status_code} {response.text}")
+            _report_supabase_error("validate token", response=response)
+            return None
         except Exception as exc:
-            print(f"Supabase token validation error: {exc}")
+            _report_supabase_error("validate token", exc=exc)
+            return None
 
     conn = get_connection()
     c = conn.cursor()
     c.execute("SELECT * FROM users WHERE token = ? AND active = 1", (token,))
     user = c.fetchone()
     conn.close()
-    return user
+    return _sqlite_row_to_dict(user)
 
 
 def cancel_token(token):
     token = _normalize_token(token)
     if not token:
-        return
+        return False
 
     if _supabase_available():
         try:
@@ -302,22 +334,26 @@ def cancel_token(token):
                 json={"active": False},
             )
             if response.status_code in (200, 204):
-                return
-            print(f"Supabase cancel token failed: {response.status_code} {response.text}")
+                return True
+            _report_supabase_error("cancel token", response=response)
+            return False
         except Exception as exc:
-            print(f"Supabase cancel token error: {exc}")
+            _report_supabase_error("cancel token", exc=exc)
+            return False
 
     conn = get_connection()
     c = conn.cursor()
     c.execute("UPDATE users SET active = 0 WHERE token = ?", (token,))
     conn.commit()
+    changed = c.rowcount > 0
     conn.close()
+    return changed
 
 
 def delete_user_by_token(token):
     token = _normalize_token(token)
     if not token:
-        return
+        return False
 
     if _supabase_available():
         try:
@@ -325,23 +361,29 @@ def delete_user_by_token(token):
                 "DELETE",
                 f"{SUPABASE_TABLE}?token=eq.{token}",
                 admin=True,
+                headers={"Prefer": "return=minimal"},
             )
-            if response.status_code in (200, 204):
-                return
-            print(f"Supabase delete token failed: {response.status_code} {response.text}")
+            if response.status_code in (200, 202, 204):
+                return True
+            _report_supabase_error("delete token", response=response)
+            return False
         except Exception as exc:
-            print(f"Supabase delete token error: {exc}")
+            _report_supabase_error("delete token", exc=exc)
+            return False
 
     conn = get_connection()
     c = conn.cursor()
     c.execute("DELETE FROM users WHERE token = ?", (token,))
     conn.commit()
+    changed = c.rowcount > 0
     conn.close()
+    return changed
 
 
 def cancel_all_client_tokens():
     if _supabase_available():
         try:
+            # Keeps old cancel-all behavior as deactivate.
             response = _supabase_request(
                 "PATCH",
                 f"{SUPABASE_TABLE}?active=eq.true",
@@ -349,16 +391,19 @@ def cancel_all_client_tokens():
                 json={"active": False},
             )
             if response.status_code in (200, 204):
-                return
-            print(f"Supabase cancel all tokens failed: {response.status_code} {response.text}")
+                return True
+            _report_supabase_error("cancel all tokens", response=response)
+            return False
         except Exception as exc:
-            print(f"Supabase cancel all tokens error: {exc}")
+            _report_supabase_error("cancel all tokens", exc=exc)
+            return False
 
     conn = get_connection()
     c = conn.cursor()
     c.execute("UPDATE users SET active = 0 WHERE role = 'client'")
     conn.commit()
     conn.close()
+    return True
 
 
 def get_all_client_tokens():
@@ -367,7 +412,7 @@ def get_all_client_tokens():
             response = _supabase_request(
                 "GET",
                 f"{SUPABASE_TABLE}?select=name,token,active,created_at&order=created_at.desc",
-                admin=True,
+                admin=False,
             )
             if response.status_code == 200:
                 rows = response.json()
@@ -381,16 +426,18 @@ def get_all_client_tokens():
                     for row in rows
                     if row.get("token")
                 ]
-            print(f"Supabase list tokens failed: {response.status_code} {response.text}")
+            _report_supabase_error("list tokens", response=response)
+            return []
         except Exception as exc:
-            print(f"Supabase list tokens error: {exc}")
+            _report_supabase_error("list tokens", exc=exc)
+            return []
 
     conn = get_connection()
     c = conn.cursor()
     c.execute("SELECT * FROM users WHERE role = 'client' ORDER BY created_at DESC")
-    users = c.fetchall()
+    users = [_sqlite_row_to_dict(row) for row in c.fetchall()]
     conn.close()
-    return users
+    return [u for u in users if u]
 
 
 def get_active_token_count():
@@ -407,8 +454,11 @@ def get_active_token_count():
                 if "/" in content_range:
                     return int(content_range.rsplit("/", 1)[-1])
                 return len(response.json())
+            _report_supabase_error("active token count", response=response)
+            return 0
         except Exception as exc:
-            print(f"Supabase active count error: {exc}")
+            _report_supabase_error("active token count", exc=exc)
+            return 0
 
     conn = get_connection()
     c = conn.cursor()

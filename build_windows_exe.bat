@@ -1,6 +1,8 @@
 @echo off
-setlocal
+setlocal EnableExtensions
 cd /d "%~dp0"
+
+set APP_NAME=DropzUniversalAgent
 
 echo Building Dropz Universal Agent with Python:
 python --version
@@ -12,7 +14,7 @@ python -m pip install -r requirements_desktop.txt
 echo Cleaning old build output...
 rmdir /s /q build 2>nul
 rmdir /s /q dist 2>nul
-del DropzUniversalAgent-Windows.zip 2>nul
+del %APP_NAME%-Windows.zip 2>nul
 
 echo Building Dropz Universal Agent desktop app...
 
@@ -20,7 +22,7 @@ python -m PyInstaller ^
   --clean ^
   --noconfirm ^
   --onedir ^
-  --name DropzUniversalAgent ^
+  --name %APP_NAME% ^
   --icon assets\dropz_icon.ico ^
   --runtime-hook pyi_runtime_hook_dropz.py ^
   --collect-all streamlit ^
@@ -30,6 +32,15 @@ python -m PyInstaller ^
   --collect-all plotly ^
   --collect-all pandas ^
   --collect-all numpy ^
+  --collect-all requests ^
+  --collect-all certifi ^
+  --collect-all urllib3 ^
+  --collect-all charset_normalizer ^
+  --collect-all idna ^
+  --collect-all dotenv ^
+  --collect-all cryptography ^
+  --collect-all cffi ^
+  --collect-all MetaTrader5 ^
   --collect-all streamlit_autorefresh ^
   --collect-all streamlit_option_menu ^
   --collect-all streamlit_extras ^
@@ -43,6 +54,8 @@ python -m PyInstaller ^
   --hidden-import streamlit_chat ^
   --hidden-import streamlit_float ^
   --hidden-import components ^
+  --hidden-import components.charts ^
+  --hidden-import components.dashboard_mt5_data ^
   --hidden-import chat_backend ^
   --hidden-import backend ^
   --add-data "streamlit_app.py;." ^
@@ -57,8 +70,6 @@ python -m PyInstaller ^
   --add-data "assets;assets" ^
   --add-data "data;data" ^
   --add-data "frontend\dropz.db;frontend" ^
-  --add-data "version_manifest.json;." ^
-  --add-data "update_manifest_url.txt;." ^
   desktop_launcher.py
 
 if errorlevel 1 (
@@ -68,7 +79,6 @@ if errorlevel 1 (
 )
 
 echo Building updater...
-
 python -m PyInstaller ^
   --clean ^
   --noconfirm ^
@@ -78,14 +88,29 @@ python -m PyInstaller ^
   dropz_updater.py
 
 if exist "dist\DropzUpdater\DropzUpdater.exe" (
-  copy /Y "dist\DropzUpdater\DropzUpdater.exe" "dist\DropzUniversalAgent\DropzUpdater.exe"
+  copy /Y "dist\DropzUpdater\DropzUpdater.exe" "dist\%APP_NAME%\DropzUpdater.exe" >nul
+)
+
+echo Copying runtime configuration files...
+if exist ".env" (
+  copy /Y ".env" "dist\%APP_NAME%\.env" >nul
+  if exist "dist\%APP_NAME%\_internal" copy /Y ".env" "dist\%APP_NAME%\_internal\.env" >nul
+)
+if exist "update_manifest_url.txt" (
+  copy /Y "update_manifest_url.txt" "dist\%APP_NAME%\update_manifest_url.txt" >nul
+  if exist "dist\%APP_NAME%\_internal" copy /Y "update_manifest_url.txt" "dist\%APP_NAME%\_internal\update_manifest_url.txt" >nul
+)
+if exist "version_manifest.json" (
+  copy /Y "version_manifest.json" "dist\%APP_NAME%\version_manifest.json" >nul
+  if exist "dist\%APP_NAME%\_internal" copy /Y "version_manifest.json" "dist\%APP_NAME%\_internal\version_manifest.json" >nul
 )
 
 echo Creating ZIP...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '.\dist\DropzUniversalAgent\*' -DestinationPath '.\DropzUniversalAgent-Windows.zip' -Force"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '.\dist\%APP_NAME%\*' -DestinationPath '.\%APP_NAME%-Windows.zip' -Force"
 
 echo.
 echo Build complete:
-echo dist\DropzUniversalAgent\DropzUniversalAgent.exe
-echo DropzUniversalAgent-Windows.zip
+echo dist\%APP_NAME%\%APP_NAME%.exe
+echo ZIP ready:
+echo %APP_NAME%-Windows.zip
 pause
