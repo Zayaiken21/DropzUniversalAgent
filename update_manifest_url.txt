@@ -1,0 +1,1 @@
+https://raw.githubusercontent.com/Zayaiken21/DropzUniversalAgent/main/version_manifest.json
