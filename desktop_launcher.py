@@ -13,12 +13,13 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 APP_NAME = "DropzUniversalAgent"
-APP_VERSION = os.environ.get("DROPZ_APP_VERSION", "1.0.0")
+APP_VERSION = os.environ.get("DROPZ_APP_VERSION", "1.0.2")
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("DROPZ_DESKTOP_PORT", "8501"))
 URL = f"http://{HOST}:{PORT}"
 
 _opened_browser = False
+_update_started = False
 
 
 def _base_dir() -> Path:
@@ -103,7 +104,13 @@ def _read_update_manifest() -> dict:
     if not manifest_url:
         return {}
 
-    req = Request(manifest_url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+    req = Request(
+        manifest_url,
+        headers={
+            "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+            "Cache-Control": "no-cache",
+        },
+    )
     with urlopen(req, timeout=5) as resp:
         raw = resp.read(1024 * 1024).decode("utf-8")
     data = json.loads(raw)
@@ -111,41 +118,64 @@ def _read_update_manifest() -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _maybe_launch_updater() -> bool:
-    """Return True when the launcher should exit because the updater was started."""
-    if os.environ.get("DROPZ_DISABLE_UPDATES", "").lower() in {"1", "true", "yes", "on"}:
-        return False
+def _start_update_check_in_background() -> None:
+    """
+    Subtle update mode.
 
-    try:
-        data = _read_update_manifest()
-        latest = str(data.get("version", "")).strip()
-        download_url = str(data.get("download_url", "")).strip()
-        if not latest or not download_url:
-            return False
-        if _version_tuple(latest) <= _version_tuple(APP_VERSION):
-            log(f"No update needed. Current={APP_VERSION} Latest={latest}")
-            return False
+    The desktop app always opens first. If an update is available, DropzUpdater is
+    started in the background. It downloads/caches the update, waits until this app
+    process closes, then installs the update and relaunches the app.
 
-        updater = EXE_DIR / "DropzUpdater.exe"
-        if not updater.exists():
-            log("Update available, but DropzUpdater.exe is missing.")
-            return False
+    This prevents the old "update first, app never opens" behavior.
+    """
+    global _update_started
+    if _update_started:
+        return
+    _update_started = True
 
-        log(f"Update available: {APP_VERSION} -> {latest}. Starting updater.")
-        args = [
-            str(updater),
-            "--app-dir", str(EXE_DIR),
-            "--main-exe", str(EXE_DIR / f"{APP_NAME}.exe"),
-            "--current-version", APP_VERSION,
-            "--latest-version", latest,
-            "--download-url", download_url,
-            "--sha256", str(data.get("sha256", "") or ""),
-        ]
-        subprocess.Popen(args, cwd=str(EXE_DIR), close_fds=True)
-        return True
-    except Exception as exc:
-        log(f"Update check skipped: {exc}")
-        return False
+    def worker() -> None:
+        try:
+            if os.environ.get("DROPZ_DISABLE_UPDATES", "").lower() in {"1", "true", "yes", "on"}:
+                log("Updates disabled by DROPZ_DISABLE_UPDATES.")
+                return
+
+            data = _read_update_manifest()
+            if not data:
+                log("No update manifest configured.")
+                return
+
+            latest = str(data.get("version", "") or "").strip()
+            download_url = str(data.get("download_url", "") or "").strip()
+            if not latest or not download_url:
+                log("Update manifest missing version or download_url.")
+                return
+
+            if _version_tuple(latest) <= _version_tuple(APP_VERSION):
+                log(f"No update needed. Current={APP_VERSION}, Latest={latest}.")
+                return
+
+            updater = EXE_DIR / "DropzUpdater.exe"
+            if not updater.exists():
+                log("Update available, but DropzUpdater.exe is missing.")
+                return
+
+            log(f"Update available: {APP_VERSION} -> {latest}. Starting updater in background.")
+            args = [
+                str(updater),
+                "--app-dir", str(EXE_DIR),
+                "--main-exe", str(EXE_DIR / f"{APP_NAME}.exe"),
+                "--current-version", APP_VERSION,
+                "--latest-version", latest,
+                "--download-url", download_url,
+                "--sha256", str(data.get("sha256", "") or ""),
+                "--wait-pid", str(os.getpid()),
+                "--background",
+            ]
+            subprocess.Popen(args, cwd=str(EXE_DIR), close_fds=True)
+        except Exception as exc:
+            log(f"Update check skipped: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def _run_streamlit_in_process(app_file: Path) -> None:
@@ -182,19 +212,18 @@ def _wait_and_open_browser() -> None:
         if _port_open():
             time.sleep(0.8)
             _open_browser_once()
+            # Start update check only after the local app is actually reachable.
+            _start_update_check_in_background()
             return
         time.sleep(0.35)
     log("Streamlit did not respond before timeout. Opening browser once anyway.")
     _open_browser_once()
+    _start_update_check_in_background()
 
 
 def main() -> int:
     log("Launcher starting.")
     try:
-        if _maybe_launch_updater():
-            log("Launcher exiting for updater.")
-            return 0
-
         app_file = _find_app_file()
         log(f"Using app file: {app_file}")
 

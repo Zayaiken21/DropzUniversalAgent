@@ -1,51 +1,26 @@
 @echo off
-setlocal EnableExtensions EnableDelayedExpansion
-
+setlocal
 cd /d "%~dp0"
 
-set APP_VERSION=1.0.0
-set APP_NAME=DropzUniversalAgent
+echo Building Dropz Universal Agent with Python:
+python --version
 
 echo Installing desktop requirements...
 python -m pip install --upgrade pip
 python -m pip install -r requirements_desktop.txt
 
-echo Checking required packages...
-python -c "from importlib.util import find_spec; import sys; required=['streamlit','pandas','numpy','plotly','requests','dotenv','cryptography','PyInstaller','altair','pyarrow','watchdog']; missing=[m for m in required if find_spec(m) is None]; print('Missing:', missing) if missing else print('Required packages OK'); sys.exit(1 if missing else 0)"
-if errorlevel 1 (
-  echo Required package check failed.
-  pause
-  exit /b 1
-)
-
 echo Cleaning old build output...
 rmdir /s /q build 2>nul
 rmdir /s /q dist 2>nul
-del /q %APP_NAME%-Windows.zip 2>nul
-
-echo Building updater...
-python -m PyInstaller ^
-  --clean ^
-  --noconfirm ^
-  --onefile ^
-  --name DropzUpdater ^
-  --icon assets\dropz_icon.ico ^
-  dropz_updater.py
-
-if errorlevel 1 (
-  echo Updater build failed.
-  pause
-  exit /b 1
-)
+del DropzUniversalAgent-Windows.zip 2>nul
 
 echo Building Dropz Universal Agent desktop app...
-set DROPZ_APP_VERSION=%APP_VERSION%
 
 python -m PyInstaller ^
   --clean ^
   --noconfirm ^
   --onedir ^
-  --name %APP_NAME% ^
+  --name DropzUniversalAgent ^
   --icon assets\dropz_icon.ico ^
   --runtime-hook pyi_runtime_hook_dropz.py ^
   --collect-all streamlit ^
@@ -55,22 +30,21 @@ python -m PyInstaller ^
   --collect-all plotly ^
   --collect-all pandas ^
   --collect-all numpy ^
-  --collect-all requests ^
-  --collect-all dotenv ^
-  --collect-all cryptography ^
-  --collect-all MetaTrader5 ^
+  --collect-all streamlit_autorefresh ^
   --collect-all streamlit_option_menu ^
   --collect-all streamlit_extras ^
-  --collect-all streamlit_autorefresh ^
-  --collect-all streamlit_webrtc ^
   --collect-all streamlit_js_eval ^
   --collect-all streamlit_chat ^
   --collect-all streamlit_float ^
-  --hidden-import chat_backend ^
-  --hidden-import chat_backend.chat_db ^
+  --hidden-import streamlit_autorefresh ^
+  --hidden-import streamlit_option_menu ^
+  --hidden-import streamlit_extras ^
+  --hidden-import streamlit_js_eval ^
+  --hidden-import streamlit_chat ^
+  --hidden-import streamlit_float ^
   --hidden-import components ^
-  --hidden-import components.charts ^
-  --hidden-import components.dashboard_mt5_data ^
+  --hidden-import chat_backend ^
+  --hidden-import backend ^
   --add-data "streamlit_app.py;." ^
   --add-data "frontend;frontend" ^
   --add-data "components;components" ^
@@ -83,34 +57,35 @@ python -m PyInstaller ^
   --add-data "assets;assets" ^
   --add-data "data;data" ^
   --add-data "frontend\dropz.db;frontend" ^
+  --add-data "version_manifest.json;." ^
+  --add-data "update_manifest_url.txt;." ^
   desktop_launcher.py
 
 if errorlevel 1 (
-  echo App build failed.
+  echo Build failed.
   pause
   exit /b 1
 )
 
-echo Copying updater into app folder...
-copy /Y "dist\DropzUpdater.exe" "dist\%APP_NAME%\DropzUpdater.exe" >nul
+echo Building updater...
 
-echo Writing version file...
-echo %APP_VERSION%> "dist\%APP_NAME%\version.txt"
+python -m PyInstaller ^
+  --clean ^
+  --noconfirm ^
+  --onedir ^
+  --name DropzUpdater ^
+  --icon assets\dropz_icon.ico ^
+  dropz_updater.py
 
-if exist update_manifest_url.txt (
-  copy /Y update_manifest_url.txt "dist\%APP_NAME%\update_manifest_url.txt" >nul
+if exist "dist\DropzUpdater\DropzUpdater.exe" (
+  copy /Y "dist\DropzUpdater\DropzUpdater.exe" "dist\DropzUniversalAgent\DropzUpdater.exe"
 )
 
 echo Creating ZIP...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '.\dist\%APP_NAME%\*' -DestinationPath '.\%APP_NAME%-Windows.zip' -Force"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '.\dist\DropzUniversalAgent\*' -DestinationPath '.\DropzUniversalAgent-Windows.zip' -Force"
 
 echo.
 echo Build complete:
-echo dist\%APP_NAME%\%APP_NAME%.exe
-echo ZIP ready:
-echo %APP_NAME%-Windows.zip
-echo.
-echo IMPORTANT:
-echo Upload %APP_NAME%-Windows.zip to your GitHub Release or download host.
-echo Update version_manifest.json with the new version and download URL.
+echo dist\DropzUniversalAgent\DropzUniversalAgent.exe
+echo DropzUniversalAgent-Windows.zip
 pause

@@ -1,9 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('streamlit_app.py', '.'), ('frontend', 'frontend'), ('components', 'components'), ('chat_backend', 'chat_backend'), ('backend', 'backend'), ('agents', 'agents'), ('strategies', 'strategies'), ('styles', 'styles'), ('tools', 'tools'), ('assets', 'assets'), ('data', 'data'), ('frontend\\dropz.db', 'frontend')]
+datas = [('streamlit_app.py', '.'), ('frontend', 'frontend'), ('components', 'components'), ('chat_backend', 'chat_backend'), ('backend', 'backend'), ('agents', 'agents'), ('strategies', 'strategies'), ('styles', 'styles'), ('tools', 'tools'), ('assets', 'assets'), ('data', 'data'), ('frontend\\dropz.db', 'frontend'), ('version_manifest.json', '.'), ('update_manifest_url.txt', '.')]
 binaries = []
-hiddenimports = ['chat_backend', 'chat_backend.chat_db', 'components', 'components.charts', 'components.dashboard_mt5_data']
+hiddenimports = ['streamlit_autorefresh', 'streamlit_option_menu', 'streamlit_extras', 'streamlit_js_eval', 'streamlit_chat', 'streamlit_float', 'components', 'chat_backend', 'backend']
 tmp_ret = collect_all('streamlit')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('tornado')
@@ -18,21 +18,11 @@ tmp_ret = collect_all('pandas')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('numpy')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('requests')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('dotenv')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('cryptography')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('MetaTrader5')
+tmp_ret = collect_all('streamlit_autorefresh')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('streamlit_option_menu')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('streamlit_extras')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('streamlit_autorefresh')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('streamlit_webrtc')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('streamlit_js_eval')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
