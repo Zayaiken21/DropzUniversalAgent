@@ -8,6 +8,15 @@ python --version
 echo Installing desktop requirements...
 python -m pip install --upgrade pip
 python -m pip install -r requirements_desktop.txt
+python -m pip install --upgrade cryptography cffi pycparser
+
+echo Verifying critical packages...
+python -c "import cryptography, cffi, streamlit, plotly, streamlit_autorefresh; print('Critical packages OK')"
+if errorlevel 1 (
+  echo Required package check failed.
+  pause
+  exit /b 1
+)
 
 echo Cleaning old build output...
 rmdir /s /q build 2>nul
@@ -30,18 +39,32 @@ python -m PyInstaller ^
   --collect-all plotly ^
   --collect-all pandas ^
   --collect-all numpy ^
+  --collect-all cryptography ^
+  --collect-all cffi ^
   --collect-all streamlit_autorefresh ^
   --collect-all streamlit_option_menu ^
   --collect-all streamlit_extras ^
   --collect-all streamlit_js_eval ^
   --collect-all streamlit_chat ^
   --collect-all streamlit_float ^
+  --collect-all streamlit_webrtc ^
+  --hidden-import cryptography ^
+  --hidden-import cryptography.fernet ^
+  --hidden-import cryptography.hazmat.bindings._rust ^
+  --hidden-import cryptography.hazmat.primitives ^
+  --hidden-import cryptography.hazmat.primitives.hashes ^
+  --hidden-import cryptography.hazmat.primitives.kdf.pbkdf2 ^
+  --hidden-import cryptography.hazmat.primitives.ciphers ^
+  --hidden-import cryptography.hazmat.primitives.padding ^
+  --hidden-import cffi ^
+  --hidden-import _cffi_backend ^
   --hidden-import streamlit_autorefresh ^
   --hidden-import streamlit_option_menu ^
   --hidden-import streamlit_extras ^
   --hidden-import streamlit_js_eval ^
   --hidden-import streamlit_chat ^
   --hidden-import streamlit_float ^
+  --hidden-import streamlit_webrtc ^
   --hidden-import components ^
   --hidden-import chat_backend ^
   --hidden-import backend ^
@@ -75,6 +98,12 @@ python -m PyInstaller ^
   --onedir ^
   --name DropzUpdater ^
   --icon assets\dropz_icon.ico ^
+  --collect-all cryptography ^
+  --collect-all cffi ^
+  --hidden-import cryptography ^
+  --hidden-import cryptography.fernet ^
+  --hidden-import cffi ^
+  --hidden-import _cffi_backend ^
   dropz_updater.py
 
 if exist "dist\DropzUpdater\DropzUpdater.exe" (

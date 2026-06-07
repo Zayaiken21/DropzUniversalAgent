@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = [('streamlit_app.py', '.'), ('frontend', 'frontend'), ('components', 'components'), ('chat_backend', 'chat_backend'), ('backend', 'backend'), ('agents', 'agents'), ('strategies', 'strategies'), ('styles', 'styles'), ('tools', 'tools'), ('assets', 'assets'), ('data', 'data'), ('frontend\\dropz.db', 'frontend'), ('version_manifest.json', '.'), ('update_manifest_url.txt', '.')]
 binaries = []
-hiddenimports = ['streamlit_autorefresh', 'streamlit_option_menu', 'streamlit_extras', 'streamlit_js_eval', 'streamlit_chat', 'streamlit_float', 'components', 'chat_backend', 'backend']
+hiddenimports = ['cryptography', 'cryptography.fernet', 'cryptography.hazmat.bindings._rust', 'cryptography.hazmat.primitives', 'cryptography.hazmat.primitives.hashes', 'cryptography.hazmat.primitives.kdf.pbkdf2', 'cryptography.hazmat.primitives.ciphers', 'cryptography.hazmat.primitives.padding', 'cffi', '_cffi_backend', 'streamlit_autorefresh', 'streamlit_option_menu', 'streamlit_extras', 'streamlit_js_eval', 'streamlit_chat', 'streamlit_float', 'streamlit_webrtc', 'components', 'chat_backend', 'backend']
 tmp_ret = collect_all('streamlit')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('tornado')
@@ -18,6 +18,10 @@ tmp_ret = collect_all('pandas')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('numpy')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('cryptography')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('cffi')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('streamlit_autorefresh')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('streamlit_option_menu')
@@ -29,6 +33,8 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('streamlit_chat')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('streamlit_float')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('streamlit_webrtc')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
