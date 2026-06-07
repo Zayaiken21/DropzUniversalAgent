@@ -103,7 +103,13 @@ def _read_update_manifest() -> dict:
     if not manifest_url:
         return {}
 
-    req = Request(manifest_url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+    req = Request(
+        manifest_url,
+        headers={
+            "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+            "Cache-Control": "no-cache",
+        },
+    )
     with urlopen(req, timeout=5) as resp:
         raw = resp.read(1024 * 1024).decode("utf-8")
     data = json.loads(raw)
@@ -111,41 +117,68 @@ def _read_update_manifest() -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _maybe_launch_updater() -> bool:
-    """Return True when the launcher should exit because the updater was started."""
+def _start_update_check_in_background() -> None:
+    """
+    Non-blocking update behavior.
+
+    The launcher must always keep opening the app. If an update exists, this starts
+    DropzUpdater in the background. The updater downloads/caches the ZIP, waits for
+    this launcher process to close, then installs and restarts the app.
+
+    This prevents the old behavior where the app closed immediately just because an
+    update was available.
+    """
     if os.environ.get("DROPZ_DISABLE_UPDATES", "").lower() in {"1", "true", "yes", "on"}:
-        return False
+        log("Updates disabled by DROPZ_DISABLE_UPDATES.")
+        return
 
-    try:
-        data = _read_update_manifest()
-        latest = str(data.get("version", "")).strip()
-        download_url = str(data.get("download_url", "")).strip()
-        if not latest or not download_url:
-            return False
-        if _version_tuple(latest) <= _version_tuple(APP_VERSION):
-            log(f"No update needed. Current={APP_VERSION} Latest={latest}")
-            return False
+    # Prevent duplicate update workers if a process is restarted quickly.
+    if os.environ.get("DROPZ_UPDATE_WORKER_STARTED") == "1":
+        return
 
-        updater = EXE_DIR / "DropzUpdater.exe"
-        if not updater.exists():
-            log("Update available, but DropzUpdater.exe is missing.")
-            return False
+    def worker() -> None:
+        try:
+            # Let Streamlit start first. This makes launch feel fast.
+            time.sleep(3)
 
-        log(f"Update available: {APP_VERSION} -> {latest}. Starting updater.")
-        args = [
-            str(updater),
-            "--app-dir", str(EXE_DIR),
-            "--main-exe", str(EXE_DIR / f"{APP_NAME}.exe"),
-            "--current-version", APP_VERSION,
-            "--latest-version", latest,
-            "--download-url", download_url,
-            "--sha256", str(data.get("sha256", "") or ""),
-        ]
-        subprocess.Popen(args, cwd=str(EXE_DIR), close_fds=True)
-        return True
-    except Exception as exc:
-        log(f"Update check skipped: {exc}")
-        return False
+            data = _read_update_manifest()
+            latest = str(data.get("version", "")).strip()
+            download_url = str(data.get("download_url", "")).strip()
+
+            if not latest or not download_url:
+                log("Update check skipped: manifest missing version/download_url.")
+                return
+
+            if _version_tuple(latest) <= _version_tuple(APP_VERSION):
+                log(f"No update needed. Current={APP_VERSION} Latest={latest}")
+                return
+
+            updater = EXE_DIR / "DropzUpdater.exe"
+            if not updater.exists():
+                log("Update available, but DropzUpdater.exe is missing.")
+                return
+
+            log(f"Update available: {APP_VERSION} -> {latest}. Starting updater in background.")
+            env = os.environ.copy()
+            env["DROPZ_UPDATE_WORKER_STARTED"] = "1"
+
+            args = [
+                str(updater),
+                "--app-dir", str(EXE_DIR),
+                "--main-exe", str(EXE_DIR / f"{APP_NAME}.exe"),
+                "--current-version", APP_VERSION,
+                "--latest-version", latest,
+                "--download-url", download_url,
+                "--sha256", str(data.get("sha256", "") or ""),
+                "--wait-pid", str(os.getpid()),
+                "--background",
+            ]
+            subprocess.Popen(args, cwd=str(EXE_DIR), env=env, close_fds=True)
+        except Exception as exc:
+            # Updates must never stop the app from opening.
+            log(f"Update check skipped: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def _run_streamlit_in_process(app_file: Path) -> None:
@@ -191,12 +224,11 @@ def _wait_and_open_browser() -> None:
 def main() -> int:
     log("Launcher starting.")
     try:
-        if _maybe_launch_updater():
-            log("Launcher exiting for updater.")
-            return 0
-
         app_file = _find_app_file()
         log(f"Using app file: {app_file}")
+
+        # Start update check, but never block the app from opening.
+        _start_update_check_in_background()
 
         browser_thread = threading.Thread(target=_wait_and_open_browser, daemon=True)
         browser_thread.start()
