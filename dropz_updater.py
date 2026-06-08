@@ -5,7 +5,6 @@ import hashlib
 import os
 import shutil
 import subprocess
-import sys
 import time
 import zipfile
 from pathlib import Path
@@ -43,10 +42,16 @@ def _is_valid_zip(path: Path) -> bool:
         return False
 
 
-def download_cached(url: str, version: str, expected_sha256: str = "") -> Path:
+def _safe_cache_name(version: str, build_id: str) -> str:
+    raw = f"{version}-{build_id or 'asset'}"
+    cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in raw)
+    return cleaned[:140]
+
+
+def download_cached(url: str, version: str, build_id: str = "", expected_sha256: str = "") -> Path:
     cache_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME / "updates"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    target = cache_dir / f"{APP_NAME}-{version}.zip"
+    target = cache_dir / f"{APP_NAME}-{_safe_cache_name(version, build_id)}.zip"
 
     if target.exists() and target.stat().st_size > 0:
         valid_hash = (not expected_sha256) or sha256_file(target).lower() == expected_sha256.lower()
@@ -60,13 +65,7 @@ def download_cached(url: str, version: str, expected_sha256: str = "") -> Path:
     tmp.unlink(missing_ok=True)
 
     log(f"Downloading update: {url}")
-    req = Request(
-        url,
-        headers={
-            "User-Agent": f"{APP_NAME}-Updater/{version}",
-            "Cache-Control": "no-cache",
-        },
-    )
+    req = Request(url, headers={"User-Agent": f"{APP_NAME}-Updater/{version}", "Cache-Control": "no-cache", "Pragma": "no-cache"})
     with urlopen(req, timeout=60) as resp, tmp.open("wb") as out:
         total = int(resp.headers.get("Content-Length") or "0")
         done = 0
@@ -77,8 +76,7 @@ def download_cached(url: str, version: str, expected_sha256: str = "") -> Path:
             out.write(chunk)
             done += len(chunk)
             if total:
-                pct = int(done * 100 / total)
-                print(f"\rDownload {pct}%", end="", flush=True)
+                print(f"\rDownload {int(done * 100 / total)}%", end="", flush=True)
     print()
 
     tmp.replace(target)
@@ -96,9 +94,9 @@ def download_cached(url: str, version: str, expected_sha256: str = "") -> Path:
     return target
 
 
-def extract_update(zip_path: Path, version: str) -> Path:
+def extract_update(zip_path: Path, version: str, build_id: str = "") -> Path:
     temp_root = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME / "update_extract"
-    extract_dir = temp_root / version
+    extract_dir = temp_root / _safe_cache_name(version, build_id)
     if extract_dir.exists():
         shutil.rmtree(extract_dir, ignore_errors=True)
     extract_dir.mkdir(parents=True, exist_ok=True)
@@ -119,13 +117,7 @@ def _process_exists(pid: int) -> bool:
     if os.name == "nt":
         try:
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            result = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                capture_output=True,
-                text=True,
-                creationflags=flags,
-                timeout=5,
-            )
+            result = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], capture_output=True, text=True, creationflags=flags, timeout=5)
             return str(pid) in (result.stdout or "")
         except Exception:
             return False
@@ -139,51 +131,37 @@ def _process_exists(pid: int) -> bool:
 def wait_for_pid_to_close(pid: int) -> None:
     if pid <= 0:
         log("No PID supplied. Waiting briefly before install.")
-        time.sleep(3)
+        time.sleep(2)
         return
-
     log(f"Waiting for app process to close. PID={pid}")
     while _process_exists(pid):
         time.sleep(1.0)
     time.sleep(2.0)
 
 
-def _copy_with_retries(src: Path, dest: Path, attempts: int = 20) -> None:
-    last_error: Exception | None = None
-    for _ in range(attempts):
-        try:
-            if dest.exists() and dest.is_file():
-                dest.unlink()
-            shutil.copy2(src, dest)
-            return
-        except Exception as exc:
-            last_error = exc
-            time.sleep(0.5)
-    raise last_error or RuntimeError(f"Could not copy {src} to {dest}")
-
-
-def copy_update(src: Path, app_dir: Path, latest_version: str) -> None:
-    log(f"Installing update into: {app_dir}")
-    app_dir.mkdir(parents=True, exist_ok=True)
-
-    # Do not replace updater while updater itself is running.
-    skip_names = {"DropzUpdater.exe"}
-
-    for item in src.iterdir():
-        if item.name in skip_names:
-            continue
-        dest = app_dir / item.name
-        if item.is_dir():
-            if dest.exists():
-                shutil.rmtree(dest, ignore_errors=True)
-            shutil.copytree(item, dest)
-        else:
-            _copy_with_retries(item, dest)
-
-    try:
-        (app_dir / "version.txt").write_text(str(latest_version), encoding="utf-8")
-    except Exception:
-        pass
+def _write_install_cmd(src: Path, app_dir: Path, main_exe: Path, version: str, build_id: str) -> Path:
+    cmd_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME / "updates"
+    cmd_dir.mkdir(parents=True, exist_ok=True)
+    cmd = cmd_dir / "finish_update.cmd"
+    state = '{{"version":"{version}","build_id":"{build_id}"}}'.format(version=version, build_id=build_id)
+    script = (
+        "@echo off\n"
+        "setlocal\n"
+        "timeout /t 2 /nobreak >nul\n"
+        f'echo Installing {APP_NAME} update...\n'
+        f'robocopy "{src}" "{app_dir}" /E /XD "__pycache__" /XF "DropzUpdater.exe" >nul\n'
+        "if %ERRORLEVEL% LEQ 7 (\n"
+        f'  echo {version}> "{app_dir}\\version.txt"\n'
+        f'  echo {state}> "{app_dir}\\last_update_state.json"\n'
+        f'  start "" "{main_exe}"\n'
+        "  exit /b 0\n"
+        ")\n"
+        "echo Update copy failed with code %ERRORLEVEL%.\n"
+        "pause\n"
+        "exit /b %ERRORLEVEL%\n"
+    )
+    cmd.write_text(script, encoding="utf-8")
+    return cmd
 
 
 def main() -> int:
@@ -192,6 +170,7 @@ def main() -> int:
     parser.add_argument("--main-exe", required=True)
     parser.add_argument("--current-version", default="0.0.0")
     parser.add_argument("--latest-version", required=True)
+    parser.add_argument("--latest-build-id", default="")
     parser.add_argument("--download-url", required=True)
     parser.add_argument("--sha256", default="")
     parser.add_argument("--wait-pid", type=int, default=0)
@@ -202,17 +181,29 @@ def main() -> int:
     main_exe = Path(args.main_exe).resolve()
 
     try:
-        log(f"Updater started. {args.current_version} -> {args.latest_version}")
-        zip_path = download_cached(args.download_url, args.latest_version, args.sha256)
-
+        log(f"Updater started. {args.current_version} -> {args.latest_version} build={args.latest_build_id}")
+        zip_path = download_cached(args.download_url, args.latest_version, args.latest_build_id, args.sha256)
         wait_for_pid_to_close(args.wait_pid)
+        src = extract_update(zip_path, args.latest_version, args.latest_build_id)
 
-        src = extract_update(zip_path, args.latest_version)
-        copy_update(src, app_dir, args.latest_version)
+        if os.name == "nt":
+            cmd = _write_install_cmd(src, app_dir, main_exe, args.latest_version, args.latest_build_id)
+            log(f"Handing install to command script: {cmd}")
+            subprocess.Popen(["cmd", "/c", str(cmd)], cwd=str(app_dir), close_fds=True)
+            return 0
 
-        log("Update installed successfully.")
+        # Non-Windows fallback.
+        for item in src.iterdir():
+            dest = app_dir / item.name
+            if item.name == "DropzUpdater.exe":
+                continue
+            if item.is_dir():
+                if dest.exists():
+                    shutil.rmtree(dest, ignore_errors=True)
+                shutil.copytree(item, dest)
+            else:
+                shutil.copy2(item, dest)
         if main_exe.exists():
-            log("Restarting app.")
             subprocess.Popen([str(main_exe)], cwd=str(app_dir), close_fds=True)
         return 0
     except Exception as exc:

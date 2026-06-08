@@ -9,11 +9,15 @@ import threading
 import time
 import traceback
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 from urllib.request import Request, urlopen
 
 APP_NAME = "DropzUniversalAgent"
-APP_VERSION = os.environ.get("DROPZ_APP_VERSION", "1.0.1")
+GITHUB_OWNER = os.environ.get("DROPZ_GITHUB_OWNER", "Zayaiken21")
+GITHUB_REPO = os.environ.get("DROPZ_GITHUB_REPO", "DropzUniversalAgent")
+UPDATE_ASSET_NAME = os.environ.get("DROPZ_UPDATE_ASSET_NAME", "DropzUniversalAgent-Windows.zip")
+
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("DROPZ_DESKTOP_PORT", "8501"))
 URL = f"http://{HOST}:{PORT}"
@@ -78,21 +82,80 @@ def _configure_runtime() -> None:
     os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
     os.environ.setdefault("STREAMLIT_GLOBAL_DEVELOPMENT_MODE", "false")
     os.environ.setdefault("DROPZ_DESKTOP_MODE", "true")
-    os.environ.setdefault("DROPZ_APP_VERSION", APP_VERSION)
 
-    user_data = Path.home() / ".dropz_universal_agent"
+    user_data = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME
     user_data.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("DROPZ_USER_DATA_DIR", str(user_data))
 
 
+def _read_json_file(path: Path) -> dict:
+    try:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _installed_info() -> dict:
+    candidates = [
+        EXE_DIR / "build_info.json",
+        BASE_DIR / "build_info.json",
+        EXE_DIR / "_internal" / "build_info.json",
+    ]
+    info: dict = {}
+    for candidate in candidates:
+        info = _read_json_file(candidate)
+        if info:
+            break
+
+    version_txt = EXE_DIR / "version.txt"
+    if version_txt.exists():
+        try:
+            info.setdefault("version", version_txt.read_text(encoding="utf-8").strip())
+        except Exception:
+            pass
+
+    info.setdefault("version", os.environ.get("DROPZ_APP_VERSION", "1.0.0"))
+    info.setdefault("build_id", "")
+    info.setdefault("build_time_utc", "")
+    return info
+
+
 def _version_tuple(value: str) -> tuple[int, ...]:
     parts = []
-    for piece in str(value or "0").replace("-", ".").split("."):
+    for piece in str(value or "0").replace("v", "").replace("-", ".").split("."):
         try:
             parts.append(int("".join(ch for ch in piece if ch.isdigit()) or "0"))
         except Exception:
             parts.append(0)
     return tuple(parts or [0])
+
+
+def _parse_time(value: str) -> float:
+    if not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _fetch_json(url: str, timeout: int = 8) -> dict:
+    req = Request(
+        url,
+        headers={
+            "User-Agent": f"{APP_NAME}-Launcher",
+            "Accept": "application/vnd.github+json, application/json",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+    )
+    with urlopen(req, timeout=timeout) as resp:
+        raw = resp.read(2 * 1024 * 1024).decode("utf-8")
+    data = json.loads(raw)
+    return data if isinstance(data, dict) else {}
 
 
 def _read_update_manifest() -> dict:
@@ -101,33 +164,70 @@ def _read_update_manifest() -> dict:
         manifest_file = EXE_DIR / "update_manifest_url.txt"
         if manifest_file.exists():
             manifest_url = manifest_file.read_text(encoding="utf-8").strip()
-    if not manifest_url:
+
+    if manifest_url:
+        try:
+            data = _fetch_json(manifest_url)
+            data["_source"] = "manifest"
+            return data
+        except Exception as exc:
+            log(f"Manifest update check failed; falling back to GitHub latest release: {exc}")
+
+    api_url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+    data = _fetch_json(api_url)
+    assets = data.get("assets") or []
+    asset = None
+    for item in assets:
+        if str(item.get("name", "")).lower() == UPDATE_ASSET_NAME.lower():
+            asset = item
+            break
+    if asset is None and assets:
+        for item in assets:
+            if str(item.get("name", "")).lower().endswith(".zip"):
+                asset = item
+                break
+    if not asset:
         return {}
 
-    req = Request(
-        manifest_url,
-        headers={
-            "User-Agent": f"{APP_NAME}/{APP_VERSION}",
-            "Cache-Control": "no-cache",
-        },
-    )
-    with urlopen(req, timeout=5) as resp:
-        raw = resp.read(1024 * 1024).decode("utf-8")
-    data = json.loads(raw)
-    data["_manifest_url"] = manifest_url
-    return data if isinstance(data, dict) else {}
+    tag = str(data.get("tag_name") or "").lstrip("v") or str(data.get("name") or "").lstrip("v")
+    latest_build_id = str(asset.get("id") or "") + "-" + str(asset.get("updated_at") or asset.get("created_at") or "")
+    return {
+        "_source": "github_latest_release",
+        "version": tag or "0.0.0",
+        "release_tag": data.get("tag_name", ""),
+        "release_id": data.get("id", ""),
+        "release_published_at": data.get("published_at") or data.get("created_at") or "",
+        "asset_id": asset.get("id", ""),
+        "asset_name": asset.get("name", UPDATE_ASSET_NAME),
+        "asset_size": asset.get("size", 0),
+        "asset_updated_at": asset.get("updated_at") or asset.get("created_at") or "",
+        "build_id": latest_build_id,
+        "download_url": asset.get("browser_download_url", ""),
+        "sha256": "",
+        "notes": data.get("body", "") or "",
+    }
+
+
+def _update_needed(installed: dict, remote: dict) -> tuple[bool, str]:
+    current_version = str(installed.get("version") or "0.0.0")
+    latest_version = str(remote.get("version") or "0.0.0")
+    if _version_tuple(latest_version) > _version_tuple(current_version):
+        return True, f"new version {current_version} -> {latest_version}"
+
+    current_build_id = str(installed.get("build_id") or "")
+    latest_build_id = str(remote.get("build_id") or "")
+    if latest_build_id and current_build_id and latest_build_id != current_build_id:
+        return True, f"same version but different GitHub asset ({current_build_id} -> {latest_build_id})"
+
+    build_time = _parse_time(str(installed.get("build_time_utc") or ""))
+    asset_time = _parse_time(str(remote.get("asset_updated_at") or remote.get("release_published_at") or ""))
+    if asset_time and build_time and asset_time > build_time + 60:
+        return True, "same version but GitHub asset is newer than installed build"
+
+    return False, "current build is up to date"
 
 
 def _start_update_check_in_background() -> None:
-    """
-    Subtle update mode.
-
-    The desktop app always opens first. If an update is available, DropzUpdater is
-    started in the background. It downloads/caches the update, waits until this app
-    process closes, then installs the update and relaunches the app.
-
-    This prevents the old "update first, app never opens" behavior.
-    """
     global _update_started
     if _update_started:
         return
@@ -139,19 +239,21 @@ def _start_update_check_in_background() -> None:
                 log("Updates disabled by DROPZ_DISABLE_UPDATES.")
                 return
 
-            data = _read_update_manifest()
-            if not data:
-                log("No update manifest configured.")
+            installed = _installed_info()
+            remote = _read_update_manifest()
+            if not remote:
+                log("No update release/asset found.")
                 return
 
-            latest = str(data.get("version", "") or "").strip()
-            download_url = str(data.get("download_url", "") or "").strip()
+            download_url = str(remote.get("download_url") or "").strip()
+            latest = str(remote.get("version", "") or "").strip()
             if not latest or not download_url:
-                log("Update manifest missing version or download_url.")
+                log("Update source missing version or download_url.")
                 return
 
-            if _version_tuple(latest) <= _version_tuple(APP_VERSION):
-                log(f"No update needed. Current={APP_VERSION}, Latest={latest}.")
+            needed, reason = _update_needed(installed, remote)
+            if not needed:
+                log(f"No update needed. Current={installed.get('version')} Latest={latest}. Reason={reason}.")
                 return
 
             updater = EXE_DIR / "DropzUpdater.exe"
@@ -159,15 +261,17 @@ def _start_update_check_in_background() -> None:
                 log("Update available, but DropzUpdater.exe is missing.")
                 return
 
-            log(f"Update available: {APP_VERSION} -> {latest}. Starting updater in background.")
+            latest_build_id = str(remote.get("build_id") or remote.get("asset_id") or latest)
+            log(f"Update available ({reason}). Starting updater in background.")
             args = [
                 str(updater),
                 "--app-dir", str(EXE_DIR),
                 "--main-exe", str(EXE_DIR / f"{APP_NAME}.exe"),
-                "--current-version", APP_VERSION,
+                "--current-version", str(installed.get("version") or "0.0.0"),
                 "--latest-version", latest,
+                "--latest-build-id", latest_build_id,
                 "--download-url", download_url,
-                "--sha256", str(data.get("sha256", "") or ""),
+                "--sha256", str(remote.get("sha256", "") or ""),
                 "--wait-pid", str(os.getpid()),
                 "--background",
             ]
@@ -181,7 +285,6 @@ def _start_update_check_in_background() -> None:
 def _run_streamlit_in_process(app_file: Path) -> None:
     _configure_runtime()
     import streamlit.web.cli as stcli
-
     sys.argv = [
         "streamlit",
         "run",
@@ -212,7 +315,6 @@ def _wait_and_open_browser() -> None:
         if _port_open():
             time.sleep(0.8)
             _open_browser_once()
-            # Start update check only after the local app is actually reachable.
             _start_update_check_in_background()
             return
         time.sleep(0.35)
@@ -226,10 +328,7 @@ def main() -> int:
     try:
         app_file = _find_app_file()
         log(f"Using app file: {app_file}")
-
-        browser_thread = threading.Thread(target=_wait_and_open_browser, daemon=True)
-        browser_thread.start()
-
+        threading.Thread(target=_wait_and_open_browser, daemon=True).start()
         _run_streamlit_in_process(app_file)
         return 0
     except Exception as exc:

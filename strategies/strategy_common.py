@@ -1,16 +1,48 @@
 """
-strategy_common.py
-==================
-XAU/USD SMC Scalp Strategy — Enhanced Edition
-----------------------------------------------
-Core Flow:
-  1. Every 15 minutes — scan the closed 15M candle for wick zones (buy/sell zones).
-  2. When price returns to a 15M wick zone — drop to 5M for confirmation candle.
-  3. When 5M confirms — drop to 1M for entry candle + liquidity-grab fingerprint.
-  4. Breakout detection tracks consecutive closes outside zone to read market direction strength.
-  5. Liquidity-grab logic identifies stop-hunt wicks above highs / below lows before reversal.
+strategy_common.py  —  TradeSmart SMC Scalp Engine  v4.0
+=========================================================
+WHAT CHANGED IN v4
+------------------
+  1. CANDLE COLOR RULE
+       BUY  entry: trigger 1M candle must be BEARISH (red) — price dipped to
+            the range low, bearish close confirms the test, we buy the bounce.
+       SELL entry: trigger 1M candle must be BULLISH (green) — price pushed to
+            the range high, bullish close confirms the test, we sell the rejection.
+       This prevents buying at the top of a move or selling at the bottom.
 
-Trade placement structure is preserved from the original (make_signal / build_decision / maybe_close).
+  2. ENTRY CANDLE FIX
+       Entry price = CLOSE of the last FULLY CLOSED 1M candle (index [-2] of
+       the raw list which includes the forming candle, or [-1] of _closed()).
+       Previously the code sometimes used the forming candle's close.
+
+  3. CANDLE-TIME DEDUP FIX
+       The agent now only stamps last_entry_candle_time on a SUCCESSFUL order,
+       not on the attempt.  Strategy does its part by returning a unique
+       entry_candle_time in the signal so the agent can compare correctly.
+
+  4. SWING LEVELS — NEAREST ONLY
+       key_levels() now returns only the 2 nearest highs and 2 nearest lows
+       relative to current price, using resistance-wick highs for sells and
+       support-wick lows for buys.
+
+  5. CHART CLEANUP
+       - Historical range boxes removed (too cluttered).  Only the ACTIVE 15M
+         range box is drawn.
+       - Swing level rays are short (start 1 bar back, no future text drift).
+       - All text labels anchored at now - 30s so they appear LEFT of the
+         current bar and never run off-screen right.
+       - Breakout and decision labels placed at range_mid ± offset so they
+         never overlap.
+
+  6. SL/TP ANCHORED TO RANGE
+       BUY  : SL below range_low by buffer, TP = range_high (full range target).
+       SELL : SL above range_high by buffer, TP = range_low.
+       Breakout: SL = range extreme opposite side, TP = entry + 2× range.
+       This makes SL/TP visually obvious on the range that is drawn.
+
+  7. 1M TRIGGER REQUIRES CLOSED CANDLE
+       confirm_1m() checks candles[-2] (last closed), never candles[-1]
+       (forming).  This prevents firing on an incomplete candle.
 """
 
 from __future__ import annotations
@@ -21,821 +53,824 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# ──────────────────────────────────────────────
-#  Constants
-# ──────────────────────────────────────────────
-BUY  = "BUY"
-SELL = "SELL"
+# ══════════════════════════════════════════════
+#  CONSTANTS
+# ══════════════════════════════════════════════
+BUY   = "BUY"
+SELL  = "SELL"
 CLOSE = "CLOSE"
 HOLD  = "HOLD"
+SCAN  = "SCAN"
 
-SYMBOL_DEFAULT = "XAUUSD"
-DRAW_ENV   = "TRADESMART_MT5_BRIDGE_FILE"
-DRAW_JSON1 = "TradeSmart_AI_DrawCommands.json1"
-DRAW_JSONL = "TradeSmart_AI_DrawCommands.jsonl"
-DEBUG_FILE = "TradeSmart_AI_Debug_LastSignal.json"
+SYMBOL_DEFAULT  = "XAUUSD"
+DRAW_ENV        = "TRADESMART_MT5_BRIDGE_FILE"
+DRAW_JSON1      = "TradeSmart_AI_DrawCommands.json1"
+DRAW_JSONL      = "TradeSmart_AI_DrawCommands.jsonl"
+DEBUG_FILE      = "TradeSmart_AI_Debug_LastSignal.json"
 
-# Minimum wick-body ratio for a candle to qualify as a wick zone.
-WICK_BODY_RATIO_MIN = 0.40          # wick must be ≥ 40% of the full candle range
-# How many pips of wick before we tag it as a liquidity-grab candidate.
-LIQ_GRAB_WICK_PIPS  = 0.30          # 30 pips (price units) — tune for XAU
-# Breakout strength: consecutive closed candles beyond zone to declare directional break.
-BREAKOUT_CANDLE_THRESH = 2
-# Default zone tolerance multiplier (fraction of 15M range).
-ZONE_TOL_RATIO = 0.08
+# Zone touch tolerance
+ZONE_TOL_RATIO  = 0.10   # 10% of range size
+MIN_ZONE_TOL    = 0.30   # min 0.30 pts
+MIN_RANGE_SIZE  = 0.50   # ignore ranges smaller than this
+
+# SL buffer above/below range extreme (price units)
+SL_BUFFER       = 1.50   # SL sits 1.50 pts beyond the range extreme
+MIN_SL_POINTS   = 2.00   # hard floor
+
+# Volume filter
+VOL_LOOKBACK    = 20
+VOL_MIN_RATIO   = 0.70   # 70% of avg volume (relaxed slightly for more trades)
+
+# Breakout: consecutive 5M closes outside range
+BREAKOUT_THRESH = 2
+# Breakout TP = range_size × multiplier
+BREAKOUT_TP_MULT = 2.0
+
+# Liquidity grab: wick beyond extreme by at least this much
+LIQ_GRAB_MIN    = 0.40
 
 
-# ──────────────────────────────────────────────
-#  Utilities
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+#  UTILITY
+# ══════════════════════════════════════════════
 
-def f(value: Any, default: float = 0.0) -> float:
+def fv(value: Any, default: float = 0.0) -> float:
     try:
         return default if value is None else float(value)
     except Exception:
         return default
 
 
-def symbol_from_context(context: Dict[str, Any]) -> str:
-    return str(
-        context.get("symbol")
-        or (context.get("profile") or {}).get("symbol")
-        or SYMBOL_DEFAULT
-    )
+def symbol_from_context(ctx: Dict[str, Any]) -> str:
+    return str(ctx.get("symbol") or (ctx.get("profile") or {}).get("symbol") or SYMBOL_DEFAULT)
 
 
-def normalize_candle(candle: Any) -> Dict[str, Any]:
-    if candle is None:
+def normalize_candle(c: Any) -> Dict[str, Any]:
+    if c is None:
         return {}
-    if isinstance(candle, dict):
-        return candle
+    if isinstance(c, dict):
+        return c
     out: Dict[str, Any] = {}
-    for key in ("time", "open", "high", "low", "close", "tick_volume", "spread", "real_volume", "volume"):
+    for k in ("time", "open", "high", "low", "close", "tick_volume", "spread", "real_volume"):
         try:
-            out[key] = candle[key]
+            out[k] = c[k]
         except Exception:
             try:
-                out[key] = getattr(candle, key)
+                out[k] = getattr(c, k)
             except Exception:
                 pass
     return out
 
 
-def candle_direction(candle: Dict[str, Any]) -> str:
-    c = f(candle.get("close"))
-    o = f(candle.get("open"))
-    if c > o:
-        return BUY
-    if c < o:
-        return SELL
-    return HOLD
-
-
-def candle_body(candle: Dict[str, Any]) -> float:
-    return abs(f(candle.get("close")) - f(candle.get("open")))
-
-
-def candle_range(candle: Dict[str, Any]) -> float:
-    return f(candle.get("high")) - f(candle.get("low"))
-
-
-def upper_wick(candle: Dict[str, Any]) -> float:
-    return f(candle.get("high")) - max(f(candle.get("open")), f(candle.get("close")))
-
-
-def lower_wick(candle: Dict[str, Any]) -> float:
-    return min(f(candle.get("open")), f(candle.get("close"))) - f(candle.get("low"))
-
-
 def floor_15m(ts: int) -> int:
-    """Floor a unix timestamp to the most recent 15-minute boundary."""
     return int(ts) - (int(ts) % 900)
 
 
-def hour_start(ts: int) -> int:
-    return int(ts) - (int(ts) % 3600)
+def avg_volume(candles: List[Dict[str, Any]], n: int = VOL_LOOKBACK) -> float:
+    sample = [fv(c.get("tick_volume")) for c in candles[-n:] if fv(c.get("tick_volume")) > 0]
+    return sum(sample) / len(sample) if sample else 1.0
 
 
-# ──────────────────────────────────────────────
-#  MT5 Data Fetch
-# ──────────────────────────────────────────────
+def is_bearish(c: Dict[str, Any]) -> bool:
+    return fv(c.get("close")) < fv(c.get("open"))
 
-def mt5_rates(symbol: str, include_forming: bool = True) -> Dict[str, List[Dict[str, Any]]]:
+
+def is_bullish(c: Dict[str, Any]) -> bool:
+    return fv(c.get("close")) > fv(c.get("open"))
+
+
+# ══════════════════════════════════════════════
+#  TIMEFRAME RESOLVER
+# ══════════════════════════════════════════════
+
+def _fetch_mt5_tf(symbol: str) -> Dict[str, List[Dict[str, Any]]]:
     out: Dict[str, List[Dict[str, Any]]] = {}
     try:
         import MetaTrader5 as mt5
-    except Exception:
-        return out
-
-    try:
         mt5.initialize()
     except Exception:
-        pass
-
-    mapping = {
-        "M1":  getattr(mt5, "TIMEFRAME_M1",  None),
-        "M5":  getattr(mt5, "TIMEFRAME_M5",  None),
-        "M15": getattr(mt5, "TIMEFRAME_M15", None),
-        "H1":  getattr(mt5, "TIMEFRAME_H1",  None),
+        return out
+    tf_map = {
+        "M1":  (getattr(mt5, "TIMEFRAME_M1",  None), 300),
+        "M5":  (getattr(mt5, "TIMEFRAME_M5",  None), 200),
+        "M15": (getattr(mt5, "TIMEFRAME_M15", None), 100),
+        "H1":  (getattr(mt5, "TIMEFRAME_H1",  None),  60),
     }
-    bars = {"M1": 300, "M5": 200, "M15": 100, "H1": 100}
-
-    for tf, tf_const in mapping.items():
-        if tf_const is None:
+    for tf, (const, count) in tf_map.items():
+        if const is None:
             continue
         try:
-            raw = mt5.copy_rates_from_pos(symbol, tf_const, 0, bars[tf])
+            raw = mt5.copy_rates_from_pos(symbol, const, 0, count)
         except Exception:
-            raw = None
+            continue
         if raw is None:
             continue
-
-        rows: List[Dict[str, Any]] = []
-        for r in raw:
-            rows.append({
-                "time":        int(r["time"]),
-                "open":        float(r["open"]),
-                "high":        float(r["high"]),
-                "low":         float(r["low"]),
-                "close":       float(r["close"]),
-                "tick_volume": int(r["tick_volume"]),
-                "spread":      int(r["spread"]),
-                "real_volume": int(r["real_volume"]),
-            })
-
-        if not include_forming and len(rows) > 2:
-            rows = rows[:-1]
-        out[tf] = rows
-
+        rows = [{"time": int(r["time"]), "open": float(r["open"]), "high": float(r["high"]),
+                 "low": float(r["low"]), "close": float(r["close"]),
+                 "tick_volume": int(r["tick_volume"]), "spread": int(r["spread"]),
+                 "real_volume": int(r.get("real_volume", 0))} for r in raw]
+        if rows:
+            out[tf] = sorted(rows, key=lambda x: x["time"])
     return out
 
 
-def get_timeframes(context: Dict[str, Any], include_forming: bool = True) -> Dict[str, List[Dict[str, Any]]]:
+def get_timeframes(ctx: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
     out: Dict[str, List[Dict[str, Any]]] = {}
 
-    raw = context.get("timeframes") or context.get("timeframe_rates") or {}
-    if isinstance(raw, dict):
-        for k, v in raw.items():
+    tfd = ctx.get("timeframes") or {}
+    if isinstance(tfd, dict):
+        for k, v in tfd.items():
             tf = str(k).upper()
-            if tf in ("M1", "M5", "M15", "H1"):
-                rows = [normalize_candle(c) for c in list(v or [])]
-                rows = [r for r in rows if r]
-                rows.sort(key=lambda x: int(x.get("time", 0) or 0))
-                out[tf] = rows if include_forming else (rows[:-1] if len(rows) > 2 else rows)
+            if tf in ("M1", "M5", "M15", "H1") and v:
+                rows = sorted([normalize_candle(c) for c in v if normalize_candle(c)],
+                              key=lambda x: int(x.get("time", 0) or 0))
+                out[tf] = rows
 
     aliases = {
-        "M1":  ("rates", "closed_rates", "candles", "m1_rates", "rates_m1", "bars"),
-        "M5":  ("m5_rates",  "rates_m5"),
-        "M15": ("m15_rates", "rates_m15"),
-        "H1":  ("h1_rates",  "rates_h1"),
+        "M1":  ["rates_m1", "m1_rates", "rates", "closed_rates", "candles", "bars"],
+        "M5":  ["rates_m5", "m5_rates"],
+        "M15": ["rates_m15", "m15_rates"],
+        "H1":  ["rates_h1",  "h1_rates"],
     }
-
     for tf, keys in aliases.items():
         if tf in out:
             continue
         for key in keys:
-            if context.get(key):
-                rows = [normalize_candle(c) for c in list(context.get(key) or [])]
-                rows = [r for r in rows if r]
-                rows.sort(key=lambda x: int(x.get("time", 0) or 0))
-                out[tf] = rows if include_forming else (rows[:-1] if len(rows) > 2 else rows)
-                break
+            val = ctx.get(key)
+            if val:
+                rows = sorted([normalize_candle(c) for c in val if normalize_candle(c)],
+                              key=lambda x: int(x.get("time", 0) or 0))
+                if rows:
+                    out[tf] = rows
+                    break
 
-    direct = mt5_rates(symbol_from_context(context), include_forming=include_forming)
-    for tf, rows in direct.items():
-        if rows:
-            out[tf] = rows
-
+    if not out:
+        out.update(_fetch_mt5_tf(symbol_from_context(ctx)))
     return out
 
 
-# ──────────────────────────────────────────────
-#  15M Wick Zone Scanner
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+#  15M RANGE BUILDER
+#  Range = HIGH and LOW of the closed 15M candle wicks.
+#  While the bar is still forming, use M1 wicks in the first 5 minutes.
+# ══════════════════════════════════════════════
 
-def classify_15m_wick_zone(candle: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Inspect a closed 15M candle and return a wick zone if significant wicks exist.
+def build_15m_range(m1: List[Dict[str, Any]], m15: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not m1:
+        return {"valid": False, "reason": "No M1 data."}
 
-    A zone is created when the wick is ≥ WICK_BODY_RATIO_MIN × full range.
-    Zones come in two flavours:
-      - "sell_zone"  — upper wick dominant  (price rejected from highs, sellers lurk)
-      - "buy_zone"   — lower wick dominant  (price rejected from lows, buyers lurk)
-    If both wicks qualify, the dominant one takes priority.
+    # Identify current 15M bar start
+    ref_ts    = int(m1[-1].get("time", 0) or time.time())
+    bar_start = floor_15m(ref_ts)
 
-    Returns a zone dict or None.
-    """
-    rng = candle_range(candle)
-    if rng <= 0:
-        return None
+    # Check if the current 15M bar has already CLOSED (appears in M15 closed list)
+    # M15 list from MT5 includes the forming candle as the last element.
+    # Closed bars = all except the last.
+    m15_closed = m15[:-1] if len(m15) > 1 else []
+    locked_bars = [c for c in m15_closed if int(c.get("time", 0) or 0) == bar_start]
 
-    uw = upper_wick(candle)
-    lw = lower_wick(candle)
-    body = candle_body(candle)
-
-    uw_ratio = uw / rng
-    lw_ratio = lw / rng
-
-    upper_qualifies = uw_ratio >= WICK_BODY_RATIO_MIN
-    lower_qualifies = lw_ratio >= WICK_BODY_RATIO_MIN
-
-    if not (upper_qualifies or lower_qualifies):
-        return None
-
-    # Dominant wick wins; in a tie, both zones are returned separately via the caller.
-    if upper_qualifies and (not lower_qualifies or uw >= lw):
-        zone_type  = "sell_zone"
-        zone_high  = f(candle.get("high"))
-        zone_low   = max(f(candle.get("open")), f(candle.get("close")))
-        wick_size  = uw
+    if locked_bars:
+        # Use the closed 15M candle's wick extremes directly
+        bar   = locked_bars[-1]
+        high  = fv(bar.get("high"))
+        low   = fv(bar.get("low"))
+        open_ = fv(bar.get("open"))
+        close = fv(bar.get("close"))
+        source = "locked_15m_candle"
+        is_locked = True
     else:
-        zone_type  = "buy_zone"
-        zone_high  = min(f(candle.get("open")), f(candle.get("close")))
-        zone_low   = f(candle.get("low"))
-        wick_size  = lw
+        # Bar is still forming — build from M1 wicks in the first 5 minutes
+        first5_end = bar_start + 300
+        window = [c for c in m1 if bar_start <= int(c.get("time", 0) or 0) < first5_end]
+        if not window:
+            return {"valid": False,
+                    "reason": f"Waiting for first M1 candle of 15M bar at {bar_start}.",
+                    "active_15m_start": bar_start}
+        high  = max(fv(c.get("high")) for c in window)
+        low   = min(fv(c.get("low"))  for c in window)
+        open_ = fv(window[0].get("open"))
+        close = fv(window[-1].get("close"))
+        source = "live_first5m"
+        is_locked = False
 
-    is_liq_grab = wick_size >= LIQ_GRAB_WICK_PIPS
+    rng = high - low
+    if rng < MIN_RANGE_SIZE:
+        return {"valid": False, "reason": f"Range too small ({rng:.2f} pts).",
+                "active_15m_start": bar_start}
 
+    direction = BUY if close > open_ else SELL if close < open_ else HOLD
     return {
-        "type":          zone_type,
-        "zone_high":     zone_high,
-        "zone_low":      zone_low,
-        "zone_mid":      (zone_high + zone_low) / 2.0,
-        "wick_size":     wick_size,
-        "wick_ratio":    uw_ratio if zone_type == "sell_zone" else lw_ratio,
-        "body_size":     body,
-        "candle_range":  rng,
-        "is_liq_grab":   is_liq_grab,
-        "candle_time":   int(candle.get("time", 0) or 0),
-        "candle_open":   f(candle.get("open")),
-        "candle_high":   f(candle.get("high")),
-        "candle_low":    f(candle.get("low")),
-        "candle_close":  f(candle.get("close")),
+        "valid":            True,
+        "locked":           is_locked,
+        "source":           source,
+        "active_15m_start": bar_start,
+        "range_start":      bar_start,
+        "range_end":        bar_start + 900,
+        "range_high":       high,
+        "range_low":        low,
+        "range_mid":        (high + low) / 2.0,
+        "range_size":       rng,
+        "range_open":       open_,
+        "range_close":      close,
+        "range_direction":  direction,
+        "reason":           "Range locked." if is_locked else "Range building (first 5M).",
     }
 
 
-def scan_15m_wick_zones(m15_candles: List[Dict[str, Any]], lookback: int = 8) -> List[Dict[str, Any]]:
+# ══════════════════════════════════════════════
+#  NEAREST SWING LEVELS
+#  Only the 2 nearest swing highs (resistance wick tips) and
+#  2 nearest swing lows (support wick tips) relative to current price.
+# ══════════════════════════════════════════════
+
+def nearest_swing_levels(m15: List[Dict[str, Any]],
+                          current_price: float,
+                          lookback: int = 10) -> Dict[str, List[float]]:
     """
-    Walk the last `lookback` closed 15M candles and collect all wick zones.
-    Returns newest-first list of zone dicts.
+    Returns {"resistance": [r1, r2], "support": [s1, s2]}
+    where resistance = swing-high wick tips ABOVE current price (nearest first)
+    and   support    = swing-low  wick tips BELOW current price (nearest first).
     """
-    zones: List[Dict[str, Any]] = []
-    closed = m15_candles[:-1] if len(m15_candles) > 1 else m15_candles  # exclude forming
-    for candle in reversed(closed[-lookback:]):
-        zone = classify_15m_wick_zone(candle)
-        if zone:
-            zones.append(zone)
-    return zones
+    closed = (m15[:-1] if len(m15) > 1 else m15)[-lookback:]
+    swing_highs: List[float] = []
+    swing_lows:  List[float] = []
+
+    for i in range(1, len(closed) - 1):
+        prev_h = fv(closed[i-1].get("high"))
+        curr_h = fv(closed[i].get("high"))
+        next_h = fv(closed[i+1].get("high"))
+        prev_l = fv(closed[i-1].get("low"))
+        curr_l = fv(closed[i].get("low"))
+        next_l = fv(closed[i+1].get("low"))
+
+        if curr_h > prev_h and curr_h > next_h:
+            swing_highs.append(curr_h)
+        if curr_l < prev_l and curr_l < next_l:
+            swing_lows.append(curr_l)
+
+    # Keep only levels above/below current price, sorted nearest first
+    resistance = sorted([h for h in swing_highs if h > current_price])[:2]
+    support    = sorted([l for l in swing_lows  if l < current_price], reverse=True)[:2]
+
+    return {"resistance": resistance, "support": support}
 
 
-def price_in_zone(price: float, zone: Dict[str, Any], tol: float = 0.0) -> bool:
-    return (zone["zone_low"] - tol) <= price <= (zone["zone_high"] + tol)
+# ══════════════════════════════════════════════
+#  LIQUIDITY GRAB
+# ══════════════════════════════════════════════
 
-
-def current_zone(
-    m15_candles: List[Dict[str, Any]],
-    current_price: float,
-    tol_ratio: float = ZONE_TOL_RATIO,
-    lookback: int = 8,
-) -> Optional[Dict[str, Any]]:
-    """Return the most recent 15M wick zone that price is currently touching."""
-    zones = scan_15m_wick_zones(m15_candles, lookback=lookback)
-    for zone in zones:
-        tol = max(zone["candle_range"] * tol_ratio, 0.20)
-        if price_in_zone(current_price, zone, tol=tol):
-            return {**zone, "tolerance": tol}
-    return None
-
-
-# ──────────────────────────────────────────────
-#  Liquidity Grab Detection
-# ──────────────────────────────────────────────
-
-def detect_liquidity_grab(
-    candles: List[Dict[str, Any]],
-    zone: Dict[str, Any],
-    direction: str,
-) -> Dict[str, Any]:
+def detect_liq_grab(candles: List[Dict[str, Any]], extreme: float, direction: str) -> bool:
     """
-    A liquidity grab (stop hunt) is when the wick of a candle breaches the zone extreme
-    but the CLOSE returns inside the zone — trapping breakout traders.
-
-    direction: "BUY"  → look for a wick below zone_low that closes back above it.
-               "SELL" → look for a wick above zone_high that closes back below it.
-
-    Returns a dict with:
-      - confirmed (bool)
-      - grab_candle_time
-      - grab_extreme (the wick tip that grabbed stops)
-      - grab_candle_index (-1 = last closed, -2 = two ago, …)
+    BUY  side: recent M1 wick went BELOW extreme then closed ABOVE it.
+    SELL side: recent M1 wick went ABOVE extreme then closed BELOW it.
     """
-    result = {"confirmed": False, "grab_candle_time": None, "grab_extreme": None, "grab_candle_index": None}
-
-    if not candles or not zone:
-        return result
-
-    # Inspect last 3 closed candles for the grab signature.
-    for i, idx in enumerate([-1, -2, -3]):
-        try:
-            c = candles[idx]
-        except IndexError:
-            break
-
+    for c in reversed(candles[-4:]):
         if direction == BUY:
-            # Wick poked below zone_low, close recovered above zone_low.
-            if f(c.get("low")) < zone["zone_low"] and f(c.get("close")) > zone["zone_low"]:
-                result = {
-                    "confirmed":          True,
-                    "grab_candle_time":   int(c.get("time", 0) or 0),
-                    "grab_extreme":       f(c.get("low")),
-                    "grab_candle_index":  idx,
-                    "grab_direction":     BUY,
-                }
-                break
-        else:  # SELL
-            # Wick poked above zone_high, close came back below zone_high.
-            if f(c.get("high")) > zone["zone_high"] and f(c.get("close")) < zone["zone_high"]:
-                result = {
-                    "confirmed":          True,
-                    "grab_candle_time":   int(c.get("time", 0) or 0),
-                    "grab_extreme":       f(c.get("high")),
-                    "grab_candle_index":  idx,
-                    "grab_direction":     SELL,
-                }
-                break
-
-    return result
-
-
-# ──────────────────────────────────────────────
-#  Breakout Strength
-# ──────────────────────────────────────────────
-
-def breakout_strength(
-    candles: List[Dict[str, Any]],
-    zone: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    Count consecutive candle closes ABOVE zone_high (bullish breakout)
-    or BELOW zone_low (bearish breakout).
-
-    Returns:
-      - direction    : BUY / SELL / HOLD
-      - candle_count : consecutive candles confirming break
-      - confirmed    : True if count >= BREAKOUT_CANDLE_THRESH
-      - momentum     : "strong" / "forming" / "none"
-    """
-    if not candles or not zone:
-        return {"direction": HOLD, "candle_count": 0, "confirmed": False, "momentum": "none"}
-
-    bull_count = 0
-    bear_count = 0
-
-    for c in reversed(candles[-6:]):
-        close = f(c.get("close"))
-        if close > zone["zone_high"]:
-            bull_count += 1
-            bear_count  = 0
-        elif close < zone["zone_low"]:
-            bear_count += 1
-            bull_count  = 0
+            if fv(c.get("low")) < extreme - LIQ_GRAB_MIN and fv(c.get("close")) > extreme:
+                return True
         else:
-            break  # inside zone — streak ends
-
-    if bull_count > 0:
-        confirmed = bull_count >= BREAKOUT_CANDLE_THRESH
-        return {
-            "direction":    BUY,
-            "candle_count": bull_count,
-            "confirmed":    confirmed,
-            "momentum":     "strong" if bull_count >= BREAKOUT_CANDLE_THRESH + 1 else ("forming" if confirmed else "building"),
-        }
-    if bear_count > 0:
-        confirmed = bear_count >= BREAKOUT_CANDLE_THRESH
-        return {
-            "direction":    SELL,
-            "candle_count": bear_count,
-            "confirmed":    confirmed,
-            "momentum":     "strong" if bear_count >= BREAKOUT_CANDLE_THRESH + 1 else ("forming" if confirmed else "building"),
-        }
-
-    return {"direction": HOLD, "candle_count": 0, "confirmed": False, "momentum": "none"}
+            if fv(c.get("high")) > extreme + LIQ_GRAB_MIN and fv(c.get("close")) < extreme:
+                return True
+    return False
 
 
-# ──────────────────────────────────────────────
-#  5M Confirmation
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+#  BREAKOUT CHECK
+# ══════════════════════════════════════════════
 
-def confirm_5m(
-    m5_candles: List[Dict[str, Any]],
-    zone: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    On the 5M timeframe, look for a confirmation candle that:
-      - For a buy_zone : closes ABOVE zone_low with a bullish candle and lower-wick rejection.
-      - For a sell_zone: closes BELOW zone_high with a bearish candle and upper-wick rejection.
-
-    Returns:
-      - confirmed (bool)
-      - signal    : BUY / SELL / HOLD
-      - reason    : human-readable explanation
-      - candle    : the confirming 5M candle dict
-    """
-    base = {"confirmed": False, "signal": HOLD, "reason": "No 5M confirmation.", "candle": None}
-    if not m5_candles or not zone:
-        return base
-
-    # Use last 3 closed 5M candles to find the confirmation.
-    closed = m5_candles[:-1] if len(m5_candles) > 1 else m5_candles
-    for c in reversed(closed[-3:]):
-        close_  = f(c.get("close"))
-        open_   = f(c.get("open"))
-        high_   = f(c.get("high"))
-        low_    = f(c.get("low"))
-        rng     = high_ - low_
-        uw      = upper_wick(c)
-        lw      = lower_wick(c)
-
-        if zone["type"] == "buy_zone":
-            bullish = close_ > open_
-            # Body closed above zone_low, lower wick shows rejection.
-            if bullish and close_ >= zone["zone_low"] and lw >= rng * 0.25:
-                return {
-                    "confirmed": True,
-                    "signal":    BUY,
-                    "reason":    f"5M bullish rejection candle above buy zone low @ {zone['zone_low']:.2f}.",
-                    "candle":    c,
-                }
-
-        elif zone["type"] == "sell_zone":
-            bearish = close_ < open_
-            # Body closed below zone_high, upper wick shows rejection.
-            if bearish and close_ <= zone["zone_high"] and uw >= rng * 0.25:
-                return {
-                    "confirmed": True,
-                    "signal":    SELL,
-                    "reason":    f"5M bearish rejection candle below sell zone high @ {zone['zone_high']:.2f}.",
-                    "candle":    c,
-                }
-
-    return base
+def breakout_check(m5: List[Dict[str, Any]],
+                   range_high: float, range_low: float) -> Dict[str, Any]:
+    closed = m5[:-1] if len(m5) > 1 else m5
+    bull = bear = 0
+    for c in reversed(closed[-6:]):
+        cl = fv(c.get("close"))
+        if cl > range_high:
+            bull += 1; bear = 0
+        elif cl < range_low:
+            bear += 1; bull = 0
+        else:
+            break
+    if bull >= BREAKOUT_THRESH:
+        return {"direction": BUY,  "count": bull, "confirmed": True}
+    if bear >= BREAKOUT_THRESH:
+        return {"direction": SELL, "count": bear, "confirmed": True}
+    return {"direction": HOLD, "count": 0, "confirmed": False}
 
 
-# ──────────────────────────────────────────────
-#  1M Entry Confirmation
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+#  5M CONFIRMATION
+#  BUY zone : last closed 5M is BEARISH but closes ABOVE range_low
+#             (tested the low, rejected, body closing back inside range)
+#  SELL zone: last closed 5M is BULLISH but closes BELOW range_high
+#             (tested the high, rejected, body closing back inside range)
+# ══════════════════════════════════════════════
 
-def confirm_1m(
-    m1_candles: List[Dict[str, Any]],
-    zone: Dict[str, Any],
-    signal_direction: str,
-) -> Dict[str, Any]:
-    """
-    On the 1M timeframe, look for the entry trigger candle:
-      - BUY : last closed 1M is bullish and closes above zone_low.
-      - SELL: last closed 1M is bearish and closes below zone_high.
-    Also checks for a 1M-level liquidity grab as extra confluence.
-    """
-    base = {"confirmed": False, "signal": HOLD, "reason": "No 1M confirmation.", "candle": None, "liq_grab": False}
-    if not m1_candles or not zone:
-        return base
-
-    closed = m1_candles[:-1] if len(m1_candles) > 1 else m1_candles
+def confirm_5m(m5: List[Dict[str, Any]], direction: str, zone_extreme: float) -> bool:
+    closed = m5[:-1] if len(m5) > 1 else m5
     if not closed:
-        return base
-
-    last = closed[-1]
-    close_ = f(last.get("close"))
-    open_  = f(last.get("open"))
-
-    liq = detect_liquidity_grab(closed, zone, signal_direction)
-
-    if signal_direction == BUY:
-        if close_ > open_ and close_ >= zone["zone_low"]:
-            return {
-                "confirmed": True,
-                "signal":    BUY,
-                "reason":    f"1M bullish close above buy zone low @ {zone['zone_low']:.2f}. Liq grab={'YES' if liq['confirmed'] else 'NO'}.",
-                "candle":    last,
-                "liq_grab":  liq["confirmed"],
-                "liq_data":  liq,
-            }
-
-    elif signal_direction == SELL:
-        if close_ < open_ and close_ <= zone["zone_high"]:
-            return {
-                "confirmed": True,
-                "signal":    SELL,
-                "reason":    f"1M bearish close below sell zone high @ {zone['zone_high']:.2f}. Liq grab={'YES' if liq['confirmed'] else 'NO'}.",
-                "candle":    last,
-                "liq_grab":  liq["confirmed"],
-                "liq_data":  liq,
-            }
-
-    return {**base, "liq_grab": liq["confirmed"], "liq_data": liq}
-
-
-# ──────────────────────────────────────────────
-#  Main Signal Builder
-# ──────────────────────────────────────────────
-
-def scalp_signal(context: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Full top-down signal builder:
-      15M wick zones → 5M confirmation → 1M entry → liquidity grab + breakout strength.
-
-    Returns a signal dict compatible with make_signal / build_decision.
-    """
-    tfs = get_timeframes(context, include_forming=False)
-
-    m15 = tfs.get("M15", [])
-    m5  = tfs.get("M5",  [])
-    m1  = tfs.get("M1",  [])
-
-    # ── Minimum data guard ──────────────────────
-    if len(m15) < 3:
-        return _hold(context, tfs, "Waiting for M15 candle history.")
-    if len(m5) < 3:
-        return _hold(context, tfs, "Waiting for M5 candle history.")
-    if len(m1) < 3:
-        return _hold(context, tfs, "Waiting for M1 candle history.")
-
-    current_price = f(m1[-1].get("close"))
-
-    # ── Step 1: Find the active 15M wick zone ───
-    active_zone = current_zone(m15, current_price)
-
-    if active_zone is None:
-        zones = scan_15m_wick_zones(m15)
-        return {
-            **_hold(context, tfs, "Price not in any 15M wick zone — waiting for zone retest."),
-            "zones": zones,
-            "zone_count": len(zones),
-        }
-
-    # ── Step 2: Check for breakout from this zone ─
-    bo = breakout_strength(m5, active_zone)
-
-    if bo["confirmed"]:
-        # Price is breaking out — ride the momentum, not the scalp.
-        direction = bo["direction"]
-        score     = 0.85 if bo["momentum"] == "forming" else 0.95
-        entry     = active_zone["zone_high"] if direction == BUY else active_zone["zone_low"]
-        target    = entry + active_zone["candle_range"] if direction == BUY else entry - active_zone["candle_range"]
-        stop_ref  = active_zone["zone_low"]  if direction == BUY else active_zone["zone_high"]
-
-        return {
-            **_base_setup(context, tfs, active_zone, bo),
-            "action":       direction,
-            "score":        score,
-            "entry_type":   f"breakout_{bo['momentum']}",
-            "entry_level":  entry,
-            "target_level": target,
-            "stop_reference": stop_ref,
-            "reason":       f"{direction}: 15M zone breakout — {bo['candle_count']} consecutive M5 closes ({bo['momentum']}). Zone {active_zone['zone_low']:.2f}-{active_zone['zone_high']:.2f}.",
-        }
-
-    # ── Step 3: 5M confirmation for scalp ───────
-    conf5 = confirm_5m(m5, active_zone)
-    if not conf5["confirmed"]:
-        return {
-            **_hold(context, tfs, f"In 15M wick zone ({active_zone['type']}) — waiting for 5M confirmation candle."),
-            "active_zone": active_zone,
-            "breakout":    bo,
-        }
-
-    signal_dir = conf5["signal"]
-
-    # ── Step 4: 1M entry confirmation ───────────
-    conf1 = confirm_1m(m1, active_zone, signal_dir)
-    if not conf1["confirmed"]:
-        return {
-            **_hold(context, tfs, f"5M confirmed {signal_dir} — waiting for 1M entry candle."),
-            "active_zone":    active_zone,
-            "confirm_5m":     conf5,
-            "breakout":       bo,
-        }
-
-    # ── Step 5: Score and package the trade ─────
-    base_score = 0.75
-    if conf1["liq_grab"]:
-        base_score += 0.15       # liquidity grab adds confluence
-    if active_zone["is_liq_grab"]:
-        base_score += 0.05       # 15M zone itself was a liq grab wick
-    if bo["direction"] == signal_dir:
-        base_score += 0.05       # momentum behind us even if not a confirmed breakout
-    score = min(base_score, 1.0)
-
-    zone_rng = active_zone["candle_range"]
-    tol      = active_zone.get("tolerance", max(zone_rng * ZONE_TOL_RATIO, 0.20))
-
-    if signal_dir == BUY:
-        entry     = active_zone["zone_low"]
-        target    = active_zone["zone_high"] + zone_rng * 0.5
-        stop_ref  = active_zone["zone_low"] - tol
+        return False
+    c  = closed[-1]
+    cl = fv(c.get("close"))
+    op = fv(c.get("open"))
+    if direction == BUY:
+        # Bearish candle that still closes above the low — rejection from below
+        return cl < op and cl > zone_extreme
     else:
-        entry     = active_zone["zone_high"]
-        target    = active_zone["zone_low"] - zone_rng * 0.5
-        stop_ref  = active_zone["zone_high"] + tol
-
-    liq_tag = " [LIQ GRAB]" if conf1["liq_grab"] else ""
-    reason  = (
-        f"{signal_dir}: 15M wick zone ({active_zone['type']}) + 5M + 1M confirmed{liq_tag}. "
-        f"Zone {active_zone['zone_low']:.2f}–{active_zone['zone_high']:.2f}. "
-        f"Wick ratio {active_zone['wick_ratio']:.0%}. "
-        f"{conf5['reason']} | {conf1['reason']}"
-    )
-
-    return {
-        **_base_setup(context, tfs, active_zone, bo),
-        "action":           signal_dir,
-        "score":            score,
-        "entry_type":       "scalp_zone_confluence" + ("_liq_grab" if conf1["liq_grab"] else ""),
-        "entry_level":      entry,
-        "target_level":     target,
-        "stop_reference":   stop_ref,
-        "tolerance":        tol,
-        "confirm_5m":       conf5,
-        "confirm_1m":       conf1,
-        "reason":           reason,
-    }
+        # Bullish candle that still closes below the high — rejection from above
+        return cl > op and cl < zone_extreme
 
 
-# ──────────────────────────────────────────────
-#  Internal Helpers
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+#  1M TRIGGER — CANDLE COLOR RULE + VOLUME
+#
+#  BUY  : trigger candle must be BEARISH (red).
+#          Price dipped to/below range_low (the support), closed above it.
+#          We buy the bounce — entry on the close of that red candle.
+#
+#  SELL : trigger candle must be BULLISH (green).
+#          Price pushed to/above range_high (the resistance), closed below it.
+#          We sell the rejection — entry on the close of that green candle.
+#
+#  Rationale: A bearish candle touching support shows the level was TESTED and
+#  held (sellers tried, buyers absorbed).  A bullish candle touching resistance
+#  shows buyers tried and sellers absorbed.  This is the institutional fingerprint.
+# ══════════════════════════════════════════════
 
-def _hold(context: Dict[str, Any], tfs: Dict, reason: str) -> Dict[str, Any]:
-    return {
-        "valid":       True,
-        "action":      HOLD,
-        "score":       0.0,
-        "entry_type":  "waiting",
-        "entry_level": None,
-        "target_level": None,
-        "stop_reference": None,
-        "tolerance":   0.0,
-        "timeframes":  tfs,
-        "reason":      f"HOLD: {reason}",
-    }
+def confirm_1m(m1: List[Dict[str, Any]],
+               direction: str,
+               zone_extreme: float) -> Tuple[bool, bool, Optional[Dict[str, Any]]]:
+    """
+    Returns (confirmed, volume_ok, trigger_candle).
+    Uses the LAST CLOSED candle (m1[-2] when m1 includes the forming bar).
+    """
+    # Get strictly closed candles (exclude forming)
+    closed = m1[:-1] if len(m1) > 1 else m1
+    if not closed:
+        return False, False, None
+
+    c   = closed[-1]   # last fully closed 1M candle
+    cl  = fv(c.get("close"))
+    op  = fv(c.get("open"))
+    lo  = fv(c.get("low"))
+    hi  = fv(c.get("high"))
+    vol = fv(c.get("tick_volume"))
+    avg = avg_volume(closed[:-1])
+    vol_ok = avg == 0 or vol >= avg * VOL_MIN_RATIO
+
+    if direction == BUY:
+        # Red candle that wicked to/below range_low then closed above it
+        candle_red    = cl < op                         # bearish body
+        tested_low    = lo <= zone_extreme + MIN_ZONE_TOL  # wick touched the zone
+        closed_inside = cl > zone_extreme - MIN_ZONE_TOL   # close did not break down
+        confirmed     = candle_red and tested_low and closed_inside
+        return confirmed, vol_ok, c if confirmed else None
+    else:
+        # Green candle that wicked to/above range_high then closed below it
+        candle_green  = cl > op                         # bullish body
+        tested_high   = hi >= zone_extreme - MIN_ZONE_TOL  # wick touched the zone
+        closed_inside = cl < zone_extreme + MIN_ZONE_TOL   # close did not break up
+        confirmed     = candle_green and tested_high and closed_inside
+        return confirmed, vol_ok, c if confirmed else None
 
 
-def _base_setup(
-    context: Dict[str, Any],
-    tfs: Dict,
-    zone: Dict[str, Any],
-    bo: Dict[str, Any],
-) -> Dict[str, Any]:
-    return {
-        "valid":        True,
-        "timeframes":   tfs,
-        "active_zone":  zone,
-        "breakout":     bo,
-    }
+# ══════════════════════════════════════════════
+#  SL / TP  —  RANGE-ANCHORED  1:3 RR
+#
+#  BUY  : SL = range_low  - SL_BUFFER
+#          TP = range_high + (range_high - range_low) * 0.5   (~1.5× range)
+#              adjusted so RR is at least 1:3
+#
+#  SELL : SL = range_high + SL_BUFFER
+#          TP = range_low  - (range_high - range_low) * 0.5
+# ══════════════════════════════════════════════
+
+def calc_rr(direction: str, entry: float,
+            range_high: float, range_low: float,
+            liq_grab: bool = False) -> Dict[str, float]:
+    rng    = range_high - range_low
+    buffer = SL_BUFFER * (0.70 if liq_grab else 1.0)
+
+    if direction == BUY:
+        sl     = round(range_low - max(buffer, MIN_SL_POINTS), 2)
+        sl_dist= entry - sl
+        tp_dist= sl_dist * 3.0
+        tp     = round(entry + tp_dist, 2)
+    else:
+        sl     = round(range_high + max(buffer, MIN_SL_POINTS), 2)
+        sl_dist= sl - entry
+        tp_dist= sl_dist * 3.0
+        tp     = round(entry - tp_dist, 2)
+
+    return {"sl": sl, "tp": tp, "sl_dist": sl_dist, "tp_dist": tp_dist}
 
 
-def tolerance(context: Dict[str, Any], setup: Dict[str, Any]) -> float:
-    rules    = context.get("rules") or {}
-    explicit = f(rules.get("zone_tolerance") or rules.get("ray_touch_tolerance"), 0.0)
-    if explicit > 0:
-        return explicit
-    rng = f(setup.get("active_zone", {}).get("candle_range") if setup.get("active_zone") else setup.get("range_size"), 0.0)
-    return max(rng * ZONE_TOL_RATIO, 0.20)
+# ══════════════════════════════════════════════
+#  POSITION UTILITIES
+# ══════════════════════════════════════════════
+
+def position_age_m1(pos: Dict[str, Any], m1: List[Dict[str, Any]]) -> int:
+    open_time = int(pos.get("time", 0) or 0)
+    return sum(1 for c in m1 if int(c.get("time", 0) or 0) > open_time)
 
 
-# ──────────────────────────────────────────────
-#  Trade Signal Factory (unchanged interface)
-# ──────────────────────────────────────────────
+def position_in_profit(pos: Dict[str, Any], m1: List[Dict[str, Any]]) -> bool:
+    if pos.get("profit") is not None:
+        return fv(pos.get("profit")) > 0
+    if not m1:
+        return False
+    entry    = fv(pos.get("price_open") or pos.get("open_price") or pos.get("entry_price"))
+    last_cl  = fv(m1[-1].get("close"))
+    pos_type = int(pos.get("type", 0) or 0)
+    return last_cl > entry if pos_type == 0 else last_cl < entry
+
+
+# ══════════════════════════════════════════════
+#  SIGNAL FACTORY
+# ══════════════════════════════════════════════
 
 def make_signal(
     action: str,
     reason: str,
     confidence: float,
-    context: Dict[str, Any],
+    ctx: Dict[str, Any],
     data: Optional[Dict[str, Any]] = None,
     close_ticket: Any = None,
+    sl: Optional[float] = None,
+    tp: Optional[float] = None,
+    entry_candle_time: Optional[int] = None,
 ) -> Dict[str, Any]:
     action = str(action or HOLD).upper()
-    if action not in (BUY, SELL, CLOSE, HOLD):
+    if action not in (BUY, SELL, CLOSE, HOLD, SCAN):
         action = HOLD
-
-    rules = context.get("rules") or {}
+    rules = ctx.get("rules") or {}
     return {
-        "enabled":       True,
-        "active":        True,
-        "valid":         True,
-        "strategy":      "xauusd_m15_wick_scalp_strategy",
-        "name":          "xauusd_m15_wick_scalp_strategy",
-        "symbol":        symbol_from_context(context),
-        "volume":        f(rules.get("volume") or rules.get("trade_volume") or context.get("volume"), 0.01),
-        "action":        action,
-        "signal":        action,
-        "trade_signal":  action,
-        "direction":     action,
-        "side":          action,
-        "mt5_action":    action,
-        "mt5_order_type": action,
-        "order_type":    action,
-        "should_trade":  action in (BUY, SELL),
-        "execute":       action in (BUY, SELL),
-        "should_execute": action in (BUY, SELL),
-        "should_close":  action == CLOSE,
-        "close_ticket":  close_ticket,
-        "confidence":    max(0.0, min(f(confidence), 1.0)),
-        "reason":        reason,
-        "thought":       reason,
-        "data":          data or {},
+        "enabled":          True,
+        "active":           True,
+        "valid":            True,
+        "strategy":         "xauusd_m15_wick_scalp",
+        "name":             "xauusd_m15_wick_scalp",
+        "symbol":           symbol_from_context(ctx),
+        "volume":           fv(rules.get("volume") or rules.get("trade_volume") or ctx.get("volume"), 0.01),
+        "action":           action,
+        "signal":           action,
+        "trade_signal":     action,
+        "direction":        action,
+        "side":             action,
+        "mt5_action":       action,
+        "mt5_order_type":   action,
+        "order_type":       action,
+        "should_trade":     action in (BUY, SELL),
+        "execute":          action in (BUY, SELL),
+        "should_execute":   action in (BUY, SELL),
+        "should_close":     action == CLOSE,
+        "close_ticket":     close_ticket,
+        "confidence":       max(0.0, min(fv(confidence), 1.0)),
+        "reason":           reason,
+        "thought":          reason,
+        "sl":               sl,
+        "tp":               tp,
+        "entry_candle_time": entry_candle_time,
+        "data":             data or {},
     }
 
 
-# ──────────────────────────────────────────────
-#  Position Management (unchanged interface)
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+#  POSITION MANAGEMENT  (maybe_close)
+# ══════════════════════════════════════════════
 
-def position_age_candles(position: Dict[str, Any], rates: List[Dict[str, Any]]) -> int:
-    open_time = int(position.get("time", 0) or 0)
-    if not open_time:
-        return 0
-    return len([c for c in rates if int(c.get("time", 0) or 0) > open_time])
-
-
-def position_in_profit(position: Dict[str, Any], rates: List[Dict[str, Any]]) -> bool:
-    if position.get("profit") is not None:
-        return f(position.get("profit")) > 0
-    if not rates:
-        return False
-    entry    = f(position.get("price_open") or position.get("open_price") or position.get("entry_price"))
-    close    = f(rates[-1].get("close"))
-    pos_type = int(position.get("type", 0) or 0)
-    return close > entry if pos_type == 0 else close < entry
-
-
-def maybe_close(context: Dict[str, Any], setup: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    positions = context.get("positions") or context.get("open_positions") or []
+def maybe_close(ctx: Dict[str, Any], setup: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    positions = ctx.get("positions") or []
     if not positions:
         return None
-
-    m1 = setup.get("timeframes", {}).get("M1", [])
+    m1 = setup.get("_m1", [])
     if not m1:
         return None
 
-    pos      = positions[0]
-    ticket   = pos.get("ticket")
-    age      = position_age_candles(pos, m1)
-    profit   = position_in_profit(pos, m1)
-    pos_type = int(pos.get("type", 0) or 0)
-    close    = f(m1[-1].get("close"))
+    pos       = positions[0]
+    ticket    = pos.get("ticket")
+    age       = position_age_m1(pos, m1)
+    in_profit = position_in_profit(pos, m1)
+    pos_type  = int(pos.get("type", 0) or 0)   # 0=BUY, 1=SELL
+    last_cl   = fv(m1[-1].get("close"))
+    rng_high  = fv(setup.get("range_high"))
+    rng_low   = fv(setup.get("range_low"))
 
-    zone     = setup.get("active_zone") or {}
-    target   = f(setup.get("target_level"))
-    zone_high = f(zone.get("zone_high") or setup.get("range_high"))
-    zone_low  = f(zone.get("zone_low")  or setup.get("range_low"))
+    # Read SL/TP stored in setup (placed on the order by agent)
+    tp_level = fv(setup.get("tp"))
+    sl_level = fv(setup.get("sl"))
 
-    # Target hit.
-    if pos_type == 0:
-        if target > 0 and close >= target:
-            return make_signal(CLOSE, f"CLOSE: BUY reached target @ {target:.2f}.", 1.0, context, data=setup, close_ticket=ticket)
-        if profit and zone_high > 0 and close >= zone_high:
-            return make_signal(CLOSE, f"CLOSE: BUY reached 15M zone high @ {zone_high:.2f}.", 0.95, context, data=setup, close_ticket=ticket)
+    # Software TP backup
+    if pos_type == 0 and tp_level > 0 and last_cl >= tp_level:
+        return make_signal(CLOSE, f"CLOSE: BUY TP {tp_level:.2f} reached.", 1.0, ctx, data=setup, close_ticket=ticket)
+    if pos_type == 1 and tp_level > 0 and last_cl <= tp_level:
+        return make_signal(CLOSE, f"CLOSE: SELL TP {tp_level:.2f} reached.", 1.0, ctx, data=setup, close_ticket=ticket)
 
-    if pos_type == 1:
-        if target > 0 and close <= target:
-            return make_signal(CLOSE, f"CLOSE: SELL reached target @ {target:.2f}.", 1.0, context, data=setup, close_ticket=ticket)
-        if profit and zone_low > 0 and close <= zone_low:
-            return make_signal(CLOSE, f"CLOSE: SELL reached 15M zone low @ {zone_low:.2f}.", 0.95, context, data=setup, close_ticket=ticket)
+    # Software SL backup
+    if pos_type == 0 and sl_level > 0 and last_cl <= sl_level:
+        return make_signal(CLOSE, f"CLOSE: BUY SL {sl_level:.2f} hit.", 1.0, ctx, data=setup, close_ticket=ticket)
+    if pos_type == 1 and sl_level > 0 and last_cl >= sl_level:
+        return make_signal(CLOSE, f"CLOSE: SELL SL {sl_level:.2f} hit.", 1.0, ctx, data=setup, close_ticket=ticket)
 
-    # Time-based exits.
-    if profit and age >= 7:
-        return make_signal(CLOSE, f"CLOSE: profit after {age} M1 candles.", 1.0, context, data=setup, close_ticket=ticket)
-    if not profit and age >= 4:
-        return make_signal(CLOSE, f"CLOSE: not in profit after {age} M1 candles.", 1.0, context, data=setup, close_ticket=ticket)
+    # Breakout against trade
+    if rng_high > 0 and rng_low > 0:
+        if pos_type == 0 and last_cl < rng_low - SL_BUFFER:
+            return make_signal(CLOSE, f"CLOSE: BUY — broke below range low {rng_low:.2f}.", 0.95, ctx, data=setup, close_ticket=ticket)
+        if pos_type == 1 and last_cl > rng_high + SL_BUFFER:
+            return make_signal(CLOSE, f"CLOSE: SELL — broke above range high {rng_high:.2f}.", 0.95, ctx, data=setup, close_ticket=ticket)
 
-    return make_signal(HOLD, f"HOLD: tracking open position, candles_open={age}, in_profit={profit}.", 0.0, context, data=setup)
+    # Time-based exits
+    if in_profit and age >= 7:
+        return make_signal(CLOSE, f"CLOSE: BUY in profit {age} candles — securing.", 1.0, ctx, data=setup, close_ticket=ticket)
+    if not in_profit and age >= 4:
+        return make_signal(CLOSE, f"CLOSE: {'BUY' if pos_type==0 else 'SELL'} not in profit after {age} candles — cut.", 1.0, ctx, data=setup, close_ticket=ticket)
+
+    pos_dir = "BUY" if pos_type == 0 else "SELL"
+    return make_signal(HOLD, f"HOLD: Managing {pos_dir} ticket {ticket} — age={age} candles, profit={in_profit}.",
+                       0.0, ctx, data=setup, close_ticket=ticket)
 
 
-# ──────────────────────────────────────────────
-#  Decision Entry Point
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+#  MAIN DECISION ENGINE
+# ══════════════════════════════════════════════
 
-def build_decision(context: Dict[str, Any]) -> Dict[str, Any]:
-    setup = scalp_signal(context)
+def build_decision(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    tfs = get_timeframes(ctx)
+    m1  = tfs.get("M1",  [])
+    m5  = tfs.get("M5",  [])
+    m15 = tfs.get("M15", [])
 
-    close_signal = maybe_close(context, setup)
-    if close_signal is not None:
-        return close_signal
+    positions = ctx.get("positions") or []
 
-    return make_signal(
-        setup.get("action", HOLD),
-        str(setup.get("reason", "HOLD: waiting for 15M wick zone setup.")),
-        f(setup.get("score"), 0.0),
-        context,
-        data=setup,
+    # Guard: need enough data
+    if len(m1) < 5:
+        return make_signal(SCAN, "SCAN: Waiting for M1 candle history.", 0.0, ctx)
+    if len(m15) < 3:
+        return make_signal(SCAN, "SCAN: Waiting for M15 candle history.", 0.0, ctx)
+
+    # Current price
+    current_price = fv(m1[-1].get("close"))
+
+    # Build the 15M range
+    rng = build_15m_range(m1, m15)
+
+    # Swing levels for context
+    levels = nearest_swing_levels(m15, current_price, lookback=10)
+
+    setup: Dict[str, Any] = {
+        **rng,
+        "_m1":      m1,
+        "_m5":      m5,
+        "_m15":     m15,
+        "levels":   levels,
+        "price":    current_price,
+    }
+
+    # ── Manage open position FIRST ─────────────
+    if positions:
+        sig = maybe_close(ctx, setup)
+        if sig is not None:
+            sig["data"].update({"levels": levels})
+            return sig
+
+    if not rng.get("valid"):
+        return make_signal(SCAN, f"SCAN: {rng.get('reason', 'No valid range.')}",
+                           0.0, ctx, data=setup)
+
+    range_high = fv(rng["range_high"])
+    range_low  = fv(rng["range_low"])
+    range_mid  = fv(rng["range_mid"])
+    range_size = fv(rng["range_size"])
+    tol        = max(range_size * ZONE_TOL_RATIO, MIN_ZONE_TOL)
+
+    # ── Breakout check ─────────────────────────
+    bo = breakout_check(m5, range_high, range_low)
+    setup["breakout"] = bo
+
+    if bo["confirmed"]:
+        direction = bo["direction"]
+        liq = detect_liq_grab(m1,
+                               range_low  if direction == BUY  else range_high,
+                               direction)
+        # Entry = close of last closed M1 candle
+        closed_m1 = m1[:-1] if len(m1) > 1 else m1
+        entry = fv(closed_m1[-1].get("close")) if closed_m1 else current_price
+        entry_ct  = int(closed_m1[-1].get("time", 0)) if closed_m1 else 0
+
+        rr  = {
+            BUY:  {"sl": round(range_low  - max(SL_BUFFER, MIN_SL_POINTS), 2),
+                   "tp": round(entry + (entry - (range_low - SL_BUFFER)) * 3, 2)},
+            SELL: {"sl": round(range_high + max(SL_BUFFER, MIN_SL_POINTS), 2),
+                   "tp": round(entry - ((range_high + SL_BUFFER) - entry) * 3, 2)},
+        }[direction]
+
+        conf = min(0.88 + (0.08 if liq else 0.0), 1.0)
+        setup.update({"entry_level": entry, "sl": rr["sl"], "tp": rr["tp"]})
+        return make_signal(
+            direction,
+            f"{direction} BREAKOUT: {bo['count']} M5 closes outside range. "
+            f"E={entry:.2f}  SL={rr['sl']:.2f}  TP={rr['tp']:.2f}"
+            + (" [LIQ]" if liq else ""),
+            conf, ctx, data=setup, sl=rr["sl"], tp=rr["tp"],
+            entry_candle_time=entry_ct,
+        )
+
+    # ── Zone touch detection ───────────────────
+    last_m1 = m1[-1]
+    lo1     = fv(last_m1.get("low"))
+    hi1     = fv(last_m1.get("high"))
+
+    at_buy_zone  = lo1 <= range_low  + tol
+    at_sell_zone = hi1 >= range_high - tol
+
+    if not at_buy_zone and not at_sell_zone:
+        return make_signal(
+            SCAN,
+            f"SCAN: {range_low:.2f}–{range_high:.2f} | Price {current_price:.2f} — watching zones.",
+            0.0, ctx, data=setup,
+        )
+
+    direction    = BUY if at_buy_zone else SELL
+    zone_extreme = range_low if direction == BUY else range_high
+
+    # ── 5M confirmation ────────────────────────
+    if len(m5) >= 3:
+        if not confirm_5m(m5, direction, zone_extreme):
+            return make_signal(
+                HOLD,
+                f"HOLD: Price at {direction} zone {zone_extreme:.2f} — waiting for 5M rejection candle.",
+                0.0, ctx, data=setup,
+            )
+
+    # ── 1M trigger  (candle color + volume) ───
+    m1_ok, vol_ok, trigger_candle = confirm_1m(m1, direction, zone_extreme)
+
+    if not m1_ok:
+        return make_signal(
+            HOLD,
+            f"HOLD: 5M at {direction} zone — waiting for 1M {'red' if direction == BUY else 'green'} trigger candle.",
+            0.0, ctx, data=setup,
+        )
+
+    # ── Liquidity grab confluence ───────────────
+    liq   = detect_liq_grab(m1, zone_extreme, direction)
+
+    # Entry = close of the trigger candle
+    entry    = fv(trigger_candle.get("close"))
+    entry_ct = int(trigger_candle.get("time", 0))
+
+    rr    = calc_rr(direction, entry, range_high, range_low, liq_grab=liq)
+    score = min(0.78 + (0.12 if liq else 0.0) + (0.07 if vol_ok else 0.0), 1.0)
+
+    setup.update({"entry_level": entry, "sl": rr["sl"], "tp": rr["tp"],
+                  "trigger_candle": trigger_candle})
+
+    tag_liq = " [LIQ]"  if liq   else ""
+    tag_vol = " [VOL+]" if vol_ok else ""
+    reason  = (
+        f"{direction}: 15M {range_low:.2f}–{range_high:.2f} | "
+        f"5M+1M {'red' if direction==BUY else 'green'} trigger{tag_liq}{tag_vol} | "
+        f"E={entry:.2f}  SL={rr['sl']:.2f}  TP={rr['tp']:.2f}  (1:3)"
     )
+    return make_signal(direction, reason, score, ctx,
+                       data=setup, sl=rr["sl"], tp=rr["tp"],
+                       entry_candle_time=entry_ct)
 
 
-# ──────────────────────────────────────────────
-#  Draw Commands
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════
+#  DRAW COMMANDS  —  clean, minimal chart markup
+# ══════════════════════════════════════════════
+
+def build_draw_commands(ctx: Dict[str, Any],
+                        decision: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """
+    Clean chart markup:
+      - Active 15M range box + HIGH / LOW rays only
+      - 2 nearest resistance rays (red, short)
+      - 2 nearest support rays   (green, short)
+      - Entry / SL / TP rays when trade is live
+      - Status text anchored LEFT of current bar (not drifting right)
+    """
+    cmds: List[Dict[str, Any]] = [{"type": "clear_all"}]
+    now  = int(time.time())
+
+    data     = (decision or {}).get("data") or {}
+    action   = (decision or {}).get("action", SCAN)
+
+    # Pull candle lists from data or re-fetch
+    m15_list = data.get("_m15") or []
+    m1_list  = data.get("_m1")  or []
+    if not m15_list or not m1_list:
+        tfs_ctx = get_timeframes(ctx)
+        if not m15_list:
+            m15_list = tfs_ctx.get("M15", [])
+        if not m1_list:
+            m1_list  = tfs_ctx.get("M1",  [])
+
+    current_price = fv((m1_list[-1] if m1_list else {}).get("close"))
+
+    # ── Active 15M range ───────────────────────
+    rng_high  = fv(data.get("range_high"))
+    rng_low   = fv(data.get("range_low"))
+    rng_mid   = fv(data.get("range_mid"))
+    bar_start = int(data.get("range_start") or now - 900)
+    bar_end   = int(data.get("range_end")   or bar_start + 900)
+    locked    = bool(data.get("locked"))
+    rng_dir   = data.get("range_direction", HOLD)
+
+    if rng_high > 0 and rng_low > 0:
+        box_color = "green" if rng_dir == BUY else "red" if rng_dir == SELL else "yellow"
+        status    = "RANGE" if locked else "BUILDING"
+
+        # Box spanning only the active bar
+        cmds.append({"type": "box", "name": "TS_RANGE_BOX",
+                     "time1": bar_start, "time2": bar_end,
+                     "price1": rng_high, "price2": rng_low,
+                     "color": box_color, "text": ""})
+
+        # HIGH ray — anchored at bar start, label LEFT of bar
+        cmds.append({"type": "ray", "name": "TS_RANGE_HIGH",
+                     "time1": bar_start, "price1": rng_high,
+                     "color": "red", "width": 2,
+                     "text": f"{status} H {rng_high:.2f}"})
+
+        # LOW ray
+        cmds.append({"type": "ray", "name": "TS_RANGE_LOW",
+                     "time1": bar_start, "price1": rng_low,
+                     "color": "green", "width": 2,
+                     "text": f"{status} L {rng_low:.2f}"})
+
+    # ── Nearest swing levels ───────────────────
+    levels = data.get("levels") or (
+        nearest_swing_levels(m15_list, current_price, lookback=10) if m15_list else {}
+    )
+    ray_start = now - 120  # short rays, anchored near current bar
+
+    for j, lv in enumerate(levels.get("resistance", [])[:2]):
+        cmds.append({"type": "ray", "name": f"TS_RES_{j}",
+                     "time1": ray_start, "price1": lv,
+                     "color": "orange", "width": 1,
+                     "text": f"R {lv:.2f}"})
+
+    for j, lv in enumerate(levels.get("support", [])[:2]):
+        cmds.append({"type": "ray", "name": f"TS_SUP_{j}",
+                     "time1": ray_start, "price1": lv,
+                     "color": "cyan", "width": 1,
+                     "text": f"S {lv:.2f}"})
+
+    # ── Entry / SL / TP ────────────────────────
+    entry_level = fv(data.get("entry_level"))
+    tp_level    = fv((decision or {}).get("tp") or data.get("tp"))
+    sl_level    = fv((decision or {}).get("sl") or data.get("sl"))
+
+    if entry_level > 0 and action in (BUY, SELL):
+        e_color = "green" if action == BUY else "red"
+        cmds.append({"type": "ray", "name": "TS_ENTRY",
+                     "time1": now - 60, "price1": entry_level,
+                     "color": e_color, "width": 3,
+                     "text": f"ENTRY {entry_level:.2f}"})
+    if tp_level > 0:
+        cmds.append({"type": "ray", "name": "TS_TP",
+                     "time1": now - 60, "price1": tp_level,
+                     "color": "blue", "width": 2,
+                     "text": f"TP {tp_level:.2f}"})
+    if sl_level > 0:
+        cmds.append({"type": "ray", "name": "TS_SL",
+                     "time1": now - 60, "price1": sl_level,
+                     "color": "orange", "width": 2,
+                     "text": f"SL {sl_level:.2f}"})
+
+    # ── Breakout marker ────────────────────────
+    bo = data.get("breakout", {})
+    if bo.get("confirmed") and rng_mid > 0:
+        bo_dir   = bo.get("direction", HOLD)
+        bo_color = "green" if bo_dir == BUY else "red"
+        # Offset text slightly above/below mid so it doesn't overlap range lines
+        offset   = (rng_high - rng_low) * 0.15 if rng_high > rng_low else 0.5
+        lbl_price= rng_mid + (offset if bo_dir == BUY else -offset)
+        cmds.append({"type": "text", "name": "TS_BO_LABEL",
+                     "time": now - 60, "price": lbl_price,
+                     "color": bo_color,
+                     "text": f"BO {bo_dir} x{bo.get('count')}"})
+
+    # ── Status label  (anchored 2 bars LEFT) ──
+    reason   = str((decision or {}).get("reason", "Scanning..."))
+    # Truncate to 80 chars max so it fits within the chart window
+    short_reason = reason[:80]
+    lbl_price = rng_mid if rng_mid > 0 else current_price
+    # Place label at now - 2 bars (120s) so it appears on the chart, not off-screen
+    lbl_time  = now - 120
+    a_color   = "green" if action == BUY else "red" if action == SELL else "yellow"
+    cmds.append({"type": "text", "name": "TS_STATUS",
+                 "time": lbl_time, "price": lbl_price,
+                 "color": a_color,
+                 "text": f"{action} | {short_reason}"})
+
+    return cmds
+
+
+# ══════════════════════════════════════════════
+#  FILE I/O
+# ══════════════════════════════════════════════
 
 def draw_paths() -> List[Path]:
     raw = os.environ.get(DRAW_ENV)
@@ -853,100 +888,30 @@ def write_json(path: Path, payload: Dict[str, Any]) -> None:
     tmp.replace(path)
 
 
-def build_draw_commands(context: Dict[str, Any], decision: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    data     = (decision or {}).get("data") or {}
-    setup    = data if data.get("active_zone") else scalp_signal(context)
-    commands: List[Dict[str, Any]] = [{"type": "clear_all"}]
-
-    zone = setup.get("active_zone")
-    bo   = setup.get("breakout", {})
-
-    # ── Draw all scanned 15M wick zones ─────────
-    tfs  = setup.get("timeframes") or get_timeframes(context, include_forming=False)
-    m15  = tfs.get("M15", [])
-    now  = int(time.time())
-
-    all_zones = scan_15m_wick_zones(m15, lookback=8)
-    for z in all_zones:
-        color = "green" if z["type"] == "buy_zone" else "red"
-        liq   = " [LIQ GRAB]" if z["is_liq_grab"] else ""
-        commands.append({
-            "type": "box",
-            "name": f"TS_ZONE_{z['candle_time']}",
-            "time1": z["candle_time"],
-            "time2": now + 3600,
-            "price1": z["zone_high"],
-            "price2": z["zone_low"],
-            "color": color,
-            "text": f"{z['type'].upper()}{liq} wick {z['wick_ratio']:.0%}",
-        })
-
-    if zone:
-        bias_color = "green" if setup.get("action") == BUY else "red" if setup.get("action") == SELL else "yellow"
-        t = int(zone.get("candle_time", now))
-
-        commands.extend([
-            {"type": "ray", "name": "TS_ACTIVE_ZONE_HIGH", "time1": t, "price1": zone["zone_high"],
-             "color": "yellow", "width": 2, "text": f"ACTIVE ZONE HIGH {zone['zone_high']:.2f}"},
-            {"type": "ray", "name": "TS_ACTIVE_ZONE_LOW",  "time1": t, "price1": zone["zone_low"],
-             "color": "cyan",   "width": 2, "text": f"ACTIVE ZONE LOW  {zone['zone_low']:.2f}"},
-            {"type": "ray", "name": "TS_ACTIVE_ZONE_MID",  "time1": t, "price1": zone["zone_mid"],
-             "color": "gray",   "width": 1, "text": f"ZONE MID {zone['zone_mid']:.2f}"},
-        ])
-
-        if bo.get("confirmed"):
-            commands.append({
-                "type": "text", "name": "TS_BREAKOUT_LABEL",
-                "time": now + 120, "price": zone["zone_mid"],
-                "color": bias_color,
-                "text": f"BREAKOUT {bo['direction']} | {bo['candle_count']} candles | {bo['momentum'].upper()}",
-            })
-
-    for key, name, color in (
-        ("entry_level",   "TS_ENTRY_AREA",       "yellow"),
-        ("target_level",  "TS_TARGET",            "blue"),
-        ("stop_reference","TS_STOP_REFERENCE",    "orange"),
-    ):
-        value = setup.get(key)
-        if value is not None:
-            commands.append({"type": "ray", "name": name, "time1": now - 300, "price1": f(value), "color": color, "width": 2,
-                             "text": f"{key.replace('_', ' ').upper()} {f(value):.2f}"})
-
-    action = setup.get("action", HOLD)
-    commands.append({
-        "type":  "text",
-        "name":  "TS_DECISION_LABEL",
-        "time":  now + 60 * 8,
-        "price": f(setup.get("entry_level") or (zone or {}).get("zone_mid") or 0),
-        "color": "green" if action == BUY else "red" if action == SELL else "yellow",
-        "text":  f"[M15 SCALP] {action}\n{str(setup.get('reason', ''))}",
-    })
-
-    return commands
-
-
-def write_draws(context: Dict[str, Any], decision: Optional[Dict[str, Any]] = None) -> int:
-    commands = build_draw_commands(context, decision)
-    payload  = {
-        "version":       12,
+def write_draws(ctx: Dict[str, Any], decision: Optional[Dict[str, Any]] = None) -> int:
+    cmds    = build_draw_commands(ctx, decision)
+    payload = {
+        "version":       14,
         "source":        "TradeSmartAI",
-        "strategy":      "m15_wick_scalp_liq_grab",
+        "strategy":      "m15_wick_scalp_v4",
         "updated":       time.time(),
-        "command_count": len(commands),
-        "commands":      commands,
+        "command_count": len(cmds),
+        "commands":      cmds,
     }
     for p in draw_paths():
         write_json(p, payload)
-    return len(commands)
+    return len(cmds)
 
 
-def write_debug(context: Dict[str, Any], result: Dict[str, Any], command_count: int) -> None:
+def write_debug(ctx: Dict[str, Any], result: Dict[str, Any], command_count: int) -> None:
     base = draw_paths()[0].parent
     write_json(base / DEBUG_FILE, {
         "updated":       time.time(),
         "action":        result.get("action"),
         "reason":        result.get("reason"),
         "confidence":    result.get("confidence"),
+        "sl":            result.get("sl"),
+        "tp":            result.get("tp"),
         "command_count": command_count,
         "data":          result.get("data", {}),
     })

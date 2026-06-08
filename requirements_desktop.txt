@@ -18,6 +18,12 @@ python-dateutil>=2.9.0
 Pillow>=10.0.0
 httpx
 tenacity
+beautifulsoup4
+lxml
+yfinance
+streamlit>=1.37
+streamlit-autorefresh>=1.0.1
+
 scikit-image
 emoji
 loguru

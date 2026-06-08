@@ -480,14 +480,11 @@ def is_profile_ready(profile: Dict[str, Any]) -> Tuple[bool, List[str]]:
 def connect_mt5(profile: Dict[str, Any]) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
     """Connect MT5 locally with the selected Demo/Live profile.
 
-    Desktop behavior:
-    - Uses only the saved selected-mode credentials.
-    - Shuts down the previous MT5 Python session before switching modes.
-    - Initializes MT5 quickly.
-    - Forces mt5.login(...), but accepts an already-open terminal session when
-      account_info() already matches the requested login. This prevents Demo
-      from failing when MT5 opens the correct Demo account but rejects a second
-      login command.
+    Uses one automatic connection path for both Demo and Live:
+    1. Start MT5 with the requested login/password/server when possible.
+    2. Also try normal initialize() then mt5.login().
+    3. Accept an already-open terminal only when the returned login matches
+       the selected Demo/Live profile. This prevents connecting the wrong account.
     """
     profile = dict(profile or {})
     profile["mode"] = str(profile.get("mode") or "Demo").title()
@@ -495,19 +492,10 @@ def connect_mt5(profile: Dict[str, Any]) -> Tuple[bool, str, Optional[Dict[str, 
     profile["password"] = str(profile.get("password", ""))
     profile["server"] = str(profile.get("server", "")).strip()
     profile["terminal_path"] = _valid_terminal_path(profile.get("terminal_path"))
-    timeout = int(profile.get("timeout", 12000) or 12000)
-    if timeout > 15000:
-        timeout = 15000
-    profile["timeout"] = timeout
 
-    _log_mt5_event("connect_attempt", {
-        "mode": profile.get("mode"),
-        "login": profile.get("login"),
-        "server": profile.get("server"),
-        "terminal_path": profile.get("terminal_path"),
-        "portable": profile.get("portable"),
-        "timeout": profile.get("timeout"),
-    })
+    timeout = int(profile.get("timeout", 12000) or 12000)
+    timeout = max(1000, min(timeout, 15000))
+    profile["timeout"] = timeout
 
     ready, missing = is_profile_ready(profile)
     if not ready:
@@ -524,15 +512,60 @@ def connect_mt5(profile: Dict[str, Any]) -> Tuple[bool, str, Optional[Dict[str, 
     requested_login = profile["login"]
     requested_server = profile["server"]
     password = profile["password"]
+    portable = bool(profile.get("portable", False))
 
-    init_variants = []
+    _log_mt5_event("connect_attempt", {
+        "mode": profile.get("mode"),
+        "login": requested_login,
+        "server": requested_server,
+        "terminal_path": profile.get("terminal_path"),
+        "portable": portable,
+        "timeout": timeout,
+    })
+
+    def _account_matches(account: Any) -> Tuple[bool, Dict[str, Any]]:
+        if account is None:
+            return False, {}
+        info = account._asdict()
+        returned_login = str(info.get("login", "")).strip()
+        # Login is the hard safety check. Server text can vary by broker/terminal,
+        # so do not reject a correct login just because MT5 returns a shortened
+        # or branded server string.
+        return returned_login == requested_login, info
+
+    base_variants: List[Dict[str, Any]] = []
+
+    # Important Live fix:
+    # Some live accounts authorize reliably only when credentials are passed to
+    # initialize(). Demo may appear to work because the terminal is already open
+    # on the demo account. Use this same automatic initialize-with-credentials
+    # method for both Demo and Live.
+    credential_kwargs = {
+        "login": int(requested_login),
+        "password": password,
+        "server": requested_server,
+    }
+
     if profile.get("terminal_path"):
-        init_variants.append({"path": profile["terminal_path"]})
-    init_variants.append({})
+        base_variants.append({"path": profile["terminal_path"], **credential_kwargs})
+    base_variants.append(dict(credential_kwargs))
+
+    if profile.get("terminal_path"):
+        base_variants.append({"path": profile["terminal_path"]})
+    base_variants.append({})
+
+    # De-duplicate variants while preserving order.
+    init_variants: List[Dict[str, Any]] = []
+    seen = set()
+    for variant in base_variants:
+        fingerprint = tuple(sorted((k, str(v)) for k, v in variant.items()))
+        if fingerprint not in seen:
+            seen.add(fingerprint)
+            init_variants.append(variant)
 
     last_err: Any = None
 
-    for attempt in range(1, 3):
+    for attempt in range(1, 4):
         for init_kwargs in init_variants:
             try:
                 mt5.shutdown()
@@ -541,14 +574,14 @@ def connect_mt5(profile: Dict[str, Any]) -> Tuple[bool, str, Optional[Dict[str, 
 
             try:
                 import time
-                time.sleep(0.20 * attempt)
+                time.sleep(0.25 * attempt)
             except Exception:
                 pass
 
             try:
                 ok = mt5.initialize(
                     timeout=timeout,
-                    portable=bool(profile.get("portable", False)),
+                    portable=portable,
                     **init_kwargs,
                 )
             except Exception as exc:
@@ -556,17 +589,34 @@ def connect_mt5(profile: Dict[str, Any]) -> Tuple[bool, str, Optional[Dict[str, 
                 last_err = f"MT5 initialize exception: {exc}"
 
             if not ok:
-                last_err = mt5.last_error()
+                try:
+                    last_err = mt5.last_error()
+                except Exception:
+                    pass
                 _log_mt5_event("connect_failed_initialize_retry", {
                     "mode": profile.get("mode"),
                     "login": requested_login,
                     "server": requested_server,
                     "attempt": attempt,
-                    "init_kwargs": {k: str(v) for k, v in init_kwargs.items()},
+                    "init_kwargs": {k: ("***" if k == "password" else str(v)) for k, v in init_kwargs.items()},
                     "error": last_err,
                 })
                 continue
 
+            # First check whether initialize() already logged into the requested account.
+            account_info = mt5.account_info()
+            matches, info = _account_matches(account_info)
+            if matches:
+                _log_mt5_event("connect_success_initialize", {
+                    "mode": profile.get("mode"),
+                    "requested_login": requested_login,
+                    "requested_server": requested_server,
+                    "returned_login": info.get("login"),
+                    "returned_server": info.get("server"),
+                })
+                return True, f"MT5 connected successfully to {requested_login}.", info
+
+            # If initialize() opened MT5 but not the requested account, force login.
             try:
                 login_ok = mt5.login(
                     int(requested_login),
@@ -578,67 +628,51 @@ def connect_mt5(profile: Dict[str, Any]) -> Tuple[bool, str, Optional[Dict[str, 
                 login_ok = False
                 last_err = f"MT5 login exception: {exc}"
             else:
-                last_err = mt5.last_error()
+                try:
+                    last_err = mt5.last_error()
+                except Exception:
+                    pass
 
             account_info = mt5.account_info()
+            matches, info = _account_matches(account_info)
+            if matches:
+                _log_mt5_event("connect_success_login", {
+                    "mode": profile.get("mode"),
+                    "requested_login": requested_login,
+                    "requested_server": requested_server,
+                    "returned_login": info.get("login"),
+                    "returned_server": info.get("server"),
+                    "login_ok": bool(login_ok),
+                    "login_error": last_err if not login_ok else None,
+                })
+                return True, f"MT5 connected successfully to {requested_login}.", info
 
-            # Accept the correct already-open terminal session. This is the key
-            # Demo/Live fix: never accept the wrong account, but do not fail if
-            # MT5 is already on the requested login and only the second login()
-            # call failed.
             if account_info is not None:
-                info = account_info._asdict()
-                returned_login = str(info.get("login", "")).strip()
-                returned_server = str(info.get("server", "")).strip()
-                if returned_login == requested_login:
-                    _log_mt5_event("connect_success", {
-                        "mode": profile.get("mode"),
-                        "requested_login": requested_login,
-                        "requested_server": requested_server,
-                        "returned_login": returned_login,
-                        "returned_server": returned_server,
-                        "login_ok": bool(login_ok),
-                        "login_error": last_err if not login_ok else None,
-                    })
-                    return True, f"MT5 connected successfully to {requested_login}.", info
-
-            if not login_ok:
+                wrong = account_info._asdict()
+                last_err = (
+                    "MT5 opened a different account than requested. "
+                    f"Requested {requested_login} on {requested_server}, "
+                    f"but terminal returned {wrong.get('login')} on {wrong.get('server')}."
+                )
+                _log_mt5_event("connect_wrong_account_retry", {
+                    "mode": profile.get("mode"),
+                    "requested_login": requested_login,
+                    "requested_server": requested_server,
+                    "returned_login": wrong.get("login"),
+                    "returned_server": wrong.get("server"),
+                    "attempt": attempt,
+                    "login_ok": bool(login_ok),
+                    "error": last_err,
+                })
+            else:
                 _log_mt5_event("connect_failed_login_retry", {
                     "mode": profile.get("mode"),
                     "login": requested_login,
                     "server": requested_server,
                     "attempt": attempt,
+                    "login_ok": bool(login_ok),
                     "error": last_err,
                 })
-                continue
-
-            if account_info is None:
-                last_err = mt5.last_error()
-                _log_mt5_event("connect_failed_account_info_retry", {
-                    "mode": profile.get("mode"),
-                    "login": requested_login,
-                    "server": requested_server,
-                    "attempt": attempt,
-                    "error": last_err,
-                })
-                continue
-
-            info = account_info._asdict()
-            returned_login = str(info.get("login", "")).strip()
-            returned_server = str(info.get("server", "")).strip()
-            last_err = (
-                "MT5 opened a different account than requested. "
-                f"Requested {requested_login} on {requested_server}, "
-                f"but terminal returned {returned_login} on {returned_server}."
-            )
-            _log_mt5_event("connect_wrong_account_retry", {
-                "mode": profile.get("mode"),
-                "requested_login": requested_login,
-                "requested_server": requested_server,
-                "returned_login": returned_login,
-                "returned_server": returned_server,
-                "attempt": attempt,
-            })
 
     try:
         mt5.shutdown()
