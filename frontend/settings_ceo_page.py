@@ -31,6 +31,7 @@ def render_settings_ceo_page(role):
                 token = generate_client_token(name, 1)
                 st.success(f"✅ Generated token for **{name}**")
                 st.code(_token_text(token), language=None)
+                st.caption("Client uses this token as their first-time username, leaves password blank, then creates their own username and password.")
                 st.rerun()
             except Exception as exc:
                 st.error(str(exc))
@@ -61,10 +62,16 @@ def render_settings_ceo_page(role):
         st.markdown('<div class="glass-card muted centered-content">No active client tokens</div>', unsafe_allow_html=True)
     else:
         for user in tokens_page:
-            col1, col2, col3 = st.columns([3, 1, 1])
+            col1, col2, col3, col4 = st.columns([2.6, 1.4, 1, 1])
             with col1:
-                st.markdown(f"**{user['name']}** — `{user['token']}`")
+                st.markdown(f"**{user['name']}**")
+                st.caption(f"Token: `{user['token']}`")
             with col2:
+                if int(user.get("password_set") or 0) == 1:
+                    st.markdown("🔐 *Active login set*")
+                else:
+                    st.markdown("🆕 *First login pending*")
+            with col3:
                 if st.button("❌ Delete", key=f"delete_{user['token']}", use_container_width=True):
                     try:
                         delete_user_by_token(user["token"])
@@ -72,7 +79,7 @@ def render_settings_ceo_page(role):
                         st.rerun()
                     except Exception as exc:
                         st.error(str(exc))
-            with col3:
+            with col4:
                 st.markdown("*Active*")
 
         st.markdown("---")

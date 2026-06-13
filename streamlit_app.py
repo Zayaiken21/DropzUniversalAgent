@@ -91,6 +91,75 @@ st.markdown(
 )
 
 
+def _inject_global_enter_submit():
+    """
+    App-wide Enter/Return support:
+    - Inside Streamlit forms, Enter clicks that form's submit button.
+    - Outside forms, Enter clicks the nearest visible button in the same input block when possible.
+    - Textareas keep normal multiline behavior unless Ctrl/Cmd+Enter is used.
+    """
+    st.markdown(
+        """
+        <script>
+        (function () {
+            if (window.__dropzEnterSubmitInstalled) return;
+            window.__dropzEnterSubmitInstalled = true;
+
+            function isVisible(el) {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            }
+
+            function clickFirstVisibleButton(root) {
+                if (!root) return false;
+                const buttons = Array.from(root.querySelectorAll('button'));
+                for (const btn of buttons) {
+                    if (!btn.disabled && isVisible(btn)) {
+                        btn.click();
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            function findInputBlock(el) {
+                return el.closest('[data-testid="stForm"]')
+                    || el.closest('[data-testid="stVerticalBlock"]')
+                    || el.closest('[data-testid="stHorizontalBlock"]')
+                    || document.body;
+            }
+
+            document.addEventListener('keydown', function (event) {
+                const target = event.target;
+                if (!target) return;
+
+                const tag = (target.tagName || '').toLowerCase();
+                const isTextInput = tag === 'input' || tag === 'select';
+                const isTextarea = tag === 'textarea';
+                if (!isTextInput && !isTextarea) return;
+                if (event.key !== 'Enter' && event.key !== 'NumpadEnter') return;
+
+                // Let regular multiline textareas keep Return. Ctrl/Cmd+Enter submits.
+                if (isTextarea && !(event.ctrlKey || event.metaKey)) return;
+
+                event.preventDefault();
+                event.stopPropagation();
+
+                const form = target.closest('form');
+                if (form && clickFirstVisibleButton(form)) return;
+
+                const block = findInputBlock(target);
+                clickFirstVisibleButton(block);
+            }, true);
+        })();
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _init_state():
     defaults = {
         "authenticated": False,
@@ -194,6 +263,7 @@ def _render_page():
 
 def main():
     _init_state()
+    _inject_global_enter_submit()
 
     # Optional safe debug. Add DEBUG_SECRETS=true in Streamlit secrets only when testing.
     if str(get_secret("DEBUG_SECRETS", "")).lower() == "true":
