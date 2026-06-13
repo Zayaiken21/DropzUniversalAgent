@@ -1,8 +1,8 @@
 import sqlite3
 from contextlib import contextmanager
 from datetime import timedelta
-from .chat_time import iso_utc_now, utc_now
-from .chat_utils import DB_PATH, ensure_dirs
+from chat_backend.chat_time import iso_utc_now, utc_now
+from chat_backend.chat_utils import DB_PATH, ensure_dirs
 
 
 def _conn():
@@ -65,6 +65,11 @@ def init_db():
             status TEXT DEFAULT 'active',
             muted INTEGER DEFAULT 0,
             last_seen TEXT NOT NULL
+        )""")
+        # Track which messages the agent has already replied to (dedup)
+        db.execute("""
+        CREATE TABLE IF NOT EXISTS agent_replied (
+            message_id INTEGER PRIMARY KEY
         )""")
         db.execute("CREATE INDEX IF NOT EXISTS idx_messages_room_id_id ON messages(room_id, id)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_presence_last_seen ON presence(last_seen)")
@@ -192,3 +197,42 @@ def validate_user_token(user_name, token):
     with get_db() as db:
         row = db.execute("SELECT token, active FROM user_tokens WHERE user_name=? LIMIT 1", (user_name,)).fetchone()
         return bool(row and row["active"] == 1 and row["token"] == token)
+
+
+# ── @Agent dedup helpers ──────────────────────────────────────────────────────
+
+def mark_agent_replied(message_id: int) -> None:
+    """Record that the agent already replied to this message_id."""
+    with get_db() as db:
+        db.execute(
+            "INSERT OR IGNORE INTO agent_replied(message_id) VALUES(?)",
+            (int(message_id),),
+        )
+
+
+def has_agent_replied(message_id: int) -> bool:
+    """Return True if the agent has already replied to this message_id."""
+    with get_db() as db:
+        row = db.execute(
+            "SELECT 1 FROM agent_replied WHERE message_id=? LIMIT 1",
+            (int(message_id),),
+        ).fetchone()
+        return row is not None
+
+
+def get_pending_agent_messages(room_id: str = "main") -> list[dict]:
+    """
+    Return messages that contain @Agent and have NOT been replied to yet.
+    """
+    with get_db() as db:
+        rows = db.execute("""
+            SELECT m.id, m.user_name, m.message
+            FROM messages m
+            LEFT JOIN agent_replied a ON a.message_id = m.id
+            WHERE m.room_id = ?
+              AND m.user_name != '@Agent'
+              AND LOWER(m.message) LIKE '%@agent%'
+              AND a.message_id IS NULL
+            ORDER BY m.id ASC
+        """, (room_id,)).fetchall()
+        return [dict(r) for r in rows]

@@ -19,35 +19,34 @@ LICENSE_FILE = APP_DATA_DIR / "license.json"
 
 
 def _secret_or_env(name: str, default: str = "") -> str:
-    value = os.getenv(name)
-    if value not in (None, ""):
-        return str(value).strip()
+    # Streamlit Cloud secrets first, local .env/environment second.
     try:
         import streamlit as st
         value = st.secrets.get(name, "")
         if value not in (None, ""):
-            return str(value).strip()
+            return str(value).strip().strip('"').strip("'")
     except Exception:
         pass
+
+    value = os.getenv(name)
+    if value not in (None, ""):
+        return str(value).strip().strip('"').strip("'")
+
     return default
 
 
 def get_license_endpoint() -> str:
-    # Example:
-    # https://gzondcztcusuwyksoyvp.supabase.co/functions/v1/validate-license
     return _secret_or_env("DROPZ_LICENSE_ENDPOINT", "").rstrip("/")
 
 
 def get_device_id() -> str:
-    raw = "|".join(
-        [
-            platform.node(),
-            platform.system(),
-            platform.machine(),
-            socket.gethostname(),
-            str(uuid.getnode()),
-        ]
-    )
+    raw = "|".join([
+        platform.node(),
+        platform.system(),
+        platform.machine(),
+        socket.gethostname(),
+        str(uuid.getnode()),
+    ])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
@@ -82,18 +81,10 @@ def validate_license(token: str) -> Dict[str, Any]:
     token = str(token or "").strip()
 
     if not endpoint:
-        return {
-            "ok": False,
-            "valid": False,
-            "message": "License endpoint is not configured.",
-        }
+        return {"ok": False, "valid": False, "message": "License endpoint is not configured."}
 
     if not token:
-        return {
-            "ok": False,
-            "valid": False,
-            "message": "License token is required.",
-        }
+        return {"ok": False, "valid": False, "message": "License token is required."}
 
     try:
         response = requests.post(
@@ -118,11 +109,7 @@ def validate_license(token: str) -> Dict[str, Any]:
         return data
 
     except requests.RequestException as exc:
-        return {
-            "ok": False,
-            "valid": False,
-            "message": f"Could not reach license server: {exc}",
-        }
+        return {"ok": False, "valid": False, "message": f"Could not reach license server: {exc}"}
 
 
 def is_license_valid_cached() -> bool:
