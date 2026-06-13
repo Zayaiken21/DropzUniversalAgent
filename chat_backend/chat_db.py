@@ -66,7 +66,6 @@ def init_db():
             muted INTEGER DEFAULT 0,
             last_seen TEXT NOT NULL
         )""")
-        # Track which messages the agent has already replied to (dedup)
         db.execute("""
         CREATE TABLE IF NOT EXISTS agent_replied (
             message_id INTEGER PRIMARY KEY
@@ -88,36 +87,35 @@ def upsert_user(user_name, role="client"):
         """, (user_name, role, now, now))
         db.execute("""
         INSERT INTO presence(user_name, role, status, muted, last_seen)
-        VALUES(?, ?, 'active', COALESCE((SELECT muted FROM users WHERE user_name=?), 0), ?)
+        VALUES(?, ?, 'active', 0, ?)
         ON CONFLICT(user_name) DO UPDATE SET
             role=excluded.role,
             status='active',
+            muted=0,
             last_seen=excluded.last_seen
-        """, (user_name, role, user_name, now))
+        """, (user_name, role, now))
 
 
 def set_user_presence(user_name, role="client", status="active", muted=None):
     now = iso_utc_now()
     with get_db() as db:
-        if muted is None:
-            row = db.execute("SELECT muted FROM users WHERE user_name=?", (user_name,)).fetchone()
-            muted = int(row["muted"]) if row else 0
         db.execute("""
         INSERT INTO presence(user_name, role, status, muted, last_seen)
-        VALUES(?, ?, ?, ?, ?)
+        VALUES(?, ?, ?, 0, ?)
         ON CONFLICT(user_name) DO UPDATE SET
             role=excluded.role,
             status=excluded.status,
-            muted=excluded.muted,
+            muted=0,
             last_seen=excluded.last_seen
-        """, (user_name, role, status, int(muted), now))
+        """, (user_name, role, status, now))
 
 
 def set_user_muted(user_name, muted):
+    # Kept for backward compatibility with older imports. UI no longer uses mute.
     now = iso_utc_now()
     with get_db() as db:
-        db.execute("UPDATE users SET muted=?, updated_at=? WHERE user_name=?", (int(muted), now, user_name))
-        db.execute("UPDATE presence SET muted=?, last_seen=? WHERE user_name=?", (int(muted), now, user_name))
+        db.execute("UPDATE users SET muted=0, updated_at=? WHERE user_name=?", (now, user_name))
+        db.execute("UPDATE presence SET muted=0, last_seen=? WHERE user_name=?", (now, user_name))
 
 
 def add_message(user_name, role, message, media_path=None, media_type=None, room_id="main"):
@@ -153,9 +151,10 @@ def prune_messages(keep=2500):
         DELETE FROM messages
         WHERE id NOT IN (SELECT id FROM messages ORDER BY id DESC LIMIT ?)
         """, (int(keep),))
+        db.execute("DELETE FROM agent_replied WHERE message_id NOT IN (SELECT id FROM messages)")
 
 
-def cleanup_inactive(seconds=30):
+def cleanup_inactive(seconds=60):
     cutoff = (utc_now() - timedelta(seconds=seconds)).isoformat()
     with get_db() as db:
         db.execute("UPDATE presence SET status='offline' WHERE last_seen < ?", (cutoff,))
@@ -199,31 +198,24 @@ def validate_user_token(user_name, token):
         return bool(row and row["active"] == 1 and row["token"] == token)
 
 
-# ── @Agent dedup helpers ──────────────────────────────────────────────────────
+def clear_chat_messages(room_id="main"):
+    with get_db() as db:
+        db.execute("DELETE FROM messages WHERE room_id=?", (room_id,))
+        db.execute("DELETE FROM agent_replied")
+
 
 def mark_agent_replied(message_id: int) -> None:
-    """Record that the agent already replied to this message_id."""
     with get_db() as db:
-        db.execute(
-            "INSERT OR IGNORE INTO agent_replied(message_id) VALUES(?)",
-            (int(message_id),),
-        )
+        db.execute("INSERT OR IGNORE INTO agent_replied(message_id) VALUES(?)", (int(message_id),))
 
 
 def has_agent_replied(message_id: int) -> bool:
-    """Return True if the agent has already replied to this message_id."""
     with get_db() as db:
-        row = db.execute(
-            "SELECT 1 FROM agent_replied WHERE message_id=? LIMIT 1",
-            (int(message_id),),
-        ).fetchone()
+        row = db.execute("SELECT 1 FROM agent_replied WHERE message_id=? LIMIT 1", (int(message_id),)).fetchone()
         return row is not None
 
 
 def get_pending_agent_messages(room_id: str = "main") -> list[dict]:
-    """
-    Return messages that contain @Agent and have NOT been replied to yet.
-    """
     with get_db() as db:
         rows = db.execute("""
             SELECT m.id, m.user_name, m.message
@@ -231,7 +223,7 @@ def get_pending_agent_messages(room_id: str = "main") -> list[dict]:
             LEFT JOIN agent_replied a ON a.message_id = m.id
             WHERE m.room_id = ?
               AND m.user_name != '@Agent'
-              AND LOWER(m.message) LIKE '%@agent%'
+              AND LOWER(COALESCE(m.message, '')) LIKE '%@agent%'
               AND a.message_id IS NULL
             ORDER BY m.id ASC
         """, (room_id,)).fetchall()

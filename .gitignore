@@ -18,6 +18,8 @@ ENV/
 .env
 .env.*
 !.env.example
+ai_api.local.json
+*.local.json
 .streamlit/secrets.toml
 *.secret
 *.token
@@ -30,13 +32,13 @@ ENV/
 build/
 dist/
 *.spec
-DropzUniversalAgent-Windows.zip
-DropzUniversalAgent-macOS.zip
 *.exe
 *.msi
 *.dmg
 *.app/
 *.pkg
+DropzUniversalAgent-Windows.zip
+DropzUniversalAgent-macOS.zip
 
 # Logs and runtime
 logs/
@@ -51,14 +53,22 @@ temp/
 runtime/
 state/
 
-# User/local data
-data/
-!data/.gitkeep
+# Chat runtime data
+Chat_data/
+chat_data/
+media/
+uploads/
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 frontend/dropz.db
 .dropz_universal_agent/
+
+# User/local data
+data/
+!data/.gitkeep
 
 # MT5 / local broker files
 AppData/

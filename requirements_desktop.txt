@@ -23,7 +23,9 @@ lxml
 yfinance
 streamlit>=1.37
 streamlit-autorefresh>=1.0.1
-
+anthropic
+openai
+google-generativeai
 scikit-image
 emoji
 loguru

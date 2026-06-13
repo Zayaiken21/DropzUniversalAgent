@@ -1,22 +1,15 @@
 """
-chat_page.py — TradeSmart Pro Chat
-====================================
-Key improvements over v1:
-  • Smart delta polling — Streamlit auto-refresh only fires when the DB has
-    new messages (compares latest_id). No re-render if nothing changed.
-  • @Agent AI — any message containing @Agent triggers an Anthropic API
-    call. The reply is posted back into the chat as "@Agent" (role=agent).
-    Deduplication via agent_replied table means it only fires once per message.
-  • Pro dark-glass UI with avatar initials, role badges, typing hint, and
-    smooth scroll-to-bottom that survives re-renders without jumping.
-  • No jarring screen flash — the chat iframe is kept stable using a
-    session-state content-hash guard.
+chat_page.py — TradeSmart Pro Chat (stable UI + production fixes)
+==================================================================
+Keeps the original dark-glass chat UI, fixes Streamlit uploader duplicate wording,
+adds Enter/Return send behavior through a single-line message input, removes the
+mute button, adds CEO-only clear chat inside the 3-dot menu, and reduces refresh
+flicker with slower stable polling.
 """
 from __future__ import annotations
 
 import base64
 import hashlib
-import importlib.util
 import sys
 import time
 from html import escape
@@ -26,105 +19,86 @@ import streamlit as st
 import streamlit.components.v1 as components
 from streamlit_autorefresh import st_autorefresh
 
-# ── package-aware imports ────────────────────────────────────────────────────
-# chat_db / chat_media / chat_time live in chat_backend/ and use relative
-# imports (from .chat_utils import ...).  importlib.util.spec_from_file_location
-# strips package context, so those relative imports crash.
-# Fix: ensure chat_backend is registered as a real package in sys.modules
-# BEFORE importing any of its modules, then use a normal absolute import.
 
 def _ensure_package(pkg_name: str, pkg_dir: Path) -> None:
-    """
-    Register pkg_dir as a Python package called pkg_name so that
-    relative imports inside it resolve correctly.
-    Idempotent — safe to call multiple times.
-    """
     if pkg_name in sys.modules:
         return
     if not pkg_dir.is_dir():
         raise ImportError(f"Package directory not found: {pkg_dir}")
-    # Add the *parent* of the package dir to sys.path so
-    # `import pkg_name.module` works normally.
     parent = str(pkg_dir.parent)
     if parent not in sys.path:
         sys.path.insert(0, parent)
-    # Also add the project root if not already there (for chat_agent.py)
-    root_str = str(pkg_dir.parent)
-    if root_str not in sys.path:
-        sys.path.insert(0, root_str)
-    # Force-import the package so sys.modules["chat_backend"] exists
     import importlib
     importlib.import_module(pkg_name)
 
-def _import_backend() -> None:
-    """
-    Register chat_backend as a package and import all backend modules.
-    Returns nothing — populates sys.modules so later `import chat_backend.x`
-    calls work too.
-    """
-    here    = Path(__file__).resolve().parent   # .../frontend/
-    root    = here.parent                        # .../DropzUniversalAgent/
-    backend = root / "chat_backend"
 
-    # Make sure the project root is on sys.path
+def _import_backend() -> None:
+    here = Path(__file__).resolve().parent
+    root = here.parent
+    backend = root / "chat_backend"
     root_str = str(root)
     if root_str not in sys.path:
         sys.path.insert(0, root_str)
-
-    # Also put frontend/ on sys.path so chat_agent.py is importable
     here_str = str(here)
     if here_str not in sys.path:
         sys.path.insert(0, here_str)
-
-    # Register chat_backend as a package (handles __init__.py presence/absence)
     _ensure_package("chat_backend", backend)
+
 
 try:
     _import_backend()
-    from chat_backend.chat_db    import (
-        init_db, upsert_user, set_user_presence, set_user_muted,
-        add_message, get_messages, get_latest_message_id, prune_messages,
-        cleanup_inactive, get_active_users, get_online_count,
-        get_pending_agent_messages, mark_agent_replied, has_agent_replied,
+    from chat_backend.chat_db import (
+        init_db,
+        upsert_user,
+        set_user_presence,
+        add_message,
+        get_messages,
+        get_latest_message_id,
+        prune_messages,
+        cleanup_inactive,
+        get_active_users,
+        get_online_count,
+        get_pending_agent_messages,
+        mark_agent_replied,
+        has_agent_replied,
+        clear_chat_messages,
     )
     from chat_backend.chat_media import save_upload
-    from chat_backend.chat_time  import to_est_label
-    from chat_agent              import call_agent, AGENT_USER, AGENT_ROLE
-    _AGENT_OK = True
+    from chat_backend.chat_time import to_est_label
+    from chat_agent import call_agent, AGENT_USER, AGENT_ROLE
 except Exception as _imp_err:
     st.error(f"Chat import error: {_imp_err}")
-    _AGENT_OK = False
     raise
-
-
 
 try:
     from frontend.style_loader import load_theme_css
 except Exception:
-    def load_theme_css(): return None
+    def load_theme_css():
+        return None
 
-# ── constants ─────────────────────────────────────────────────────────────────
+
 MAX_IMAGE_PREVIEW_MB = 25
 MAX_VIDEO_PREVIEW_MB = 18
 MAX_VISIBLE_MESSAGES = 90
-REFRESH_MS           = 2800   # poll interval — slower = less flash, still live
-PRESENCE_INTERVAL_S  = 6      # how often to ping presence
-ROOM_ID              = "main"
+REFRESH_MS = 12000          # slower polling prevents flicker/seizure-like refresh
+PRESENCE_INTERVAL_S = 18    # do not write presence every rerun
+ROOM_ID = "main"
 
-# Avatar palette — assigned by username hash
 _AVATAR_COLORS = [
     "#1e6fff", "#00c49a", "#ff6b35", "#9b5cff",
     "#ff3d8a", "#00bcd4", "#f4c542", "#4caf50",
 ]
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
-
 def _rerun():
     if hasattr(st, "rerun"):
         st.rerun()
     else:
         st.experimental_rerun()
+
+
+def _is_ceo_role(role: str) -> bool:
+    return str(role or "").strip().lower() in {"ceo", "owner", "admin", "superadmin"}
 
 
 def _file_size_mb(path) -> float:
@@ -147,8 +121,6 @@ def _avatar_initials(name: str) -> str:
 
 
 def _status_icon(member: dict) -> str:
-    if int(member.get("muted") or 0) == 1:
-        return "🔇"
     if member.get("status") == "idle":
         return "🟡"
     return "🟢"
@@ -156,14 +128,14 @@ def _status_icon(member: dict) -> str:
 
 def _role_badge_color(role: str) -> str:
     return {
-        "admin":   "#ff6b35",
-        "agent":   "#9b5cff",
+        "ceo": "#ff6b35",
+        "owner": "#ff6b35",
+        "admin": "#ff6b35",
+        "agent": "#9b5cff",
         "analyst": "#00c49a",
-        "client":  "#1e6fff",
-    }.get(role.lower(), "#576b99")
+        "client": "#1e6fff",
+    }.get(str(role).lower(), "#576b99")
 
-
-# ── media HTML ────────────────────────────────────────────────────────────────
 
 def _media_html(msg: dict) -> str:
     media_path = msg.get("media_path")
@@ -171,7 +143,7 @@ def _media_html(msg: dict) -> str:
     if not media_path:
         return ""
 
-    path     = Path(media_path)
+    path = Path(media_path)
     filename = escape(path.name)
 
     if not path.exists():
@@ -228,51 +200,38 @@ def _media_html(msg: dict) -> str:
     return f"<div class='attachment-chip'>📎 {filename}</div>"
 
 
-# ── chat HTML builder ─────────────────────────────────────────────────────────
-
 def _build_chat_html(messages: list[dict], current_user: str) -> str:
     bubbles = []
     for msg in messages[-MAX_VISIBLE_MESSAGES:]:
-        is_me       = msg.get("user_name") == current_user
-        is_agent    = msg.get("user_name") == AGENT_USER
-        user_name   = str(msg.get("user_name") or "User")
-        role        = str(msg.get("role") or "client")
-        created_at  = to_est_label(str(msg.get("created_at") or ""))
-        text_raw    = str(msg.get("message") or "")
-        text        = escape(text_raw).replace("\n", "<br>")
-        media       = _media_html(msg)
+        is_me = msg.get("user_name") == current_user
+        is_agent = msg.get("user_name") == AGENT_USER
+        user_name = str(msg.get("user_name") or "User")
+        role = str(msg.get("role") or "client")
+        created_at = to_est_label(str(msg.get("created_at") or ""))
+        text_raw = str(msg.get("message") or "")
+        text = escape(text_raw).replace("\n", "<br>")
+        media = _media_html(msg)
 
-        side_cls    = "is-me" if is_me else ("is-agent" if is_agent else "is-other")
-        av_color    = "#9b5cff" if is_agent else _avatar_color(user_name)
+        side_cls = "is-me" if is_me else ("is-agent" if is_agent else "is-other")
+        av_color = "#9b5cff" if is_agent else _avatar_color(user_name)
         av_initials = "AI" if is_agent else _avatar_initials(user_name)
         badge_color = _role_badge_color(role)
         display_name = escape(user_name)
-        role_label   = escape(role)
+        role_label = escape(role)
 
-        avatar_html = (
-            f'<div class="msg-avatar" style="background:{av_color}">'
-            f'{escape(av_initials)}</div>'
-        )
+        avatar_html = f'<div class="msg-avatar" style="background:{av_color}">{escape(av_initials)}</div>'
         meta_html = (
             f'<div class="msg-meta">'
             f'<span class="msg-user">{display_name}</span>'
-            f'<span class="msg-badge" style="background:{badge_color}22;color:{badge_color};border:1px solid {badge_color}44">'
-            f'{role_label}</span>'
+            f'<span class="msg-badge" style="background:{badge_color}22;color:{badge_color};border:1px solid {badge_color}44">{role_label}</span>'
             f'<span class="msg-time">{escape(created_at)}</span>'
             f'</div>'
         )
-
         text_block = f'<div class="msg-text">{text}</div>' if text else ""
-        left_av    = "" if is_me else avatar_html
-        right_av   = avatar_html if is_me else ""
         bubbles.append(
             f'<div class="msg-row {side_cls}">'
             f'{"" if is_me else avatar_html}'
-            f'<div class="msg-bubble">'
-            f'{meta_html}'
-            f'{text_block}'
-            f'{media}'
-            f'</div>'
+            f'<div class="msg-bubble">{meta_html}{text_block}{media}</div>'
             f'{avatar_html if is_me else ""}'
             f'</div>'
         )
@@ -296,33 +255,24 @@ def _build_chat_html(messages: list[dict], current_user: str) -> str:
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 html,body{{height:100%;background:transparent;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;overflow:hidden}}
-/* frame */
 .chat-frame{{position:relative;height:500px;border-radius:26px;overflow:hidden;background:radial-gradient(ellipse at 10% 5%,rgba(0,212,255,.16),transparent 30%),radial-gradient(ellipse at 90% 90%,rgba(100,60,255,.12),transparent 28%),linear-gradient(180deg,rgba(10,22,42,.95),rgba(4,12,26,.98));border:1px solid rgba(0,212,255,.16);box-shadow:0 24px 72px rgba(0,0,0,.40),inset 0 1px 0 rgba(255,255,255,.06)}}
-/* scroll */
-.chat-scroll{{height:100%;overflow-y:auto;padding:20px 16px;scroll-behavior:smooth;opacity:0;transition:opacity .15s ease}}
-.chat-scroll.ready{{opacity:1}}
+.chat-scroll{{height:100%;overflow-y:auto;padding:20px 16px;scroll-behavior:auto;opacity:1}}
 .chat-scroll::-webkit-scrollbar{{width:5px}}
 .chat-scroll::-webkit-scrollbar-track{{background:transparent}}
 .chat-scroll::-webkit-scrollbar-thumb{{background:rgba(0,212,255,.22);border-radius:999px}}
-/* rows */
 .msg-row{{display:flex;align-items:flex-end;gap:8px;margin-bottom:14px}}
 .msg-row.is-me{{flex-direction:row-reverse}}
 .msg-row.is-agent{{flex-direction:row}}
-/* avatar */
 .msg-avatar{{width:32px;height:32px;border-radius:999px;display:flex;align-items:center;justify-content:center;font-size:.60rem;font-weight:900;letter-spacing:.03em;color:#fff;flex-shrink:0;box-shadow:0 4px 14px rgba(0,0,0,.28)}}
-/* bubble */
 .msg-bubble{{max-width:72%;padding:11px 14px;border-radius:20px;border:1px solid rgba(255,255,255,.10);box-shadow:0 8px 26px rgba(0,0,0,.20);word-break:break-word}}
 .is-me .msg-bubble{{background:linear-gradient(135deg,rgba(0,180,255,.30),rgba(0,90,210,.28));border-color:rgba(0,212,255,.24);border-bottom-right-radius:6px}}
 .is-other .msg-bubble{{background:linear-gradient(135deg,rgba(255,255,255,.10),rgba(255,255,255,.06));border-bottom-left-radius:6px}}
 .is-agent .msg-bubble{{background:linear-gradient(135deg,rgba(140,80,255,.22),rgba(80,40,200,.20));border-color:rgba(155,92,255,.28);border-bottom-left-radius:6px}}
-/* meta */
 .msg-meta{{display:flex;align-items:center;gap:6px;margin-bottom:5px;flex-wrap:wrap}}
 .msg-user{{font-size:.68rem;font-weight:800;color:rgba(200,230,255,.92);letter-spacing:.02em}}
 .msg-badge{{font-size:.56rem;font-weight:700;padding:1px 7px;border-radius:999px;letter-spacing:.06em;text-transform:uppercase}}
 .msg-time{{font-size:.60rem;color:rgba(140,180,220,.52);margin-left:auto}}
-/* text */
 .msg-text{{font-size:.875rem;color:rgba(235,248,255,.94);line-height:1.58;font-weight:400}}
-/* media */
 .media-card{{margin-top:8px;border-radius:14px;overflow:hidden;background:rgba(4,18,36,.68);border:1px solid rgba(0,212,255,.14)}}
 .voice-card{{padding:10px;background:rgba(0,212,255,.10)}}
 .voice-title{{font-size:.70rem;font-weight:700;color:rgba(0,212,255,.88);margin-bottom:6px}}
@@ -333,16 +283,12 @@ html,body{{height:100%;background:transparent;font-family:-apple-system,BlinkMac
 .preview-link:hover,.download-link:hover{{background:rgba(0,212,255,.22)}}
 .attachment-chip{{display:inline-block;font-size:.74rem;padding:5px 11px;background:rgba(0,212,255,.10);border:1px solid rgba(0,212,255,.22);border-radius:999px;color:rgba(180,220,255,.82);margin-top:7px}}
 .attachment-note{{font-size:.66rem;color:rgba(140,180,220,.54);margin-top:4px}}
-/* empty */
 .empty-chat{{display:flex;flex-direction:column;align-items:center;justify-content:center;height:85%;gap:10px;text-align:center;padding:20px}}
 .empty-icon{{font-size:2.4rem;opacity:.55}}
 .empty-title{{font-size:1rem;font-weight:700;color:rgba(180,210,255,.72)}}
 .empty-sub{{font-size:.78rem;color:rgba(120,160,210,.50);max-width:300px;line-height:1.5}}
 .agent-hint{{font-size:.74rem;color:rgba(155,92,255,.72);margin-top:6px;padding:6px 14px;border-radius:999px;border:1px solid rgba(155,92,255,.22);background:rgba(155,92,255,.08)}}
-/* jump */
-.jump-btn{{position:absolute;bottom:14px;right:14px;background:rgba(0,212,255,.88);color:#fff;border:none;border-radius:999px;padding:7px 14px;font-size:.72rem;font-weight:800;cursor:pointer;box-shadow:0 6px 20px rgba(0,140,200,.30);transition:opacity .2s;display:none;z-index:10}}
-.jump-btn:hover{{filter:brightness(1.1)}}
-/* overlay */
+.jump-btn{{position:absolute;bottom:14px;right:14px;background:rgba(0,212,255,.88);color:#fff;border:none;border-radius:999px;padding:7px 14px;font-size:.72rem;font-weight:800;cursor:pointer;box-shadow:0 6px 20px rgba(0,140,200,.30);display:none;z-index:10}}
 .overlay{{position:fixed;inset:0;background:rgba(0,0,0,.92);display:none;align-items:center;justify-content:center;z-index:999;cursor:pointer}}
 .overlay.active{{display:flex}}
 .overlay img,.overlay video{{max-width:92vw;max-height:88vh;border-radius:16px;object-fit:contain;cursor:default;box-shadow:0 0 80px rgba(0,212,255,.18)}}
@@ -351,14 +297,10 @@ html,body{{height:100%;background:transparent;font-family:-apple-system,BlinkMac
 <body>
 <div class="overlay" id="overlay">
   <img id="previewImage" style="display:none" alt="preview"/>
-  <video id="previewVideo" style="display:none" controls playsinline>
-    <source id="previewVideoSource" src="" type=""/>
-  </video>
+  <video id="previewVideo" style="display:none" controls playsinline><source id="previewVideoSource" src="" type=""/></video>
 </div>
 <div class="chat-frame">
-  <div class="chat-scroll" id="chatScroll">
-    {body}
-  </div>
+  <div class="chat-scroll" id="chatScroll">{body}</div>
   <button class="jump-btn" id="jumpBtn" onclick="scrollToBottom()">↓ New messages</button>
 </div>
 <script>
@@ -368,18 +310,10 @@ const overlay=document.getElementById("overlay");
 const previewImage=document.getElementById("previewImage");
 const previewVideo=document.getElementById("previewVideo");
 const previewVideoSource=document.getElementById("previewVideoSource");
-let userScrolled=false;
-function isAtBottom(){{return chatScroll.scrollHeight-chatScroll.scrollTop-chatScroll.clientHeight<60;}}
-function scrollToBottom(){{chatScroll.scrollTop=chatScroll.scrollHeight;userScrolled=false;jumpBtn.style.display="none";}}
-function updateJumpBtn(){{jumpBtn.style.display=(!isAtBottom())?"block":"none";}}
-chatScroll.addEventListener("scroll",()=>{{userScrolled=!isAtBottom();updateJumpBtn();}});
-requestAnimationFrame(()=>{{
-  const was=sessionStorage.getItem("ts_chat_scrolled")==="true";
-  if(!was)scrollToBottom();
-  chatScroll.classList.add("ready");
-  updateJumpBtn();
-}});
-window.addEventListener("beforeunload",()=>{{sessionStorage.setItem("ts_chat_scrolled",String(userScrolled));}});
+function isAtBottom(){{return chatScroll.scrollHeight-chatScroll.scrollTop-chatScroll.clientHeight<80;}}
+function scrollToBottom(){{chatScroll.scrollTop=chatScroll.scrollHeight;jumpBtn.style.display="none";}}
+chatScroll.addEventListener("scroll",()=>{{jumpBtn.style.display=(!isAtBottom())?"block":"none";}});
+requestAnimationFrame(()=>{{scrollToBottom();}});
 function openImagePreview(src){{previewVideo.style.display="none";previewImage.src=src;previewImage.style.display="block";overlay.classList.add("active");}}
 function openVideoPreview(src,type){{previewImage.style.display="none";previewVideoSource.src=src;previewVideoSource.type=type;previewVideo.load();previewVideo.style.display="block";overlay.classList.add("active");}}
 function closePreview(){{overlay.classList.remove("active");previewImage.src="";previewVideo.pause();previewVideoSource.src="";previewVideo.load();previewImage.style.display="none";previewVideo.style.display="none";}}
@@ -390,15 +324,12 @@ document.addEventListener("keydown",e=>{{if(e.key==="Escape")closePreview();}});
 </html>"""
 
 
-# ── CSS injection ─────────────────────────────────────────────────────────────
-
 def _inject_shell_css():
     st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
     * { font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif !important; }
 
-    /* outer shell */
     .ts-chat-shell {
         padding: 0;
         border-radius: 28px;
@@ -408,8 +339,6 @@ def _inject_shell_css():
         box-shadow: 0 28px 88px rgba(0,0,0,.32), inset 0 1px 0 rgba(255,255,255,.05);
         overflow: hidden;
     }
-
-    /* header bar */
     .ts-chat-header {
         display: flex;
         align-items: center;
@@ -418,173 +347,102 @@ def _inject_shell_css():
         border-bottom: 1px solid rgba(0,212,255,.10);
         background: rgba(4, 14, 30, 0.70);
     }
-    .ts-chat-header h2 {
-        margin: 0;
-        font-size: 1.15rem;
-        font-weight: 800;
-        color: #e8f4ff;
-        letter-spacing: .02em;
-    }
-    .ts-chat-sub {
-        font-size: .68rem;
-        color: rgba(120,170,220,.56);
-        margin-top: 3px;
-        font-weight: 500;
-    }
-
-    /* live pill */
-    .live-pill {
-        display: inline-flex;
-        align-items: center;
-        gap: 7px;
-        padding: 6px 12px;
-        border-radius: 999px;
-        background: rgba(0,230,118,.10);
-        border: 1px solid rgba(0,230,118,.22);
-        font-size: .72rem;
-        font-weight: 800;
-        color: rgba(0,230,118,.92);
-        letter-spacing: .06em;
-        white-space: nowrap;
-    }
-    @keyframes pulse-glow {
-        0%,100% { box-shadow: 0 0 0 0 rgba(0,230,118,.55); }
-        50%      { box-shadow: 0 0 0 5px rgba(0,230,118,0); }
-    }
-    .pulse-dot {
-        width: 8px; height: 8px;
-        border-radius: 999px;
-        background: #00e676;
-        animation: pulse-glow 1.8s ease infinite;
-    }
-
-    /* agent hint pill */
-    .agent-pill {
-        display: inline-flex;
-        align-items: center;
-        gap: 5px;
-        padding: 3px 10px;
-        border-radius: 999px;
-        background: rgba(155,92,255,.10);
-        border: 1px solid rgba(155,92,255,.24);
-        font-size: .64rem;
-        font-weight: 700;
-        color: rgba(180,140,255,.82);
-        margin-top: 4px;
-    }
-
-    /* member list items */
-    .ts-member {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 5px 0;
-        border-bottom: 1px solid rgba(0,212,255,.07);
-        font-size: .76rem;
-        color: rgba(180,210,255,.80);
-    }
+    .ts-chat-header h2 { margin: 0; font-size: 1.15rem; font-weight: 800; color: #e8f4ff; letter-spacing: .02em; }
+    .ts-chat-sub { font-size: .68rem; color: rgba(120,170,220,.56); margin-top: 3px; font-weight: 500; }
+    .live-pill { display: inline-flex; align-items: center; gap: 7px; padding: 6px 12px; border-radius: 999px; background: rgba(0,230,118,.10); border: 1px solid rgba(0,230,118,.22); font-size: .72rem; font-weight: 800; color: rgba(0,230,118,.92); letter-spacing: .06em; white-space: nowrap; }
+    .pulse-dot { width: 8px; height: 8px; border-radius: 999px; background: #00e676; }
+    .agent-pill { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 999px; background: rgba(155,92,255,.10); border: 1px solid rgba(155,92,255,.24); font-size: .64rem; font-weight: 700; color: rgba(180,140,255,.82); margin-top: 4px; }
+    .ts-member { display: flex; align-items: center; gap: 8px; padding: 5px 0; border-bottom: 1px solid rgba(0,212,255,.07); font-size: .76rem; color: rgba(180,210,255,.80); }
     .ts-member:last-child { border-bottom: none; }
-    .ts-member-av {
-        width: 26px; height: 26px;
-        border-radius: 999px;
-        display: flex; align-items: center; justify-content: center;
-        font-size: .56rem; font-weight: 900; color: #fff;
-        flex-shrink: 0;
-    }
+    .ts-member-av { width: 26px; height: 26px; border-radius: 999px; display: flex; align-items: center; justify-content: center; font-size: .56rem; font-weight: 900; color: #fff; flex-shrink: 0; }
     .ts-member-name { font-weight: 700; color: rgba(220,240,255,.88); }
-    .ts-member-role {
-        font-size: .58rem; font-weight: 700; padding: 1px 6px;
-        border-radius: 999px; margin-left: 4px;
-        background: rgba(30,111,255,.16); color: rgba(100,170,255,.82);
-        border: 1px solid rgba(30,111,255,.22);
-    }
+    .ts-member-role { font-size: .58rem; font-weight: 700; padding: 1px 6px; border-radius: 999px; margin-left: 4px; background: rgba(30,111,255,.16); color: rgba(100,170,255,.82); border: 1px solid rgba(30,111,255,.22); }
+    .clear-chat-danger button { background: rgba(255,80,80,.18) !important; border: 1px solid rgba(255,80,80,.35) !important; color: #ffd4d4 !important; }
 
-    /* hide Streamlit chrome */
-    div[data-testid="stFileUploader"] label { display: none !important; }
-    div[data-testid="stFileUploader"] section { padding: 6px !important; }
+    /* Upload duplicate-wording fix. Keep the button, hide labels/instruction text. */
+    div[data-testid="stFileUploader"] label,
+    div[data-testid="stFileUploader"] small,
+    div[data-testid="stFileUploader"] [data-testid="stMarkdownContainer"],
+    div[data-testid="stFileUploader"] section > div:first-child:not(:has(button)) {
+        display: none !important;
+    }
+    div[data-testid="stFileUploader"] section {
+        padding: 0 !important;
+        border: 0 !important;
+        background: transparent !important;
+    }
+    div[data-testid="stFileUploader"] button {
+        width: 100% !important;
+        border-radius: 14px !important;
+        min-height: 42px !important;
+    }
+    div[data-testid="stTextInput"] input {
+        min-height: 52px !important;
+        border-radius: 16px !important;
+        font-weight: 600 !important;
+    }
     </style>
     """, unsafe_allow_html=True)
 
 
-# ── @Agent processing ─────────────────────────────────────────────────────────
-
 def _process_agent_messages():
-    """Check for unhandled @Agent messages and post AI replies."""
     pending = get_pending_agent_messages(room_id=ROOM_ID)
     for row in pending:
-        msg_id    = row["id"]
+        msg_id = row["id"]
         user_name = row["user_name"]
-        message   = row["message"] or ""
+        message = row["message"] or ""
         if has_agent_replied(msg_id):
             continue
-        # Mark before calling so re-renders during the API call don't double-post
         mark_agent_replied(msg_id)
         reply = call_agent(user_name, message)
         add_message(AGENT_USER, AGENT_ROLE, reply, room_id=ROOM_ID)
 
 
-# ── main render ───────────────────────────────────────────────────────────────
-
 def render_frontend_chat_page(voice_note=None):
     load_theme_css()
     _inject_shell_css()
 
-    # Session state defaults
-    st.session_state.setdefault("chat_muted", False)
     st.session_state.setdefault("chat_menu_open", False)
     st.session_state.setdefault("last_voice_note_sig", None)
     st.session_state.setdefault("chat_last_presence_ping", 0.0)
-    st.session_state.setdefault("chat_last_seen_id", 0)
     st.session_state.setdefault("chat_html_hash", "")
+    st.session_state.setdefault("chat_clear_confirm", False)
 
-    # ── smart auto-refresh ────────────────────────────────────────────────────
-    # Always schedule the timer, but we only actually update the rendered HTML
-    # when the message ID has changed — this kills the jarring flash.
-    st_autorefresh(interval=REFRESH_MS, key="ts_chat_autorefresh")
+    # Stable live polling. This is intentionally slow to avoid flicker/seizure-like reruns.
+    st_autorefresh(interval=REFRESH_MS, key="ts_chat_stable_refresh")
 
-    # ── DB bootstrap ──────────────────────────────────────────────────────────
     init_db()
-    cleanup_inactive(seconds=35)
+    cleanup_inactive(seconds=60)
     prune_messages()
 
-    # ── user identity ─────────────────────────────────────────────────────────
-    user      = st.session_state.get("user", {}) or {}
+    user = st.session_state.get("user", {}) or {}
     user_name = str(user.get("name") or user.get("username") or "Guest").strip() or "Guest"
-    role      = str(user.get("role") or "client").strip() or "client"
+    role = str(user.get("role") or "client").strip() or "client"
+    is_ceo = _is_ceo_role(role)
 
     upsert_user(user_name, role)
     now_ts = time.time()
     if now_ts - float(st.session_state.chat_last_presence_ping or 0) >= PRESENCE_INTERVAL_S:
-        set_user_presence(user_name, role=role, status="active",
-                          muted=int(st.session_state.chat_muted))
+        set_user_presence(user_name, role=role, status="active", muted=0)
         st.session_state.chat_last_presence_ping = now_ts
 
-    # ── @Agent: process any pending questions ─────────────────────────────────
     _process_agent_messages()
 
-    # ── fetch data ────────────────────────────────────────────────────────────
     online_count = get_online_count()
     active_users = get_active_users()
-    messages     = get_messages(room_id=ROOM_ID, limit=MAX_VISIBLE_MESSAGES)
-    latest_id    = get_latest_message_id(room_id=ROOM_ID)
+    messages = get_messages(room_id=ROOM_ID, limit=MAX_VISIBLE_MESSAGES)
 
-    # ── OUTER SHELL ───────────────────────────────────────────────────────────
     st.markdown('<div class="ts-chat-shell">', unsafe_allow_html=True)
-
-    # Header
     st.markdown(
         f'<div class="ts-chat-header">'
-        f'<div>'
-        f'<h2>💬 Operations Chat</h2>'
-        f'<div class="ts-chat-sub">Live · SQLite-backed · no websocket</div>'
-        f'<div class="agent-pill">🤖 @Agent available — mention it to ask the AI</div>'
-        f'</div>'
+        f'<div><h2>💬 Operations Chat</h2>'
+        f'<div class="ts-chat-sub">Live · SQLite-backed · stable polling</div>'
+        f'<div class="agent-pill">🤖 @Agent available — mention it to ask the AI</div></div>'
         f'<div class="live-pill"><span class="pulse-dot"></span>{online_count} online</div>'
         f'</div>',
         unsafe_allow_html=True,
     )
 
-    # Active users row + menu toggle
     top_l, top_r = st.columns([8, 1])
     with top_l:
         names_preview = [str(u.get("name") or "User") for u in active_users[:5]]
@@ -596,102 +454,100 @@ def render_frontend_chat_page(voice_note=None):
             st.session_state.chat_menu_open = not st.session_state.chat_menu_open
             _rerun()
 
-    # Slide-out member panel
     if st.session_state.chat_menu_open:
         with st.container(border=True):
-            mc1, mc2 = st.columns([1.1, 2.8])
-            with mc1:
-                mute_lbl = "🔊 Unmute" if st.session_state.chat_muted else "🔇 Mute me"
-                if st.button(mute_lbl, key="chat_mute_toggle"):
-                    st.session_state.chat_muted = not st.session_state.chat_muted
-                    set_user_muted(user_name, int(st.session_state.chat_muted))
-                    set_user_presence(user_name, role=role,
-                                      muted=int(st.session_state.chat_muted))
-                    _rerun()
-            with mc2:
-                st.caption("Members online")
-                members_html = ""
-                for m in active_users[:20]:
-                    mname = str(m.get("name") or "User")
-                    mrole = str(m.get("role") or "client")
-                    av_c  = _avatar_color(mname)
-                    av_i  = _avatar_initials(mname)
-                    icon  = _status_icon(m)
-                    members_html += (
-                        f'<div class="ts-member">'
-                        f'<div class="ts-member-av" style="background:{av_c}">{escape(av_i)}</div>'
-                        f'<span class="ts-member-name">{escape(mname)}</span>'
-                        f'<span class="ts-member-role">{escape(mrole)}</span>'
-                        f'<span style="margin-left:auto">{icon}</span>'
-                        f'</div>'
-                    )
-                if not members_html:
-                    members_html = '<div class="ts-member" style="color:rgba(120,160,200,.5)">No active users yet.</div>'
-                st.markdown(members_html, unsafe_allow_html=True)
+            st.caption("Members online")
+            members_html = ""
+            for m in active_users[:20]:
+                mname = str(m.get("name") or "User")
+                mrole = str(m.get("role") or "client")
+                av_c = _avatar_color(mname)
+                av_i = _avatar_initials(mname)
+                icon = _status_icon(m)
+                members_html += (
+                    f'<div class="ts-member">'
+                    f'<div class="ts-member-av" style="background:{av_c}">{escape(av_i)}</div>'
+                    f'<span class="ts-member-name">{escape(mname)}</span>'
+                    f'<span class="ts-member-role">{escape(mrole)}</span>'
+                    f'<span style="margin-left:auto">{icon}</span>'
+                    f'</div>'
+                )
+            if not members_html:
+                members_html = '<div class="ts-member" style="color:rgba(120,160,200,.5)">No active users yet.</div>'
+            st.markdown(members_html, unsafe_allow_html=True)
 
-    # ── Chat iframe ───────────────────────────────────────────────────────────
-    # Only rebuild the HTML if content actually changed — avoids scroll reset
+            if is_ceo:
+                st.divider()
+                if not st.session_state.chat_clear_confirm:
+                    st.markdown('<div class="clear-chat-danger">', unsafe_allow_html=True)
+                    if st.button("Clear full chat", key="chat_clear_start", use_container_width=True):
+                        st.session_state.chat_clear_confirm = True
+                        _rerun()
+                    st.markdown('</div>', unsafe_allow_html=True)
+                else:
+                    st.warning("This will permanently clear all chat messages in this room.")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.markdown('<div class="clear-chat-danger">', unsafe_allow_html=True)
+                        if st.button("Yes, clear chat", key="chat_clear_confirm_yes", use_container_width=True):
+                            clear_chat_messages(room_id=ROOM_ID)
+                            st.session_state.chat_clear_confirm = False
+                            st.session_state.chat_menu_open = False
+                            _rerun()
+                        st.markdown('</div>', unsafe_allow_html=True)
+                    with c2:
+                        if st.button("Cancel", key="chat_clear_cancel", use_container_width=True):
+                            st.session_state.chat_clear_confirm = False
+                            _rerun()
+
     chat_html = _build_chat_html(messages, user_name)
-    content_hash = hashlib.md5(chat_html.encode()).hexdigest()
-    if content_hash != st.session_state.chat_html_hash:
-        st.session_state.chat_html_hash = content_hash
-        st.session_state.chat_last_seen_id = latest_id
-        components.html(chat_html, height=520, scrolling=False)
-    else:
-        # Re-render the same iframe silently (no visual change)
-        components.html(chat_html, height=520, scrolling=False)
+    components.html(chat_html, height=520, scrolling=False)
 
-    # ── Message compose form ──────────────────────────────────────────────────
+    # Single-line input allows Enter/Return to submit on laptop and phone.
     with st.form("ts_chat_form", clear_on_submit=True):
-        message = st.text_area(
+        message = st.text_input(
             "Message",
             placeholder="Type a message… or use @Agent to ask the AI assistant",
             label_visibility="collapsed",
-            height=78,
+            key="ts_chat_message_input",
         )
         fc1, fc2, fc3 = st.columns([1.15, 1.05, 1.45])
         with fc1:
             upload = st.file_uploader(
-                "Attach",
-                type=["png","jpg","jpeg","webp","gif","mp4","mov","webm",
-                      "wav","mp3","m4a","pdf","txt","csv","docx","xlsx"],
+                "Upload file",
+                type=["png", "jpg", "jpeg", "webp", "gif", "mp4", "mov", "webm",
+                      "wav", "mp3", "m4a", "pdf", "txt", "csv", "docx", "xlsx"],
                 label_visibility="collapsed",
+                key="ts_chat_upload",
             )
         with fc2:
-            voice_rec = st.audio_input("Voice", label_visibility="collapsed")
+            voice_rec = st.audio_input("Voice", label_visibility="collapsed", key="ts_chat_voice")
         with fc3:
-            send = st.form_submit_button("Send  ↑", use_container_width=True)
+            send = st.form_submit_button("Send ↑", use_container_width=True)
 
         if send:
-            text       = (message or "").strip()
+            text = (message or "").strip()
             media_path = None
             media_type = None
 
-            # File attachment
             if upload is not None:
                 try:
-                    media_path, media_type = save_upload(
-                        upload, prefix=user_name.replace(" ", "_")
-                    )
+                    media_path, media_type = save_upload(upload, prefix=user_name.replace(" ", "_"))
                 except Exception as exc:
                     st.error(f"Upload failed: {exc}")
                     st.stop()
 
-            # Voice note
             if voice_rec is not None:
                 vbytes = voice_rec.getvalue()
-                vsig   = hashlib.sha256(vbytes).hexdigest()
+                vsig = hashlib.sha256(vbytes).hexdigest()
                 if st.session_state.last_voice_note_sig != vsig:
                     st.session_state.last_voice_note_sig = vsig
                     try:
-                        media_path, media_type = save_upload(
-                            voice_rec,
-                            prefix=f"voice_{user_name.replace(' ', '_')}"
-                        )
+                        media_path, media_type = save_upload(voice_rec, prefix=f"voice_{user_name.replace(' ', '_')}")
                     except Exception:
                         from chat_backend.chat_utils import MEDIA_DIR, ensure_dirs
                         ensure_dirs()
-                        vp = MEDIA_DIR / f"voice_{user_name.replace(' ','_')}_{int(time.time()*1000)}.wav"
+                        vp = MEDIA_DIR / f"voice_{user_name.replace(' ', '_')}_{int(time.time()*1000)}.wav"
                         vp.write_bytes(vbytes)
                         media_path, media_type = str(vp), "audio/wav"
                     if not text:
@@ -699,9 +555,7 @@ def render_frontend_chat_page(voice_note=None):
 
             if text or media_path:
                 add_message(user_name, role, text, media_path, media_type, ROOM_ID)
-                set_user_presence(user_name, role=role, status="active",
-                                  muted=int(st.session_state.chat_muted))
-                st.toast("Sent ✓", icon="✅")
+                set_user_presence(user_name, role=role, status="active", muted=0)
                 _rerun()
             else:
                 st.warning("Type a message or attach a file first.")

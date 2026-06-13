@@ -657,6 +657,94 @@ def set_client_profile(
     _raise_supabase_error("set username and password", response=response)
 
 
+
+def reset_client_username_with_token(token: str, new_username: str) -> Dict[str, Any]:
+    """
+    Username reset using the original client access code.
+    The password is unchanged. The original token remains the permanent license key.
+    """
+    _require_supabase()
+    token = _normalize_token(token)
+    new_username = _normalize_username(new_username)
+
+    ok, msg = _validate_username(new_username)
+    if not ok:
+        raise RuntimeError(msg)
+
+    user = _select_client_by_token(token, include_password=False)
+    if not user:
+        raise RuntimeError("Invalid or expired access code.")
+
+    if _username_exists(new_username, current_token=token):
+        raise RuntimeError("That username is already taken. Please choose another.")
+
+    response = _supabase_request(
+        "PATCH",
+        f"{SUPABASE_TABLE}?token=eq.{token}&active=eq.true",
+        json={
+            "username": new_username,
+            "username_updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+    if response.status_code in (200, 204):
+        updated = _select_client_by_token(token, include_password=False)
+        return _public_user(updated or {**user, "username": new_username})
+
+    _raise_supabase_error("reset username", response=response)
+
+
+def reset_client_profile_with_token(
+    token: str,
+    new_username: str | None = None,
+    new_password: str | None = None,
+) -> Dict[str, Any]:
+    """
+    Reset username and/or password using the original client access code.
+    Leave either value blank/None to keep it unchanged.
+    """
+    _require_supabase()
+    token = _normalize_token(token)
+    user = _select_client_by_token(token, include_password=False)
+    if not user:
+        raise RuntimeError("Invalid or expired access code.")
+
+    payload: Dict[str, Any] = {}
+    new_username = _normalize_username(new_username)
+
+    if new_username:
+        ok, msg = _validate_username(new_username)
+        if not ok:
+            raise RuntimeError(msg)
+        if _username_exists(new_username, current_token=token):
+            raise RuntimeError("That username is already taken. Please choose another.")
+        payload["username"] = new_username
+        payload["username_updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    if new_password not in (None, ""):
+        ok, msg = _validate_password_strength(str(new_password))
+        if not ok:
+            raise RuntimeError(msg)
+        payload["password_hash"] = _hash_password(str(new_password))
+        payload["password_set"] = True
+        payload["password_updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    if not payload:
+        raise RuntimeError("Enter a new username, a new password, or both.")
+
+    response = _supabase_request(
+        "PATCH",
+        f"{SUPABASE_TABLE}?token=eq.{token}&active=eq.true",
+        json=payload,
+    )
+
+    if response.status_code in (200, 204):
+        updated = _select_client_by_token(token, include_password=False)
+        return _public_user(updated or {**user, **payload})
+
+    _raise_supabase_error("reset username/password", response=response)
+
+
 def set_client_password(token: str, new_password: str) -> Dict[str, Any]:
     """Change a client's password only. Username is unchanged."""
     _require_supabase()

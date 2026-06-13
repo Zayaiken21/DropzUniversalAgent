@@ -6,6 +6,7 @@ from frontend.database import (
     validate_token,
     set_client_profile,
     reset_client_password_with_token,
+    reset_client_profile_with_token,
 )
 
 
@@ -145,25 +146,31 @@ def _render_first_time_profile_setup():
 def _render_reset_password_form():
     _inject_copy_paste()
 
-    st.markdown("### 🔁 Reset Your Password")
+    st.markdown("### 🔁 Reset Login Details")
     st.info(
-        "Enter the **original access code** you received from the CEO when your account was created. "
-        "This is the code you used the very first time you logged in — it never changes and is "
-        "required to reset your password."
+        "Enter the **original access code** you received from the CEO. "
+        "You can reset your username, your password, or both. "
+        "The access code remains your permanent recovery key."
     )
 
-    with st.form("reset_client_password_form", clear_on_submit=False):
+    with st.form("reset_client_login_details_form", clear_on_submit=False):
         reset_token = st.text_input(
             "Original Access Code",
             key="reset_client_access_code",
             placeholder="Paste or type your original access code here",
-            help="The access code from the CEO. You can paste it directly into this field.",
+            help="This is the original code from the CEO. It is required to reset login details.",
+        )
+        new_username = st.text_input(
+            "New Username",
+            key="reset_new_username",
+            placeholder="Optional: enter a new username",
+            help="Leave blank if you only want to reset your password.",
         )
         new_password = st.text_input(
             "New Password",
             key="reset_new_password",
             type="password",
-            placeholder="Enter your new password (min 6 characters)",
+            placeholder="Optional: enter your new password",
         )
         confirm_password = st.text_input(
             "Confirm New Password",
@@ -174,7 +181,7 @@ def _render_reset_password_form():
 
         col1, col2 = st.columns([1, 1])
         with col1:
-            reset_clicked = st.form_submit_button("Save New Password", use_container_width=True)
+            reset_clicked = st.form_submit_button("Save Reset", use_container_width=True)
         with col2:
             cancel_clicked = st.form_submit_button("← Back to Login", use_container_width=True)
 
@@ -183,11 +190,16 @@ def _render_reset_password_form():
             _rerun()
 
         if reset_clicked:
+            wants_username = bool(str(new_username or "").strip())
+            wants_password = bool(str(new_password or "").strip() or str(confirm_password or "").strip())
+
             if not reset_token:
                 st.error("⚠️ Paste your original access code above.")
-            elif not new_password or not confirm_password:
+            elif not wants_username and not wants_password:
+                st.error("⚠️ Enter a new username, a new password, or both.")
+            elif wants_password and (not new_password or not confirm_password):
                 st.error("⚠️ Enter and confirm your new password.")
-            elif new_password != confirm_password:
+            elif wants_password and new_password != confirm_password:
                 st.error("❌ Passwords do not match.")
             else:
                 try:
@@ -195,11 +207,16 @@ def _render_reset_password_form():
                     if not user:
                         st.error("❌ Invalid or expired access code. Contact your administrator.")
                         return
-                    reset_client_password_with_token(reset_token, new_password)
-                    display_name = user.get("username") or user.get("name") or "your account"
+
+                    updated_user = reset_client_profile_with_token(
+                        reset_token,
+                        new_username if wants_username else None,
+                        new_password if wants_password else None,
+                    )
+                    display_name = updated_user.get("username") or user.get("username") or user.get("name") or "your account"
                     st.success(
-                        f"✅ Password reset for **{display_name}**. "
-                        "You can now log in with your username and new password."
+                        f"✅ Login details updated for **{display_name}**. "
+                        "You can now log in with the updated username/password."
                     )
                     _clear_profile_flow()
                     _rerun()
@@ -291,7 +308,7 @@ def render_frontend_login_page():
             with col1:
                 submit_clicked = st.form_submit_button("Login", use_container_width=True)
             with col2:
-                reset_clicked = st.form_submit_button("Forgot Password?", use_container_width=True)
+                reset_clicked = st.form_submit_button("Reset Login", use_container_width=True)
 
         # ── form logic ────────────────────────────────────────────────────────
         if submit_clicked:
