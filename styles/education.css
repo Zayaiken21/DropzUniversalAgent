@@ -1,0 +1,67 @@
+
+/* styles/education.css — Dropz Universal Agent Education page
+   Works with the main Dropz theme and fixes select/dropdown white backgrounds. */
+
+:root{
+  --edu-bg:#070b14;
+  --edu-card:rgba(255,255,255,.065);
+  --edu-card2:rgba(255,255,255,.035);
+  --edu-border:rgba(255,255,255,.12);
+  --edu-text:#ffffff;
+  --edu-muted:rgba(255,255,255,.68);
+  --edu-dim:rgba(255,255,255,.48);
+  --edu-green:#00ffa3;
+  --edu-gold:#ffca28;
+  --edu-red:#ff5d78;
+  --edu-blue:#42a5ff;
+  --edu-purple:#a78bfa;
+}
+
+.edu-hero{
+  position:relative; overflow:hidden; padding:1.55rem; border-radius:28px; margin-bottom:1rem;
+  background:
+    radial-gradient(circle at 12% 18%, rgba(0,255,163,.22), transparent 32%),
+    radial-gradient(circle at 82% 8%, rgba(255,202,40,.16), transparent 28%),
+    linear-gradient(135deg, rgba(8,13,27,.98), rgba(24,30,47,.94));
+  border:1px solid var(--edu-border); box-shadow:0 22px 70px rgba(0,0,0,.34);
+}
+.edu-orb{position:absolute;right:-70px;top:-80px;width:220px;height:220px;border-radius:50%;background:radial-gradient(circle,rgba(0,255,163,.18),transparent 70%)}
+.edu-kicker{font-size:.72rem;text-transform:uppercase;letter-spacing:.18em;font-weight:900;color:var(--edu-green);margin-bottom:.45rem}
+.edu-hero h1{margin:0;color:#fff;font-size:clamp(2rem,5vw,3.65rem);font-weight:950;letter-spacing:-.05em;line-height:1.02}
+.edu-hero p{max-width:1120px;color:var(--edu-muted);font-size:1rem;line-height:1.55;margin:.75rem 0 0}
+.edu-badge-row{display:flex;flex-wrap:wrap;gap:.52rem;margin-top:1rem}
+.edu-badge,.edu-pill{display:inline-block;border-radius:999px;padding:.33rem .68rem;background:rgba(0,255,163,.08);border:1px solid rgba(0,255,163,.25);color:#b7ffe4;font-size:.78rem;font-weight:850;margin:.12rem}
+.edu-pill-gold{background:rgba(255,202,40,.09);border-color:rgba(255,202,40,.27);color:#ffe79a}.edu-pill-green{background:rgba(0,255,163,.09);border-color:rgba(0,255,163,.27);color:#a8ffdd}
+
+.edu-stat-card{padding:1rem;border-radius:20px;background:linear-gradient(180deg,var(--edu-card),var(--edu-card2));border:1px solid var(--edu-border);box-shadow:0 14px 34px rgba(0,0,0,.22);min-height:118px;margin-bottom:.75rem}
+.edu-stat-card span{display:block;color:var(--edu-dim);font-size:.74rem;text-transform:uppercase;letter-spacing:.12em;font-weight:900}.edu-stat-card strong{display:block;color:#fff;font-size:2rem;letter-spacing:-.04em;margin:.25rem 0}.edu-stat-card small{color:var(--edu-muted)}
+
+.edu-section-title{margin:.8rem 0 .65rem;color:var(--edu-green);text-transform:uppercase;letter-spacing:.16em;font-size:.78rem;font-weight:950}
+.edu-muted{color:var(--edu-muted);line-height:1.55}.edu-subtitle{margin:.9rem 0 .45rem;color:#fff;font-weight:950;font-size:.9rem}.edu-empty{padding:1.2rem;border-radius:18px;background:rgba(255,255,255,.045);border:1px dashed var(--edu-border);text-align:center;color:var(--edu-muted)}
+
+.edu-course-head{padding:1rem;border-radius:18px;background:linear-gradient(180deg,rgba(0,0,0,.20),rgba(255,255,255,.035));border:1px solid var(--edu-border);margin-bottom:.75rem}.edu-course-head h3{margin:.55rem 0 .35rem;color:#fff;font-size:1.15rem}.edu-course-head p{color:var(--edu-muted);line-height:1.55;margin:0}.edu-outcome{margin-top:.65rem;padding:.75rem;border-radius:14px;background:rgba(255,202,40,.075);border:1px solid rgba(255,202,40,.20);color:rgba(255,255,255,.82)}
+.edu-depth-block{padding:.9rem;border-radius:16px;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.09);margin:.55rem 0}.edu-depth-title{font-weight:950;color:#fff4bf;margin-bottom:.28rem}.edu-check,.edu-warn{padding:.52rem .65rem;border-radius:12px;margin:.35rem 0;font-weight:750}.edu-check{background:rgba(0,255,163,.065);border:1px solid rgba(0,255,163,.18);color:#d8fff0}.edu-warn{background:rgba(255,93,120,.065);border:1px solid rgba(255,93,120,.18);color:#ffd7de}.edu-drill{padding:.9rem;border-radius:16px;background:rgba(66,165,255,.075);border:1px solid rgba(66,165,255,.20);color:rgba(255,255,255,.82);margin-top:.8rem}
+
+.edu-quiz-question{margin:.85rem 0 .35rem;color:#fff;font-weight:900}.edu-score-card{display:flex;align-items:center;justify-content:space-between;gap:1rem;border-radius:18px;padding:1rem;background:linear-gradient(135deg,rgba(0,255,163,.13),rgba(66,165,255,.08));border:1px solid rgba(0,255,163,.28);margin:1rem 0}.edu-score-card strong{font-size:1.7rem;color:#fff}.edu-score-card span{color:var(--edu-muted)}.edu-review{padding:.9rem;border-radius:16px;margin:.65rem 0;border:1px solid var(--edu-border);background:rgba(255,255,255,.045)}.edu-review-ok{border-color:rgba(0,255,163,.28);box-shadow:0 0 18px rgba(0,255,163,.06)}.edu-review-bad{border-color:rgba(255,93,120,.34);box-shadow:0 0 18px rgba(255,93,120,.06)}
+
+.edu-zoom-room{display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;padding:1.1rem;border-radius:22px;background:linear-gradient(135deg,rgba(0,255,163,.10),rgba(66,165,255,.08));border:1px solid rgba(0,255,163,.24);margin-bottom:1rem}.edu-zoom-room h3{margin:.15rem 0;color:#fff}.edu-zoom-room p{margin:.25rem 0 0;color:var(--edu-muted)}.edu-join-btn,.edu-small-link{display:inline-block;text-decoration:none!important;border-radius:999px;background:linear-gradient(135deg,#00ffa3,#42a5ff);color:#06111a!important;font-weight:950;padding:.62rem .95rem;margin-top:.5rem}.edu-small-link{font-size:.82rem;padding:.45rem .75rem}.edu-class-card{padding:1rem;border-radius:18px;background:rgba(255,255,255,.05);border:1px solid var(--edu-border);margin:.72rem 0}.edu-class-card h4{margin:.22rem 0;color:#fff}.edu-class-card p{color:var(--edu-muted);margin:.35rem 0}.edu-class-date{color:var(--edu-gold);font-weight:950;font-size:.82rem;letter-spacing:.04em}
+
+.edu-video-box{padding:1rem;border-radius:20px;background:linear-gradient(180deg,rgba(255,255,255,.065),rgba(255,255,255,.035));border:1px solid var(--edu-border);margin-bottom:1rem;min-height:380px}.edu-video-frame{width:100%;height:240px;border:0;border-radius:16px;background:#000}.edu-video-placeholder{height:240px;border-radius:16px;background:rgba(0,0,0,.25);border:1px dashed var(--edu-border);display:flex;align-items:center;justify-content:center;text-align:center;color:var(--edu-muted);padding:1rem}.edu-video-box h4{color:#fff;margin:.8rem 0 .25rem}.edu-video-box p{color:var(--edu-muted);line-height:1.5}
+
+/* Dropdown / select white background fix */
+div[data-baseweb="select"] > div,
+div[data-baseweb="select"] div[role="combobox"]{
+  background-color:#101827!important;color:#ffffff!important;border-color:rgba(255,255,255,.16)!important;box-shadow:none!important;
+}
+div[data-baseweb="select"] input{color:#ffffff!important}
+div[data-baseweb="popover"],ul[role="listbox"],li[role="option"]{background:#101827!important;color:#ffffff!important;border-color:rgba(255,255,255,.14)!important}
+li[role="option"]:hover{background:#1f2a44!important;color:#ffffff!important}
+label[data-testid="stWidgetLabel"] p{color:rgba(255,255,255,.70)!important;font-weight:800!important}
+
+/* Inputs and expanders aligned to dark theme */
+div[data-testid="stTextInput"] input,div[data-testid="stTextArea"] textarea,div[data-testid="stDateInput"] input,div[data-testid="stTimeInput"] input,div[data-testid="stNumberInput"] input{background:#0d1424!important;color:#fff!important;border:1px solid rgba(255,255,255,.14)!important;border-radius:12px!important}
+.streamlit-expanderHeader{font-weight:850!important;color:#fff!important;background:rgba(255,255,255,.035)!important;border-radius:14px!important}
+div[data-testid="stExpander"]{border:1px solid rgba(255,255,255,.11)!important;border-radius:16px!important;background:rgba(255,255,255,.025)!important;margin-bottom:.65rem!important}
+
+@media(max-width:900px){.edu-video-frame,.edu-video-placeholder{height:210px}.edu-video-box{min-height:auto}.edu-zoom-room{display:block}.edu-stat-card strong{font-size:1.55rem}}
+@media(max-width:620px){.edu-hero{padding:1.1rem}.edu-hero h1{font-size:2rem}.edu-badge-row{gap:.35rem}.edu-badge,.edu-pill{font-size:.72rem}.edu-video-frame,.edu-video-placeholder{height:190px}}

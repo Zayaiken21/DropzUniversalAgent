@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -42,16 +43,16 @@ def _is_valid_zip(path: Path) -> bool:
         return False
 
 
-def _safe_cache_name(version: str, build_id: str) -> str:
-    raw = f"{version}-{build_id or 'asset'}"
-    cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in raw)
-    return cleaned[:140]
+def _safe_cache_name(value: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(value or "asset"))
+    return cleaned[:160] or "asset"
 
 
 def download_cached(url: str, version: str, build_id: str = "", expected_sha256: str = "") -> Path:
     cache_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME / "updates"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    target = cache_dir / f"{APP_NAME}-{_safe_cache_name(version, build_id)}.zip"
+    cache_key = _safe_cache_name(f"{version}-{build_id or 'asset'}")
+    target = cache_dir / f"{APP_NAME}-{cache_key}.zip"
 
     if target.exists() and target.stat().st_size > 0:
         valid_hash = (not expected_sha256) or sha256_file(target).lower() == expected_sha256.lower()
@@ -65,8 +66,15 @@ def download_cached(url: str, version: str, build_id: str = "", expected_sha256:
     tmp.unlink(missing_ok=True)
 
     log(f"Downloading update: {url}")
-    req = Request(url, headers={"User-Agent": f"{APP_NAME}-Updater/{version}", "Cache-Control": "no-cache", "Pragma": "no-cache"})
-    with urlopen(req, timeout=60) as resp, tmp.open("wb") as out:
+    req = Request(
+        url,
+        headers={
+            "User-Agent": f"{APP_NAME}-Updater/{version}",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+    )
+    with urlopen(req, timeout=90) as resp, tmp.open("wb") as out:
         total = int(resp.headers.get("Content-Length") or "0")
         done = 0
         while True:
@@ -96,7 +104,7 @@ def download_cached(url: str, version: str, build_id: str = "", expected_sha256:
 
 def extract_update(zip_path: Path, version: str, build_id: str = "") -> Path:
     temp_root = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME / "update_extract"
-    extract_dir = temp_root / _safe_cache_name(version, build_id)
+    extract_dir = temp_root / _safe_cache_name(f"{version}-{build_id or 'asset'}")
     if extract_dir.exists():
         shutil.rmtree(extract_dir, ignore_errors=True)
     extract_dir.mkdir(parents=True, exist_ok=True)
@@ -117,7 +125,13 @@ def _process_exists(pid: int) -> bool:
     if os.name == "nt":
         try:
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            result = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], capture_output=True, text=True, creationflags=flags, timeout=5)
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                creationflags=flags,
+                timeout=5,
+            )
             return str(pid) in (result.stdout or "")
         except Exception:
             return False
@@ -128,38 +142,59 @@ def _process_exists(pid: int) -> bool:
         return False
 
 
-def wait_for_pid_to_close(pid: int) -> None:
-    if pid <= 0:
-        log("No PID supplied. Waiting briefly before install.")
-        time.sleep(2)
-        return
-    log(f"Waiting for app process to close. PID={pid}")
-    while _process_exists(pid):
-        time.sleep(1.0)
-    time.sleep(2.0)
+def _write_state_files(src: Path, remote_state_json: str, version: str, build_id: str) -> None:
+    try:
+        state = json.loads(remote_state_json) if remote_state_json else {}
+        if not isinstance(state, dict):
+            state = {}
+    except Exception:
+        state = {}
+
+    state.setdefault("version", version)
+    state.setdefault("signature", build_id)
+    state["installed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    for name in ("update_state.json", "installed_update_state.json"):
+        try:
+            (src / name).write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+        except Exception:
+            pass
+
+    try:
+        local_state = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME / "update_state.json"
+        local_state.parent.mkdir(parents=True, exist_ok=True)
+        local_state.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    except Exception:
+        pass
 
 
-def _write_install_cmd(src: Path, app_dir: Path, main_exe: Path, version: str, build_id: str) -> Path:
+def _write_finish_cmd(src: Path, app_dir: Path, main_exe: Path, wait_pid: int) -> Path:
     cmd_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME / "updates"
     cmd_dir.mkdir(parents=True, exist_ok=True)
     cmd = cmd_dir / "finish_update.cmd"
-    state = '{{"version":"{version}","build_id":"{build_id}"}}'.format(version=version, build_id=build_id)
-    script = (
-        "@echo off\n"
-        "setlocal\n"
-        "timeout /t 2 /nobreak >nul\n"
-        f'echo Installing {APP_NAME} update...\n'
-        f'robocopy "{src}" "{app_dir}" /E /XD "__pycache__" /XF "DropzUpdater.exe" >nul\n'
-        "if %ERRORLEVEL% LEQ 7 (\n"
-        f'  echo {version}> "{app_dir}\\version.txt"\n'
-        f'  echo {state}> "{app_dir}\\last_update_state.json"\n'
-        f'  start "" "{main_exe}"\n'
-        "  exit /b 0\n"
-        ")\n"
-        "echo Update copy failed with code %ERRORLEVEL%.\n"
-        "pause\n"
-        "exit /b %ERRORLEVEL%\n"
-    )
+
+    # /MIR keeps installed files exactly in sync with the new ZIP.
+    # It runs after this updater exits, so Windows can replace DropzUpdater.exe too.
+    script = f"""@echo off
+setlocal
+echo Finishing DropzUniversalAgent update...
+timeout /t 2 /nobreak >nul
+:waitapp
+tasklist /FI "PID eq {wait_pid}" | find "{wait_pid}" >nul
+if not errorlevel 1 (
+  timeout /t 1 /nobreak >nul
+  goto waitapp
+)
+robocopy "{src}" "{app_dir}" /MIR /R:30 /W:1 /NFL /NDL /NP
+if %ERRORLEVEL% LEQ 7 (
+  echo Update installed.
+  start "" "{main_exe}"
+) else (
+  echo Update copy failed with code %ERRORLEVEL%.
+  pause
+)
+endlocal
+"""
     cmd.write_text(script, encoding="utf-8")
     return cmd
 
@@ -170,9 +205,10 @@ def main() -> int:
     parser.add_argument("--main-exe", required=True)
     parser.add_argument("--current-version", default="0.0.0")
     parser.add_argument("--latest-version", required=True)
-    parser.add_argument("--latest-build-id", default="")
     parser.add_argument("--download-url", required=True)
     parser.add_argument("--sha256", default="")
+    parser.add_argument("--build-id", default="")
+    parser.add_argument("--remote-state-json", default="")
     parser.add_argument("--wait-pid", type=int, default=0)
     parser.add_argument("--background", action="store_true")
     args = parser.parse_args()
@@ -181,30 +217,33 @@ def main() -> int:
     main_exe = Path(args.main_exe).resolve()
 
     try:
-        log(f"Updater started. {args.current_version} -> {args.latest_version} build={args.latest_build_id}")
-        zip_path = download_cached(args.download_url, args.latest_version, args.latest_build_id, args.sha256)
-        wait_for_pid_to_close(args.wait_pid)
-        src = extract_update(zip_path, args.latest_version, args.latest_build_id)
+        log(f"Updater started. {args.current_version} -> {args.latest_version}")
+        zip_path = download_cached(args.download_url, args.latest_version, args.build_id, args.sha256)
+        src = extract_update(zip_path, args.latest_version, args.build_id)
+        _write_state_files(src, args.remote_state_json, args.latest_version, args.build_id)
 
+        log(f"Waiting for app process to close. PID={args.wait_pid}")
+        finish_cmd = _write_finish_cmd(src, app_dir, main_exe, args.wait_pid)
+
+        flags = 0
         if os.name == "nt":
-            cmd = _write_install_cmd(src, app_dir, main_exe, args.latest_version, args.latest_build_id)
-            log(f"Handing install to command script: {cmd}")
-            subprocess.Popen(["cmd", "/c", str(cmd)], cwd=str(app_dir), close_fds=True)
-            return 0
+            flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+            subprocess.Popen(["cmd.exe", "/c", str(finish_cmd)], cwd=str(app_dir), creationflags=flags)
+        else:
+            # Non-Windows fallback for development.
+            while _process_exists(args.wait_pid):
+                time.sleep(1)
+            for item in src.iterdir():
+                dest = app_dir / item.name
+                if item.is_dir():
+                    if dest.exists():
+                        shutil.rmtree(dest, ignore_errors=True)
+                    shutil.copytree(item, dest)
+                else:
+                    shutil.copy2(item, dest)
+            subprocess.Popen([str(main_exe)], cwd=str(app_dir))
 
-        # Non-Windows fallback.
-        for item in src.iterdir():
-            dest = app_dir / item.name
-            if item.name == "DropzUpdater.exe":
-                continue
-            if item.is_dir():
-                if dest.exists():
-                    shutil.rmtree(dest, ignore_errors=True)
-                shutil.copytree(item, dest)
-            else:
-                shutil.copy2(item, dest)
-        if main_exe.exists():
-            subprocess.Popen([str(main_exe)], cwd=str(app_dir), close_fds=True)
+        log("Background installer launched. Updater can close.")
         return 0
     except Exception as exc:
         log(f"Update failed: {exc}")

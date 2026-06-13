@@ -9,7 +9,7 @@ set GITHUB_OWNER=Zayaiken21
 set GITHUB_REPO=DropzUniversalAgent
 
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -AsUTC -Format yyyyMMddHHmmss"') do set BUILD_ID=%%i
-for /f %%i in ('powershell -NoProfile -Command "Get-Date -AsUTC -Format o"') do set BUILD_TIME_UTC=%%i
+for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "Get-Date -AsUTC -Format o"`) do set BUILD_TIME_UTC=%%i
 
 echo Building %APP_NAME% version %APP_VERSION% build %BUILD_ID%
 echo Python:
@@ -28,7 +28,7 @@ if errorlevel 1 (
 )
 
 echo Writing build_info.json...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$info=@{version='%APP_VERSION%'; build_id='%BUILD_ID%'; build_time_utc='%BUILD_TIME_UTC%'; github_owner='%GITHUB_OWNER%'; github_repo='%GITHUB_REPO%'; asset_name='%APP_NAME%-Windows.zip'} | ConvertTo-Json; Set-Content -Path build_info.json -Value $info -Encoding UTF8"
+python -c "import json,os; info={'version':os.environ.get('APP_VERSION','%APP_VERSION%'),'build_id':os.environ.get('BUILD_ID','%BUILD_ID%'),'build_time_utc':os.environ.get('BUILD_TIME_UTC','%BUILD_TIME_UTC%'),'github_owner':'%GITHUB_OWNER%','github_repo':'%GITHUB_REPO%','asset_name':'%APP_NAME%-Windows.zip'}; open('build_info.json','w',encoding='utf-8').write(json.dumps(info,indent=2))"
 
 echo Cleaning old build output...
 rmdir /s /q build 2>nul
@@ -51,7 +51,9 @@ if errorlevel 1 (
 )
 
 echo Building Dropz Universal Agent desktop app...
-set DROPZ_APP_VERSION=%APP_VERSION%
+
+set EXTRA_CHAT_DATA=
+if exist chat_agent.py set EXTRA_CHAT_DATA=--add-data "chat_agent.py;."
 
 python -m PyInstaller ^
   --clean ^
@@ -83,6 +85,7 @@ python -m PyInstaller ^
   --collect-all streamlit_js_eval ^
   --collect-all streamlit_chat ^
   --collect-all streamlit_float ^
+  --hidden-import chat_agent ^
   --hidden-import chat_backend ^
   --hidden-import chat_backend.chat_db ^
   --hidden-import components ^
@@ -102,6 +105,7 @@ python -m PyInstaller ^
   --add-data "data;data" ^
   --add-data "frontend\dropz.db;frontend" ^
   --add-data "build_info.json;." ^
+  %EXTRA_CHAT_DATA% ^
   desktop_launcher.py
 
 if errorlevel 1 (
@@ -118,14 +122,6 @@ echo %APP_VERSION%> "dist\%APP_NAME%\version.txt"
 copy /Y "build_info.json" "dist\%APP_NAME%\build_info.json" >nul
 if exist "dist\%APP_NAME%\_internal" copy /Y "build_info.json" "dist\%APP_NAME%\_internal\build_info.json" >nul
 
-echo Copying optional update configuration files...
-if exist update_manifest_url.txt (
-  copy /Y update_manifest_url.txt "dist\%APP_NAME%\update_manifest_url.txt" >nul
-)
-if exist version_manifest.json (
-  copy /Y version_manifest.json "dist\%APP_NAME%\version_manifest.json" >nul
-)
-
 echo Creating ZIP...
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '.\dist\%APP_NAME%\*' -DestinationPath '.\%APP_NAME%-Windows.zip' -Force"
 
@@ -135,7 +131,6 @@ echo dist\%APP_NAME%\%APP_NAME%.exe
 echo ZIP ready:
 echo %APP_NAME%-Windows.zip
 echo.
-echo IMPORTANT:
-echo Upload %APP_NAME%-Windows.zip to your GitHub Release assets.
-echo The app now checks GitHub Releases directly and can detect changed ZIP assets even when APP_VERSION stays the same.
+echo Upload %APP_NAME%-Windows.zip to GitHub Releases.
+echo Advanced updater checks GitHub release asset ID/update time/size and can detect changed ZIP assets even with the same tag/version after the first baseline check.
 pause
