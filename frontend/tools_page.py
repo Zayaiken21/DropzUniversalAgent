@@ -3,11 +3,10 @@ tools_page.py  ·  TradeSmart Tools — Streamlit UI
 ===================================================
 Tabs:
   1. Sessions  — live market session atlas with timeline
-  2. Journal   — per-user SQLite trade journal
+  2. Trade Log — per-user SQLite trade log
   3. Gold News — live yfinance snapshots + Forex Factory calendar + RSS
 
 Depends on news_endpoints.py in the same directory.
-Install: pip install yfinance requests beautifulsoup4 lxml pandas streamlit
 """
 from __future__ import annotations
 
@@ -58,22 +57,22 @@ DEFAULT_TZ = "America/New_York"
 
 SESSION_DEFS = [
     {
-        "name": "Sydney", "open": 22.0, "close": 7.0, "color": "#00d4ff",
-        "note": "Early liquidity. Often smoother movement; good for seeing if Asia builds a range.",
+        "name": "Sydney", "open_ny": "17:00", "close_ny": "02:00", "color": "#00d4ff",
+        "note": "Early liquidity. Often smoother movement; useful for seeing if Asia starts building a range.",
         "play": "Mark Asian high/low. Avoid forcing trades if range is tight.",
     },
     {
-        "name": "Tokyo", "open": 0.0, "close": 9.0, "color": "#ffca28",
+        "name": "Tokyo", "open_ny": "19:00", "close_ny": "04:00", "color": "#ffca28",
         "note": "Asian range can create liquidity for London and New York to sweep.",
         "play": "Watch if price traps one side of the range before expansion.",
     },
     {
-        "name": "London", "open": 8.0, "close": 17.0, "color": "#2979ff",
+        "name": "London", "open_ny": "03:00", "close_ny": "12:00", "color": "#2979ff",
         "note": "Expansion window. Strong for stop hunts, displacement, and trend continuation.",
         "play": "Look for sweep → displacement → retrace entries around FVG/OB.",
     },
     {
-        "name": "New York", "open": 13.0, "close": 22.0, "color": "#00e676",
+        "name": "New York", "open_ny": "08:00", "close_ny": "17:00", "color": "#00e676",
         "note": "Major XAUUSD window, especially near USD news and Wall Street open.",
         "play": "Respect news. Confirm dollar/yield reaction before chasing gold.",
     },
@@ -339,9 +338,53 @@ def _fmt_mins(minutes: int) -> str:
     return f"{h}h {m}m" if h else f"{m}m"
 
 
-def _clock_label(hour_float: float, tz_name: str) -> str:
-    base = datetime(2026, 1, 1, int(hour_float), int((hour_float % 1) * 60), tzinfo=timezone.utc)
-    return base.astimezone(ZoneInfo(tz_name)).strftime("%I:%M %p %Z")
+def _parse_hhmm(value: str) -> tuple[int, int]:
+    hour, minute = str(value).split(":", 1)
+    return int(hour), int(minute)
+
+
+def _minutes_from_hhmm(value: str) -> int:
+    hour, minute = _parse_hhmm(value)
+    return hour * 60 + minute
+
+
+def _fmt_dt(dt: datetime, tz_name: str) -> str:
+    return dt.astimezone(ZoneInfo(tz_name)).strftime("%I:%M %p %Z")
+
+
+def _session_datetimes_for_now(open_ny: str, close_ny: str, now_ny: datetime) -> tuple[datetime, datetime]:
+    """Return the active/next session window using New York time as the anchor.
+
+    The important fix: session opens/closes are stored as New York clock times
+    and then converted through ZoneInfo. That keeps the UI correct across EST
+    and EDT instead of drifting from hard-coded UTC hour floats.
+    """
+    oh, om = _parse_hhmm(open_ny)
+    ch, cm = _parse_hhmm(close_ny)
+    today_open = now_ny.replace(hour=oh, minute=om, second=0, microsecond=0)
+    today_close = now_ny.replace(hour=ch, minute=cm, second=0, microsecond=0)
+
+    crosses_midnight = _minutes_from_hhmm(close_ny) <= _minutes_from_hhmm(open_ny)
+
+    if crosses_midnight:
+        # Example: Sydney 5 PM → 2 AM NY time.
+        if now_ny >= today_open:
+            start_dt = today_open
+            end_dt = today_close + pd.Timedelta(days=1)
+        elif now_ny < today_close:
+            start_dt = today_open - pd.Timedelta(days=1)
+            end_dt = today_close
+        else:
+            start_dt = today_open
+            end_dt = today_close + pd.Timedelta(days=1)
+    else:
+        start_dt = today_open
+        end_dt = today_close
+        if now_ny >= end_dt:
+            start_dt = today_open + pd.Timedelta(days=1)
+            end_dt = today_close + pd.Timedelta(days=1)
+
+    return start_dt, end_dt
 
 
 def _safe_user_id(role: str) -> str:
@@ -390,34 +433,45 @@ def _render_snapshots(snapshots: list[dict]) -> str:
 # ── session tab ───────────────────────────────────────────────────────────────
 
 def _session_info(tz_name: str) -> list[dict[str, Any]]:
-    now_utc = datetime.now(timezone.utc)
-    h = now_utc.hour + now_utc.minute / 60
+    now_ny = datetime.now(ZoneInfo(DEFAULT_TZ))
     out = []
+
     for s in SESSION_DEFS:
-        o, c = s["open"], s["close"]
-        active = (h >= o or h < c) if o > c else (o <= h < c)
+        start_dt, end_dt = _session_datetimes_for_now(s["open_ny"], s["close_ny"], now_ny)
+        active = start_dt <= now_ny < end_dt
+        mins_left = int((end_dt - now_ny).total_seconds() // 60) if active else 0
+        mins_to = int((start_dt - now_ny).total_seconds() // 60) if not active else 0
+
         out.append({
             **s,
-            "active":      active,
-            "mins_left":   int(((c - h) % 24) * 60),
-            "mins_to":     int(((o - h) % 24) * 60),
-            "start_local": _clock_label(o, tz_name),
-            "end_local":   _clock_label(c, tz_name),
-            "start_ny":    _clock_label(o, DEFAULT_TZ),
-            "end_ny":      _clock_label(c, DEFAULT_TZ),
+            "active": active,
+            "mins_left": max(0, mins_left),
+            "mins_to": max(0, mins_to),
+            "start_dt": start_dt,
+            "end_dt": end_dt,
+            "start_local": _fmt_dt(start_dt, tz_name),
+            "end_local": _fmt_dt(end_dt, tz_name),
+            "start_ny": _fmt_dt(start_dt, DEFAULT_TZ),
+            "end_ny": _fmt_dt(end_dt, DEFAULT_TZ),
+            "start_pct": (_minutes_from_hhmm(s["open_ny"]) / 1440) * 100,
+            "end_pct": (_minutes_from_hhmm(s["close_ny"]) / 1440) * 100,
         })
+
     return out
 
 
 def _render_session_timeline(sessions: list[dict[str, Any]]) -> str:
-    now_utc  = datetime.now(timezone.utc)
-    now_pct  = ((now_utc.hour * 60 + now_utc.minute) / 1440) * 100
+    now_ny = datetime.now(ZoneInfo(DEFAULT_TZ))
+    now_pct = ((now_ny.hour * 60 + now_ny.minute) / 1440) * 100
     active_names = [s["name"] for s in sessions if s["active"]]
-    overlap  = "London" in active_names and "New York" in active_names
+    overlap = "London" in active_names and "New York" in active_names
     rows = ""
+
     for s in sessions:
-        start, end = s["open"] / 24 * 100, s["close"] / 24 * 100
-        if s["open"] > s["close"]:
+        start, end = s["start_pct"], s["end_pct"]
+        crosses_midnight = _minutes_from_hhmm(s["close_ny"]) <= _minutes_from_hhmm(s["open_ny"])
+
+        if crosses_midnight:
             fill = (
                 f'<span class="ts-fill" style="left:{start:.3f}%;width:{100-start:.3f}%;background:{s["color"]}"></span>'
                 f'<span class="ts-fill" style="left:0;width:{end:.3f}%;background:{s["color"]}"></span>'
@@ -425,11 +479,15 @@ def _render_session_timeline(sessions: list[dict[str, Any]]) -> str:
         else:
             fill = f'<span class="ts-fill" style="left:{start:.3f}%;width:{end-start:.3f}%;background:{s["color"]}"></span>'
 
-        cls    = "ts-session-card active" if s["active"] else "ts-session-card"
+        cls = "ts-session-card active" if s["active"] else "ts-session-card"
         if overlap and s["name"] in ("London", "New York"):
             cls += " overlap"
-        status = (f'OPEN · closes in {_fmt_mins(s["mins_left"])}' if s["active"]
-                  else f'closed · opens in {_fmt_mins(s["mins_to"])}')
+
+        status = (
+            f'OPEN · closes in {_fmt_mins(s["mins_left"])}'
+            if s["active"]
+            else f'closed · opens in {_fmt_mins(s["mins_to"])}'
+        )
         dot_shadow = f'box-shadow:0 0 13px {s["color"]}' if s["active"] else 'box-shadow:none;opacity:.38'
 
         rows += f"""
@@ -440,8 +498,8 @@ def _render_session_timeline(sessions: list[dict[str, Any]]) -> str:
             <span class="ts-action {'ts-green' if s['active'] else 'ts-blue'}">{status}</span>
           </div>
           <div class="ts-time-line">
-            <span>Local: {s['start_local']} → {s['end_local']}</span>
-            <span>NYC: {s['start_ny']} → {s['end_ny']}</span>
+            <span>Selected: {s['start_local']} → {s['end_local']}</span>
+            <span>NY close/open: {s['start_ny']} → {s['end_ny']}</span>
           </div>
           <div class="ts-timeline">
             {fill}
@@ -458,24 +516,25 @@ def _render_session_timeline(sessions: list[dict[str, Any]]) -> str:
 def _tab_sessions(user_id: str) -> None:
     st.markdown('<div class="ts-eyebrow">Market Session Atlas</div>', unsafe_allow_html=True)
     current_tz = _get_user_tz(user_id)
-    labels     = list(TIMEZONE_OPTIONS.keys())
-    reverse    = {v: k for k, v in TIMEZONE_OPTIONS.items()}
+    labels = list(TIMEZONE_OPTIONS.keys())
+    reverse = {v: k for k, v in TIMEZONE_OPTIONS.items()}
     selected_label = st.selectbox(
-        "Display session times in", labels,
+        "Display session times in",
+        labels,
         index=labels.index(reverse.get(current_tz, "New York / EST-EDT")),
-        key="tz_select"
+        key="tz_select",
     )
     selected_tz = TIMEZONE_OPTIONS[selected_label]
     if selected_tz != current_tz:
         _save_user_tz(user_id, selected_tz)
         st.success(f"Timezone saved: {selected_label}")
 
-    sessions  = _session_info(selected_tz)
+    sessions = _session_info(selected_tz)
     now_local = datetime.now(ZoneInfo(selected_tz))
-    now_ny    = datetime.now(ZoneInfo(DEFAULT_TZ))
-    active    = [s["name"] for s in sessions if s["active"]]
-    chips     = "".join(f'<span class="ts-chip ts-chip-green">{a} active</span>' for a in active) \
-                or '<span class="ts-chip ts-chip-red">No major session active</span>'
+    now_ny = datetime.now(ZoneInfo(DEFAULT_TZ))
+    active = [s["name"] for s in sessions if s["active"]]
+    chips = "".join(f'<span class="ts-chip ts-chip-green">{a} active</span>' for a in active) \
+            or '<span class="ts-chip ts-chip-red">No major session active</span>'
     if "London" in active and "New York" in active:
         chips += '<span class="ts-chip ts-chip-gold">⚡ London / NY overlap — strongest gold liquidity window</span>'
 
@@ -483,8 +542,10 @@ def _tab_sessions(user_id: str) -> None:
         f'<div class="ts-panel">'
         f'<div class="ts-row"><span class="ts-label">Selected clock</span>'
         f'<span class="ts-val ts-cyan">{now_local.strftime("%I:%M:%S %p · %Z")}</span></div>'
-        f'<div class="ts-row"><span class="ts-label">NYC anchor</span>'
+        f'<div class="ts-row"><span class="ts-label">New York anchor</span>'
         f'<span class="ts-val ts-blue">{now_ny.strftime("%I:%M:%S %p · %Z")}</span></div>'
+        f'<div class="ts-row"><span class="ts-label">Session source</span>'
+        f'<span class="ts-val ts-gold">Tracked from actual New York EST/EDT clock times</span></div>'
         f'<div style="margin-top:10px">{chips}</div>'
         f'</div>',
         unsafe_allow_html=True,
@@ -501,16 +562,16 @@ def _tab_sessions(user_id: str) -> None:
     st.markdown(_render_session_timeline(sessions), unsafe_allow_html=True)
 
 
-# ── journal tab ───────────────────────────────────────────────────────────────
+# ── trade log tab ───────────────────────────────────────────────────────────────
 
-def _tab_journal(user_id: str) -> None:
-    st.markdown('<div class="ts-eyebrow">Wired Trade Journal</div>', unsafe_allow_html=True)
+def _tab_trade_log(user_id: str) -> None:
+    st.markdown('<div class="ts-eyebrow">Wired Trade Log</div>', unsafe_allow_html=True)
     df = _load_trades(user_id)
     edit_options = ["New trade"] + (
         df.apply(lambda r: f'{r["trade_date"]} · {r["symbol"]} · {r["direction"]} · ${r["pnl"]:+.2f}', axis=1).tolist()
         if not df.empty else []
     )
-    pick    = st.selectbox("Journal action", edit_options, key="tj_pick")
+    pick    = st.selectbox("Trade log action", edit_options, key="tj_pick")
     editing = pick != "New trade"
     edit_row = df.iloc[edit_options.index(pick) - 1].to_dict() if editing else {}
 
@@ -603,14 +664,14 @@ def _tab_journal(user_id: str) -> None:
     ]].rename(columns={"trade_date":"Date","session_name":"Session","r_multiple":"R","pnl":"P/L"})
     st.dataframe(show, use_container_width=True, hide_index=True)
     st.download_button(
-        "EXPORT JOURNAL CSV",
+        "EXPORT TRADE LOG CSV",
         show.to_csv(index=False).encode("utf-8"),
-        file_name=f"tradesmart_journal_{user_id}.csv",
+        file_name=f"tradesmart_trade_log_{user_id}.csv",
         mime="text/csv",
     )
     with st.expander("Danger zone"):
-        st.markdown('<div class="ts-danger-zone ts-note">Clears only the current user\'s journal.</div>', unsafe_allow_html=True)
-        if st.button("CLEAR MY JOURNAL", key="tj_clear"):
+        st.markdown('<div class="ts-danger-zone ts-note">Clears only the current user\'s trade log.</div>', unsafe_allow_html=True)
+        if st.button("CLEAR MY TRADE LOG", key="tj_clear"):
             _clear_trades(user_id)
             st.rerun()
 
@@ -632,9 +693,7 @@ def _tab_gold_news() -> None:
     if not _NEWS_OK:
         st.error(
             f"news_endpoints.py failed to load: {_NEWS_ERR_MSG}\n\n"
-            "Both files must be in the **same folder**. "
-            "Also make sure you have installed:\n\n"
-            "```\npip install yfinance requests beautifulsoup4 lxml pandas\n```"
+            "Both files must be in the same folder."
         )
         return
 
@@ -754,18 +813,6 @@ def _tab_gold_news() -> None:
         if not snapshots and not calendar and not items:
             st.info("No data returned. Check internet access or disable a failing source above.")
 
-    # install note — always visible below the button
-    st.markdown(
-        '<div class="ts-panel ts-note" style="margin-top:18px">'
-        '<b style="color:var(--ts-text)">Install requirements:</b><br>'
-        '<code>pip install yfinance requests beautifulsoup4 lxml pandas</code><br><br>'
-        '<b style="color:var(--ts-text)">Tickers tracked:</b> '
-        'GC=F (Gold Futures) · GLD (ETF) · DX-Y.NYB (DXY) · ^TNX (10Y Yield) · EURUSD=X · UUP<br><br>'
-        '<b style="color:var(--ts-text)">Note:</b> Forex Factory may block automated requests. '
-        'The page fails safely — yfinance and RSS will still return data.'
-        '</div>',
-        unsafe_allow_html=True,
-    )
 
 
 # ── entry points ──────────────────────────────────────────────────────────────
@@ -777,13 +824,13 @@ def render_tools_page(role: str = "client") -> None:
     st.markdown(
         '<div class="ts-hero">'
         '<h1><span class="ts-orb"></span>TradeSmart Tools</h1>'
-        '<p>Session atlas · Per-user trade journal · Live gold news &amp; economic calendar</p>'
+        '<p>Session atlas · Per-user trade log · Live gold news &amp; economic calendar</p>'
         '</div>',
         unsafe_allow_html=True,
     )
-    tabs = st.tabs(["🌐 Sessions", "📒 Journal", "📰 Gold News"])
+    tabs = st.tabs(["🌐 Sessions", "📒 Trade Journal", "📰 Gold News"])
     with tabs[0]: _tab_sessions(user_id)
-    with tabs[1]: _tab_journal(user_id)
+    with tabs[1]: _tab_trade_log(user_id)
     with tabs[2]: _tab_gold_news()
 
 

@@ -37,7 +37,7 @@ DROPZ_UPDATE_MANIFEST_URL = get_secret("DROPZ_UPDATE_MANIFEST_URL")
 from frontend.style_loader import load_theme_css
 from frontend.login_page import render_frontend_login_page
 from frontend.dashboard_page import render_frontend_dashboard_page
-from frontend.accounts_page import render_frontend_accounts_page
+from frontend.education_page import render_frontend_education_page
 from frontend.tradesmart_page import render_frontend_tradesmart_page
 from frontend.chat_page import render_frontend_chat_page
 from frontend.tools_page import render_frontend_tools_page
@@ -203,7 +203,7 @@ def _render_menu():
     menu_cols = st.columns([1, 1, 1, 1, 1, 1, 1])
     menu_labels = [
         "Dashboard",
-        "Accounts",
+        "Education",
         "TradeSmart",
         "Chat",
         "Tools",
@@ -214,7 +214,8 @@ def _render_menu():
     for col, label in zip(menu_cols, menu_labels):
         with col:
             page_key = label.lower()
-            is_active = page_key == st.session_state.selected_page
+            current_page = "education" if st.session_state.selected_page == "accounts" else st.session_state.selected_page
+            is_active = page_key == current_page
             button_label = f"● {label}" if is_active and label != "Logout" else label
 
             if label == "Logout":
@@ -243,14 +244,17 @@ def _render_page():
 
     if page == "dashboard":
         render_frontend_dashboard_page(role)
-    elif page == "accounts":
-        render_frontend_accounts_page()
+    elif page in {"education", "accounts"}:
+        # Support the new Education route and the old Accounts route so saved sessions do not break.
+        if page == "accounts":
+            st.session_state.selected_page = "education"
+        render_frontend_education_page(role)
     elif page == "tradesmart":
         render_frontend_tradesmart_page()
     elif page == "chat":
-        render_frontend_chat_page()
+        render_frontend_chat_page(role)
     elif page == "tools":
-        render_frontend_tools_page()
+        render_frontend_tools_page(role)
     elif page == "settings":
         if role == "ceo":
             render_settings_ceo_page(role)
