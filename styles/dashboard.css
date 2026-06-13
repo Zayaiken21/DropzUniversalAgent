@@ -1,13 +1,18 @@
+/* dashboard.css — Dropz Universal Agent: pro SaaS dashboard theme
+   This file mirrors the styles injected inline by dashboard_page.py so that
+   any page loading global stylesheets stays visually consistent. */
+
 html, body, [class*="css"] {
     background: #0B0F19;
-    color: white;
-    font-family: Inter, sans-serif;
+    color: #ffffff;
+    font-family: 'Inter', sans-serif;
 }
 
 .dashboard-header {
     margin-bottom: 24px;
 }
 
+/* ── generic glass card (legacy class kept for compatibility) ───────────── */
 .glass-card {
     background: rgba(18, 22, 34, 0.72);
     border: 1px solid rgba(255,255,255,0.06);
@@ -17,43 +22,194 @@ html, body, [class*="css"] {
     box-shadow: 0 0 30px rgba(0,255,163,0.05);
 }
 
+/* ── legacy KPI card (kept for compatibility with older pages) ──────────── */
 .kpi-card {
-    background: linear-gradient(
-        145deg,
-        rgba(18,22,34,0.95),
-        rgba(28,32,48,0.95)
-    );
-
+    background: linear-gradient(145deg, rgba(18,22,34,0.95), rgba(28,32,48,0.95));
     border-radius: 18px;
     padding: 20px;
     min-height: 140px;
-
     border: 1px solid rgba(255,255,255,0.06);
-
     transition: all 0.25s ease;
 }
-
 .kpi-card:hover {
     transform: translateY(-4px);
     box-shadow: 0 0 25px rgba(0,255,163,0.12);
 }
+.kpi-title { opacity: 0.7; font-size: 14px; }
+.kpi-value { font-size: 36px; font-weight: 700; margin-top: 12px; }
 
-.kpi-title {
-    opacity: 0.7;
-    font-size: 14px;
-}
-
-.kpi-value {
-    font-size: 36px;
-    font-weight: 700;
-    margin-top: 12px;
-}
-
-.section-space {
-    height: 24px;
-}
+.section-space { height: 24px; }
 
 .activity-item {
     padding: 12px 0;
     border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+
+/* ── pro dashboard design system (du-*) ──────────────────────────────────
+   These classes match the ones injected by dashboard_page.py's
+   _inject_dashboard_styles(). Kept here so the same look is available if
+   this stylesheet is ever loaded globally (e.g. via load_theme_css). */
+
+.du-dashboard-hero {
+    padding: 28px 30px;
+    border-radius: 26px;
+    position: relative;
+    overflow: hidden;
+    background: linear-gradient(135deg, rgba(0,255,163,.08), rgba(255,255,255,.025) 55%);
+    border: 1px solid rgba(255,255,255,.12);
+    box-shadow: 0 18px 60px rgba(0,0,0,.30);
+    margin-bottom: 18px;
+}
+.du-dashboard-title { font-size: 32px; font-weight: 900; color: #fff; margin-bottom: 4px; letter-spacing: -.01em; }
+.du-dashboard-sub   { color: rgba(255,255,255,.62); font-size: 14.5px; }
+
+.du-card {
+    padding: 22px;
+    border-radius: 22px;
+    background: linear-gradient(145deg, rgba(255,255,255,.08), rgba(255,255,255,.025));
+    border: 1px solid rgba(255,255,255,.10);
+    box-shadow: 0 16px 46px rgba(0,0,0,.24);
+    margin-bottom: 18px;
+}
+
+.du-kpi-card {
+    padding: 18px 20px;
+    border-radius: 20px;
+    background: linear-gradient(145deg, rgba(255,255,255,.085), rgba(255,255,255,.03));
+    border: 1px solid rgba(255,255,255,.105);
+    box-shadow: 0 14px 38px rgba(0,0,0,.20);
+    min-height: 128px;
+    transition: transform .2s ease, box-shadow .2s ease;
+}
+.du-kpi-card:hover { transform: translateY(-3px); box-shadow: 0 18px 46px rgba(0,0,0,.30); }
+.du-kpi-top   { display: flex; align-items: center; gap: 8px; margin-bottom: 2px; }
+.du-kpi-icon  { font-size: 16px; line-height: 1; }
+.du-kpi-label { color: rgba(255,255,255,.55); font-size: 12px; font-weight: 800; letter-spacing: 1.2px; text-transform: uppercase; flex: 1; }
+.du-kpi-trend { font-size: 11px; font-weight: 900; padding: 2px 7px; border-radius: 999px; }
+.du-kpi-value { color: #fff; font-size: 25px; font-weight: 900; margin-top: 10px; }
+.du-kpi-unit  { font-size: 13px; font-weight: 700; color: rgba(255,255,255,.45); }
+.du-kpi-sub   { color: rgba(255,255,255,.50); font-size: 11.5px; margin-top: 8px; }
+
+.du-trend-up   { color: #00ffa3; background: rgba(0,255,163,.12); }
+.du-trend-down { color: #ff6b88; background: rgba(255,107,136,.12); }
+.du-trend-flat { color: rgba(255,255,255,.5); background: rgba(255,255,255,.06); }
+.du-kpi-value.du-trend-up   { color: #00ffa3; }
+.du-kpi-value.du-trend-down { color: #ff6b88; }
+
+.du-kpi-progress-track { height: 6px; border-radius: 999px; background: rgba(255,255,255,.08); margin-top: 10px; overflow: hidden; }
+.du-kpi-progress-fill  { height: 100%; border-radius: 999px; transition: width .4s ease; }
+
+.du-quote      { padding: 22px 24px; border-radius: 24px; background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.12); margin-bottom: 18px; }
+.du-quote-good { box-shadow: 0 0 35px rgba(0,255,163,.16); border-color: rgba(0,255,163,.28); }
+.du-quote-bad  { box-shadow: 0 0 35px rgba(255,77,109,.18); border-color: rgba(255,77,109,.30); }
+.du-quote-label{ color: rgba(255,255,255,.52); font-size: 11.5px; text-transform: uppercase; letter-spacing: 1.4px; font-weight: 900; margin-bottom: 8px; }
+.du-quote-text { color: #fff; font-size: 17px; font-weight: 700; line-height: 1.5; }
+
+.du-mini-grid  { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px; }
+.du-mini       { padding: 14px; border-radius: 16px; background: rgba(0,0,0,.18); border: 1px solid rgba(255,255,255,.08); transition: border-color .2s ease; }
+.du-mini:hover { border-color: rgba(255,255,255,.18); }
+.du-mini-label { color: rgba(255,255,255,.52); font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .8px; display: flex; align-items: center; gap: 6px; }
+.du-mini-value { color: #fff; font-size: 18px; font-weight: 900; margin-top: 6px; }
+
+.du-status-online  { color: #00ffa3; }
+.du-status-offline { color: #ff6b88; }
+.du-positive       { color: #00ffa3; }
+.du-negative       { color: #ff6b88; }
+
+.du-section-head      { display: flex; align-items: center; gap: 9px; margin: 2px 0 12px; }
+.du-section-icon      { font-size: 18px; line-height: 1; }
+.du-section-title-text{ font-size: 17px; font-weight: 800; color: #fff; }
+
+.du-empty-state { padding: 40px 20px; text-align: center; border-radius: 18px; background: rgba(0,0,0,.16); border: 1px dashed rgba(255,255,255,.12); }
+.du-empty-icon  { font-size: 32px; margin-bottom: 10px; }
+.du-empty-title { color: rgba(255,255,255,.85); font-weight: 800; font-size: 15px; margin-bottom: 4px; }
+.du-empty-sub   { color: rgba(255,255,255,.48); font-size: 13px; }
+
+.du-activity-item   { display: flex; gap: 12px; align-items: flex-start; padding: 11px 0; border-bottom: 1px solid rgba(255,255,255,.08); }
+.du-activity-item:last-child { border-bottom: none; }
+.du-activity-icon   { font-size: 17px; line-height: 1.4; flex-shrink: 0; }
+.du-activity-title  { color: rgba(255,255,255,.88); font-size: 13px; font-weight: 700; }
+.du-activity-sub    { font-size: 12.5px; margin-top: 2px; color: rgba(255,255,255,.62); }
+.du-activity-meta   { color: rgba(255,255,255,.40); font-weight: 500; }
+.du-feed-positive   { color: #00ffa3; }
+.du-feed-negative   { color: #ff6b88; }
+.du-feed-neutral    { color: rgba(255,255,255,.65); }
+
+.du-mode-row  { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-top: 14px; }
+.du-mode-pill {
+    display: inline-flex; align-items: center; gap: 7px; padding: 6px 14px; border-radius: 999px;
+    font-size: 12.5px; font-weight: 800; letter-spacing: .4px;
+    border: 1px solid rgba(255,255,255,.14); background: rgba(0,0,0,.20); color: rgba(255,255,255,.7);
+}
+.du-mode-pill.online  { border-color: rgba(0,255,163,.35); color: #00ffa3; background: rgba(0,255,163,.08); }
+.du-mode-pill.offline { border-color: rgba(255,107,136,.35); color: #ff6b88; background: rgba(255,107,136,.08); }
+.du-mode-dot { width: 8px; height: 8px; border-radius: 999px; background: currentColor; box-shadow: 0 0 8px currentColor; }
+
+/* ── 2026 polish patch: prevent HTML-looking fragments/overlap by keeping KPI cards self-contained ── */
+.du-kpi-card,
+.du-card,
+.du-dashboard-hero,
+.du-mini,
+.du-quote {
+    box-sizing: border-box;
+}
+
+.du-kpi-card {
+    width: 100%;
+    min-width: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    gap: 8px;
+    isolation: isolate;
+}
+
+.du-kpi-top,
+.du-kpi-value,
+.du-kpi-sub {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.du-kpi-value {
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
+    line-height: 1.05;
+    white-space: normal;
+}
+
+.du-kpi-number {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.du-kpi-unit {
+    flex-shrink: 0;
+    letter-spacing: .02em;
+}
+
+.du-kpi-progress-fill.good { background: #00ffa3; }
+.du-kpi-progress-fill.warn { background: #ffb020; }
+
+.du-kpi-trend.du-trend-flat {
+    background: rgba(255,255,255,.07);
+    color: rgba(255,255,255,.52);
+}
+
+@media (max-width: 1100px) {
+    .du-kpi-card { min-height: 118px; padding: 16px; }
+    .du-kpi-value { font-size: 22px; }
+}
+
+@media (max-width: 760px) {
+    .du-dashboard-hero { padding: 22px 18px; border-radius: 22px; }
+    .du-dashboard-title { font-size: 25px; }
+    .du-dashboard-sub { font-size: 13.5px; }
+    .du-kpi-card { min-height: 112px; border-radius: 18px; }
+    .du-kpi-label { font-size: 11px; letter-spacing: .8px; }
+    .du-kpi-value { font-size: 21px; }
+    .du-kpi-unit { font-size: 11px; }
+    .du-mini-grid { grid-template-columns: 1fr; }
 }

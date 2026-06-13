@@ -43,16 +43,15 @@ def _format_time(value):
 
 
 def _ensure_mt5_ready(mt5):
-    """Use the already-open MT5 terminal first; initialize only if needed."""
-    try:
-        account = mt5.account_info()
-        if account is not None:
-            return True
-    except Exception:
-        pass
+    """Read from the current MT5 session only.
 
+    Dashboard data should never launch/open MT5 by itself. The selected
+    Demo/Live account is connected upstream only when the user presses
+    Connect / Read Account. This keeps the dashboard fast and prevents
+    Streamlit reruns from freezing while MT5 starts.
+    """
     try:
-        return bool(mt5.initialize())
+        return mt5.account_info() is not None
     except Exception:
         return False
 
@@ -73,10 +72,20 @@ def _deal_direction(mt5_type):
     return "BUY" if typ == 0 else "SELL" if typ == 1 else "—"
 
 
-def get_live_mt5_dashboard_data(symbol=SYMBOL, days_back=90):
+def get_live_mt5_dashboard_data(symbol=SYMBOL, days_back=90, mode_label=None):
+    """
+    Read live MT5 data for the given symbol.
+
+    mode_label: optional string ("Demo" / "Live") describing which saved
+    profile was connected before this call. Purely cosmetic — echoed back
+    in the result dict so the UI can show which account is active. Does not
+    affect the MT5 read itself, since connection/mode switching happens
+    upstream via mt5_secure_store.connect_mt5(profile).
+    """
     empty = {
         "online": False,
         "symbol": symbol,
+        "mode": mode_label,
         "account": {
             "login": "—",
             "server": "—",
@@ -198,6 +207,7 @@ def get_live_mt5_dashboard_data(symbol=SYMBOL, days_back=90):
         return {
             "online": True,
             "symbol": symbol,
+            "mode": mode_label,
             "account": {
                 "login": account.get("login", "—"),
                 "server": account.get("server", "—"),
