@@ -1,0 +1,5 @@
+{
+  "SUPABASE_URL": "https://gzondcztcusuwyksoyvp.supabase.co",
+  "SUPABASE_ANON_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd6b25kY3p0Y3VzdXd5a3NveXZwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA3OTc1NzUsImV4cCI6MjA5NjM3MzU3NX0.qjSDCEqzKZB5dQp2IcVz3CJvUYUAowrbSOImaK0l-8U",
+  "DROPZ_UPDATE_MANIFEST_URL": "https://raw.githubusercontent.com/Zayaiken21/DropzUniversalAgent/main/version_manifest.json"
+}
