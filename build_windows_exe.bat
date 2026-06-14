@@ -29,6 +29,24 @@ if errorlevel 1 (
 echo Writing build_info.json...
 python -c "import json,os; info={'version':'%APP_VERSION%','build_id':'%BUILD_ID%','build_time_utc':'%BUILD_TIME_UTC%','github_owner':'%GITHUB_OWNER%','github_repo':'%GITHUB_REPO%','asset_name':'%APP_NAME%-Windows.zip'}; open('build_info.json','w',encoding='utf-8').write(json.dumps(info,indent=2))"
 
+
+echo Writing public_config.json for EXE...
+python -c "import json,os,sys; from pathlib import Path; from dotenv import dotenv_values; env=dotenv_values('.env') if Path('.env').exists() else {}; get=lambda k: (os.getenv(k) or env.get(k) or '').strip().strip('\"').strip(\"'\"); cfg={'SUPABASE_URL':get('SUPABASE_URL'),'SUPABASE_ANON_KEY':get('SUPABASE_ANON_KEY'),'DROPZ_UPDATE_MANIFEST_URL':get('DROPZ_UPDATE_MANIFEST_URL')}; missing=[k for k in ('SUPABASE_URL','SUPABASE_ANON_KEY') if not cfg.get(k)]; print('Public config:', {k: bool(v) for k,v in cfg.items()}); sys.exit('Missing required public Supabase config for EXE build: '+', '.join(missing)) if missing else Path('public_config.json').write_text(json.dumps(cfg,indent=2),encoding='utf-8')"
+if errorlevel 1 (
+  echo Public config generation failed.
+  pause
+  exit /b 1
+)
+
+if not exist version_manifest.json (
+  echo {"version":"%APP_VERSION%","download_url":"","notes":"Local build"}> version_manifest.json
+)
+
+if not exist update_manifest_url.txt (
+  echo https://api.github.com/repos/%GITHUB_OWNER%/%GITHUB_REPO%/releases/latest> update_manifest_url.txt
+)
+
+
 echo Cleaning old build output...
 rmdir /s /q build 2>nul
 rmdir /s /q dist 2>nul
@@ -97,6 +115,7 @@ python -m PyInstaller ^
   --add-data "version_manifest.json;." ^
   --add-data "update_manifest_url.txt;." ^
   --add-data "build_info.json;." ^
+  --add-data "public_config.json;." ^
   %EXTRA_CHAT_DATA% ^
   desktop_launcher.py
 
@@ -131,6 +150,9 @@ if exist "dist\DropzUpdater\DropzUpdater.exe" (
 echo Writing version/build files...
 echo %APP_VERSION%> "dist\%APP_NAME%\version.txt"
 copy /Y "build_info.json" "dist\%APP_NAME%\build_info.json" >nul
+copy /Y "public_config.json" "dist\%APP_NAME%\public_config.json" >nul
+if exist "dist\%APP_NAME%\_internal" copy /Y "public_config.json" "dist\%APP_NAME%\_internal\public_config.json" >nul
+
 if exist "dist\%APP_NAME%\_internal" copy /Y "build_info.json" "dist\%APP_NAME%\_internal\build_info.json" >nul
 
 echo Creating ZIP...
