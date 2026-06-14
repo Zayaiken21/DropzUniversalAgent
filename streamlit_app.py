@@ -9,7 +9,7 @@ ROOT_DIR = Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-# Local PyCharm .env
+# Local PyCharm .env support
 load_dotenv(ROOT_DIR / ".env")
 
 
