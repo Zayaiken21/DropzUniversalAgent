@@ -48,6 +48,13 @@ def _safe_cache_name(value: str) -> str:
     return cleaned[:160] or "asset"
 
 
+def _progress_bar(label: str, percent: int) -> None:
+    percent = max(0, min(100, int(percent)))
+    blocks = percent // 5
+    bar = "#" * blocks + "-" * (20 - blocks)
+    print(f"\r{label}: [{bar}] {percent:3d}%", end="", flush=True)
+
+
 def download_cached(url: str, version: str, build_id: str = "", expected_sha256: str = "") -> Path:
     cache_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME / "updates"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -58,6 +65,8 @@ def download_cached(url: str, version: str, build_id: str = "", expected_sha256:
         valid_hash = (not expected_sha256) or sha256_file(target).lower() == expected_sha256.lower()
         if valid_hash and _is_valid_zip(target):
             log(f"Using cached update ZIP: {target}")
+            _progress_bar("Download", 100)
+            print()
             return target
         log("Cached update ZIP is invalid or mismatched. Re-downloading.")
         target.unlink(missing_ok=True)
@@ -74,9 +83,10 @@ def download_cached(url: str, version: str, build_id: str = "", expected_sha256:
             "Pragma": "no-cache",
         },
     )
-    with urlopen(req, timeout=90) as resp, tmp.open("wb") as out:
+    with urlopen(req, timeout=120) as resp, tmp.open("wb") as out:
         total = int(resp.headers.get("Content-Length") or "0")
         done = 0
+        last_percent = -1
         while True:
             chunk = resp.read(1024 * 1024)
             if not chunk:
@@ -84,7 +94,12 @@ def download_cached(url: str, version: str, build_id: str = "", expected_sha256:
             out.write(chunk)
             done += len(chunk)
             if total:
-                print(f"\rDownload {int(done * 100 / total)}%", end="", flush=True)
+                percent = int(done * 100 / total)
+                if percent != last_percent:
+                    _progress_bar("Download", percent)
+                    last_percent = percent
+            else:
+                print(f"\rDownloaded {done / (1024 * 1024):.1f} MB", end="", flush=True)
     print()
 
     tmp.replace(target)
@@ -111,35 +126,18 @@ def extract_update(zip_path: Path, version: str, build_id: str = "") -> Path:
 
     log(f"Extracting update: {zip_path}")
     with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(extract_dir)
+        members = zf.infolist()
+        total = max(1, len(members))
+        for idx, member in enumerate(members, start=1):
+            zf.extract(member, extract_dir)
+            if idx == total or idx % max(1, total // 100) == 0:
+                _progress_bar("Extract", int(idx * 100 / total))
+    print()
 
     nested = extract_dir / APP_NAME
     if nested.exists() and (nested / f"{APP_NAME}.exe").exists():
         return nested
     return extract_dir
-
-
-def _process_exists(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        try:
-            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            result = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                capture_output=True,
-                text=True,
-                creationflags=flags,
-                timeout=5,
-            )
-            return str(pid) in (result.stdout or "")
-        except Exception:
-            return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except Exception:
-        return False
 
 
 def _write_state_files(src: Path, remote_state_json: str, version: str, build_id: str) -> None:
@@ -152,6 +150,7 @@ def _write_state_files(src: Path, remote_state_json: str, version: str, build_id
 
     state.setdefault("version", version)
     state.setdefault("signature", build_id)
+    state.setdefault("build_id", build_id)
     state["installed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     for name in ("update_state.json", "installed_update_state.json"):
@@ -173,21 +172,24 @@ def _write_finish_cmd(src: Path, app_dir: Path, main_exe: Path, wait_pid: int) -
     cmd_dir.mkdir(parents=True, exist_ok=True)
     cmd = cmd_dir / "finish_update.cmd"
 
-    # /MIR keeps installed files exactly in sync with the new ZIP.
-    # It runs after this updater exits, so Windows can replace DropzUpdater.exe too.
     script = f"""@echo off
 setlocal
-echo Finishing DropzUniversalAgent update...
-timeout /t 2 /nobreak >nul
+title Dropz Universal Agent Update Installer
+echo Installing Dropz Universal Agent update...
+echo Please keep this window open.
+timeout /t 1 /nobreak >nul
 :waitapp
 tasklist /FI "PID eq {wait_pid}" | find "{wait_pid}" >nul
 if not errorlevel 1 (
+  echo Waiting for launcher to close...
   timeout /t 1 /nobreak >nul
   goto waitapp
 )
+echo Copying update files...
 robocopy "{src}" "{app_dir}" /MIR /R:30 /W:1 /NFL /NDL /NP
 if %ERRORLEVEL% LEQ 7 (
-  echo Update installed.
+  echo Update installed successfully.
+  echo Starting Dropz Universal Agent...
   start "" "{main_exe}"
 ) else (
   echo Update copy failed with code %ERRORLEVEL%.
@@ -210,7 +212,6 @@ def main() -> int:
     parser.add_argument("--build-id", default="")
     parser.add_argument("--remote-state-json", default="")
     parser.add_argument("--wait-pid", type=int, default=0)
-    parser.add_argument("--background", action="store_true")
     args = parser.parse_args()
 
     app_dir = Path(args.app_dir).resolve()
@@ -222,7 +223,7 @@ def main() -> int:
         src = extract_update(zip_path, args.latest_version, args.build_id)
         _write_state_files(src, args.remote_state_json, args.latest_version, args.build_id)
 
-        log(f"Waiting for app process to close. PID={args.wait_pid}")
+        log("Preparing safe installer handoff.")
         finish_cmd = _write_finish_cmd(src, app_dir, main_exe, args.wait_pid)
 
         flags = 0
@@ -230,9 +231,7 @@ def main() -> int:
             flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
             subprocess.Popen(["cmd.exe", "/c", str(finish_cmd)], cwd=str(app_dir), creationflags=flags)
         else:
-            # Non-Windows fallback for development.
-            while _process_exists(args.wait_pid):
-                time.sleep(1)
+            # Non-Windows fallback for development/testing.
             for item in src.iterdir():
                 dest = app_dir / item.name
                 if item.is_dir():
@@ -243,15 +242,15 @@ def main() -> int:
                     shutil.copy2(item, dest)
             subprocess.Popen([str(main_exe)], cwd=str(app_dir))
 
-        log("Background installer launched. Updater can close.")
+        log("Installer launched. Updater can close.")
         return 0
     except Exception as exc:
         log(f"Update failed: {exc}")
-        if not args.background:
-            try:
-                input("Press Enter to close updater...")
-            except Exception:
-                pass
+        try:
+            input("Press Enter to open the current app without updating...")
+            subprocess.Popen([str(main_exe)], cwd=str(app_dir))
+        except Exception:
+            pass
         return 1
 
 

@@ -17,16 +17,17 @@ APP_NAME = "DropzUniversalAgent"
 GITHUB_OWNER = os.environ.get("DROPZ_GITHUB_OWNER", "Zayaiken21")
 GITHUB_REPO = os.environ.get("DROPZ_GITHUB_REPO", "DropzUniversalAgent")
 UPDATE_ASSET_NAME = os.environ.get("DROPZ_UPDATE_ASSET_NAME", "DropzUniversalAgent-Windows.zip")
+UPDATE_CHECK_TIMEOUT_SECONDS = int(os.environ.get("DROPZ_UPDATE_CHECK_TIMEOUT_SECONDS", "8"))
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("DROPZ_DESKTOP_PORT", "8501"))
 URL = f"http://{HOST}:{PORT}"
 
 _opened_browser = False
-_update_started = False
 
 
 def _base_dir() -> Path:
+    # PyInstaller onedir places bundled app files in sys._MEIPASS / _internal.
     if getattr(sys, "frozen", False):
         return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
     return Path(__file__).resolve().parent
@@ -47,50 +48,18 @@ LOG_FILE = Path(os.environ.get("DROPZ_LAUNCHER_LOG", str(Path.home() / "DropzUni
 UPDATE_STATE_FILE = USER_DATA_DIR / "update_state.json"
 
 
-def log(message: str) -> None:
-    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}"
+def log(msg: str) -> None:
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
     try:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with LOG_FILE.open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
     except Exception:
         pass
     try:
         print(line, flush=True)
     except Exception:
         pass
-
-
-def _port_open() -> bool:
-    try:
-        with socket.create_connection((HOST, PORT), timeout=0.35):
-            return True
-    except OSError:
-        return False
-
-
-def _find_app_file() -> Path:
-    candidates = [
-        BASE_DIR / "streamlit_app.py",
-        EXE_DIR / "streamlit_app.py",
-        EXE_DIR / "_internal" / "streamlit_app.py",
-        Path.cwd() / "streamlit_app.py",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate.resolve()
-    raise FileNotFoundError("streamlit_app.py was not found next to the EXE or inside _internal.")
-
-
-def _configure_runtime() -> None:
-    os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
-    os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
-    os.environ.setdefault("STREAMLIT_GLOBAL_DEVELOPMENT_MODE", "false")
-    os.environ.setdefault("DROPZ_DESKTOP_MODE", "true")
-    os.environ.setdefault("DROPZ_USER_DATA_DIR", str(USER_DATA_DIR))
-
-    installed = _installed_info()
-    os.environ.setdefault("DROPZ_APP_VERSION", str(installed.get("version") or "1.0.0"))
 
 
 def _read_json(path: Path) -> dict:
@@ -112,11 +81,16 @@ def _write_json(path: Path, data: dict) -> None:
 
 
 def _installed_info() -> dict:
+    # installed_update_state.json/update_state.json are written by the updater after a successful update.
     candidates = [
+        UPDATE_STATE_FILE,
+        EXE_DIR / "installed_update_state.json",
+        EXE_DIR / "update_state.json",
         EXE_DIR / "build_info.json",
         EXE_DIR / "_internal" / "build_info.json",
         BASE_DIR / "build_info.json",
     ]
+
     info: dict = {}
     for candidate in candidates:
         info = _read_json(candidate)
@@ -131,238 +105,180 @@ def _installed_info() -> dict:
             pass
 
     info.setdefault("version", "1.0.0")
-    info.setdefault("build_id", "")
-    info.setdefault("build_time_utc", "")
+    info.setdefault("signature", info.get("build_id", ""))
+    info.setdefault("build_id", info.get("signature", ""))
     return info
 
 
-def _version_tuple(value: str) -> tuple[int, ...]:
-    parts = []
-    for piece in str(value or "0").replace("v", "").replace("-", ".").split("."):
-        digits = "".join(ch for ch in piece if ch.isdigit())
-        parts.append(int(digits or "0"))
-    return tuple(parts or [0])
-
-
-def _fetch_json(url: str, timeout: int = 10) -> dict:
+def _github_latest_release() -> dict:
+    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
     req = Request(
         url,
         headers={
             "User-Agent": f"{APP_NAME}-Launcher",
-            "Accept": "application/vnd.github+json, application/json",
+            "Accept": "application/vnd.github+json",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
         },
     )
-    with urlopen(req, timeout=timeout) as resp:
-        raw = resp.read(3 * 1024 * 1024).decode("utf-8")
-    data = json.loads(raw)
-    return data if isinstance(data, dict) else {}
-
-
-def _github_latest_release() -> dict:
-    api_url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
-    release = _fetch_json(api_url)
-
-    assets = release.get("assets") or []
-    asset = None
-    for item in assets:
-        if str(item.get("name") or "") == UPDATE_ASSET_NAME:
-            asset = item
-            break
-
-    if not asset:
-        raise RuntimeError(f"Release asset not found: {UPDATE_ASSET_NAME}")
-
-    tag = str(release.get("tag_name") or release.get("name") or "").strip()
-    version = tag[1:] if tag.lower().startswith("v") else tag
-    if not version:
-        version = str(release.get("id") or "0")
-
-    asset_id = str(asset.get("id") or "")
-    updated_at = str(asset.get("updated_at") or asset.get("created_at") or "")
-    size = str(asset.get("size") or "")
-    download_url = str(asset.get("browser_download_url") or "")
-
-    if not download_url:
-        raise RuntimeError("GitHub release asset has no download URL.")
-
-    signature = "|".join(
-        [
-            "github_release_asset",
-            str(release.get("id") or ""),
-            tag,
-            asset_id,
-            updated_at,
-            size,
-            UPDATE_ASSET_NAME,
-        ]
-    )
-
-    return {
-        "source": "github",
-        "version": version,
-        "tag_name": tag,
-        "release_id": str(release.get("id") or ""),
-        "asset_id": asset_id,
-        "asset_name": UPDATE_ASSET_NAME,
-        "asset_updated_at": updated_at,
-        "asset_size": size,
-        "download_url": download_url,
-        "sha256": "",
-        "signature": signature,
-    }
-
-
-def _manifest_fallback() -> dict:
-    manifest_url = os.environ.get("DROPZ_UPDATE_MANIFEST_URL", "").strip()
-    if not manifest_url:
-        for candidate in (EXE_DIR / "update_manifest_url.txt", EXE_DIR / "_internal" / "update_manifest_url.txt", BASE_DIR / "update_manifest_url.txt"):
-            if candidate.exists():
-                manifest_url = candidate.read_text(encoding="utf-8").strip()
-                break
-
-    if not manifest_url:
-        return {}
-
-    data = _fetch_json(manifest_url)
-    version = str(data.get("version") or "").strip()
-    download_url = str(data.get("download_url") or "").strip()
-    if not version or not download_url:
-        return {}
-
-    signature = str(data.get("build_id") or data.get("sha256") or data.get("updated_at") or version)
-    return {
-        "source": "manifest",
-        "version": version,
-        "tag_name": f"v{version}",
-        "release_id": "",
-        "asset_id": "",
-        "asset_name": UPDATE_ASSET_NAME,
-        "asset_updated_at": str(data.get("updated_at") or ""),
-        "asset_size": "",
-        "download_url": download_url,
-        "sha256": str(data.get("sha256") or ""),
-        "signature": f"manifest|{signature}|{download_url}",
-    }
+    with urlopen(req, timeout=UPDATE_CHECK_TIMEOUT_SECONDS) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        return data if isinstance(data, dict) else {}
 
 
 def _remote_update_info() -> dict:
+    release = _github_latest_release()
+    assets = release.get("assets") or []
+    asset = None
+    for item in assets:
+        if str(item.get("name") or "").lower() == UPDATE_ASSET_NAME.lower():
+            asset = item
+            break
+    if not asset:
+        return {}
+
+    tag = str(release.get("tag_name") or release.get("name") or "0.0.0").lstrip("v")
+    asset_id = str(asset.get("id") or "")
+    updated_at = str(asset.get("updated_at") or asset.get("created_at") or release.get("published_at") or "")
+    size = str(asset.get("size") or "")
+    download_url = str(asset.get("browser_download_url") or "")
+    release_id = str(release.get("id") or "")
+
+    # Signature is intentionally based on GitHub asset metadata, not just version.
+    # If you delete/re-upload the ZIP under the same release tag, asset id/updated_at/size changes.
+    signature = f"github:{GITHUB_OWNER}/{GITHUB_REPO}:{release_id}:{asset_id}:{updated_at}:{size}:{UPDATE_ASSET_NAME}"
+
+    return {
+        "version": tag or "0.0.0",
+        "signature": signature,
+        "build_id": signature,
+        "download_url": download_url,
+        "asset_name": UPDATE_ASSET_NAME,
+        "asset_id": asset_id,
+        "asset_updated_at": updated_at,
+        "asset_size": size,
+        "release_id": release_id,
+        "release_url": str(release.get("html_url") or ""),
+    }
+
+
+def _update_available(local: dict, remote: dict) -> bool:
+    if not remote or not remote.get("download_url") or not remote.get("signature"):
+        return False
+
+    local_sig = str(local.get("signature") or local.get("build_id") or "")
+    remote_sig = str(remote.get("signature") or remote.get("build_id") or "")
+    if remote_sig and remote_sig != local_sig:
+        return True
+
+    # Fallback: version changed.
+    return str(remote.get("version") or "") != str(local.get("version") or "")
+
+
+def _run_prelaunch_update_if_available() -> bool:
+    """
+    Checks GitHub Releases before opening the app. If an update exists, this launches
+    DropzUpdater.exe in foreground mode so the user sees download/install progress,
+    then exits this launcher. The updater installs and relaunches the updated app.
+    """
     try:
-        return _github_latest_release()
+        if os.environ.get("DROPZ_SKIP_UPDATE_CHECK", "").lower() in {"1", "true", "yes"}:
+            log("Update check skipped by DROPZ_SKIP_UPDATE_CHECK.")
+            return False
+
+        updater = EXE_DIR / "DropzUpdater.exe"
+        if not updater.exists():
+            log("No updater found. Opening app normally.")
+            return False
+
+        local = _installed_info()
+        log("Checking GitHub Releases for updates...")
+        remote = _remote_update_info()
+        if not _update_available(local, remote):
+            log("No update available.")
+            return False
+
+        log(f"Update available: {local.get('version')} -> {remote.get('version')} ({remote.get('asset_updated_at')}).")
+        log("Starting updater before opening the app so progress is visible.")
+
+        args = [
+            str(updater),
+            "--app-dir", str(EXE_DIR),
+            "--main-exe", str(EXE_DIR / f"{APP_NAME}.exe"),
+            "--current-version", str(local.get("version") or "0.0.0"),
+            "--latest-version", str(remote.get("version") or "0.0.0"),
+            "--download-url", str(remote.get("download_url") or ""),
+            "--build-id", str(remote.get("signature") or ""),
+            "--remote-state-json", json.dumps(remote, separators=(",", ":")),
+            "--wait-pid", str(os.getpid()),
+        ]
+
+        subprocess.Popen(args, cwd=str(EXE_DIR), close_fds=True)
+        log("Launcher exiting so updater can safely replace app files.")
+        return True
     except Exception as exc:
-        log(f"GitHub release update check failed: {exc}")
-        try:
-            data = _manifest_fallback()
-            if data:
-                log("Using manifest fallback for update check.")
-                return data
-        except Exception as manifest_exc:
-            log(f"Manifest fallback failed: {manifest_exc}")
-    return {}
+        # Never block app launch if update check fails.
+        log(f"Update check failed; opening app normally: {exc}")
+        return False
 
 
-def _should_update(remote: dict, installed: dict, state: dict) -> tuple[bool, str]:
-    if not remote:
-        return False, "No remote update info."
-
-    local_version = str(installed.get("version") or "0.0.0")
-    remote_version = str(remote.get("version") or "0.0.0")
-
-    if _version_tuple(remote_version) > _version_tuple(local_version):
-        return True, f"newer version {local_version} -> {remote_version}"
-
-    if _version_tuple(remote_version) < _version_tuple(local_version):
-        return False, f"installed version {local_version} is newer than remote {remote_version}"
-
-    remote_sig = str(remote.get("signature") or "")
-    state_sig = str(state.get("signature") or "")
-
-    if not remote_sig:
-        return False, "Remote signature missing."
-
-    if not state_sig:
-        # First run of the advanced updater on this installed version.
-        # Adopt the current GitHub asset as the baseline so we do not keep
-        # reinstalling the same ZIP forever. Future reuploads with the same
-        # version/tag will change asset_id/updated_at/size and will update.
-        baseline = dict(remote)
-        baseline["adopted_without_update"] = True
-        baseline["adopted_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        _write_json(UPDATE_STATE_FILE, baseline)
-        return False, "Baseline update asset recorded for same-version tracking."
-
-    if state_sig != remote_sig:
-        return True, "same version but GitHub release asset changed"
-
-    return False, "No update needed; release asset signature matches installed state."
+def _port_open() -> bool:
+    try:
+        with socket.create_connection((HOST, PORT), timeout=0.4):
+            return True
+    except OSError:
+        return False
 
 
-def _start_update_check_in_background() -> None:
-    global _update_started
-    if _update_started:
-        return
-    _update_started = True
+def _find_app_file() -> Path:
+    candidates = [
+        BASE_DIR / "streamlit_app.py",
+        EXE_DIR / "streamlit_app.py",
+        EXE_DIR / "_internal" / "streamlit_app.py",
+        Path.cwd() / "streamlit_app.py",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    raise FileNotFoundError("streamlit_app.py was not found next to the EXE or inside _internal.")
 
-    def worker() -> None:
-        try:
-            if os.environ.get("DROPZ_DISABLE_UPDATES", "").lower() in {"1", "true", "yes", "on"}:
-                log("Updates disabled by DROPZ_DISABLE_UPDATES.")
-                return
 
-            installed = _installed_info()
-            state = _read_json(UPDATE_STATE_FILE)
-            remote = _remote_update_info()
+def _configure_streamlit_runtime() -> None:
+    os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+    os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
+    os.environ.setdefault("STREAMLIT_GLOBAL_DEVELOPMENT_MODE", "false")
+    os.environ.setdefault("DROPZ_DESKTOP_MODE", "true")
+    os.environ.setdefault("DROPZ_USER_DATA_DIR", str(USER_DATA_DIR))
 
-            should_update, reason = _should_update(remote, installed, state)
-            if not should_update:
-                log(f"Update check complete: {reason}")
-                return
-
-            updater = EXE_DIR / "DropzUpdater.exe"
-            if not updater.exists():
-                log("Update available, but DropzUpdater.exe is missing.")
-                return
-
-            latest = str(remote.get("version") or "0.0.0")
-            download_url = str(remote.get("download_url") or "")
-            build_id = str(remote.get("signature") or remote.get("asset_id") or remote.get("asset_updated_at") or latest)
-
-            log(f"Update available: {reason}. Starting updater in background.")
-            args = [
-                str(updater),
-                "--app-dir", str(EXE_DIR),
-                "--main-exe", str(EXE_DIR / f"{APP_NAME}.exe"),
-                "--current-version", str(installed.get("version") or "0.0.0"),
-                "--latest-version", latest,
-                "--download-url", download_url,
-                "--sha256", str(remote.get("sha256", "") or ""),
-                "--build-id", build_id,
-                "--remote-state-json", json.dumps(remote, separators=(",", ":")),
-                "--wait-pid", str(os.getpid()),
-                "--background",
-            ]
-            subprocess.Popen(args, cwd=str(EXE_DIR), close_fds=True)
-        except Exception as exc:
-            log(f"Update check skipped: {type(exc).__name__}: {exc}")
-
-    threading.Thread(target=worker, daemon=True).start()
+    installed = _installed_info()
+    os.environ.setdefault("DROPZ_APP_VERSION", str(installed.get("version") or "1.0.0"))
 
 
 def _run_streamlit_in_process(app_file: Path) -> None:
-    _configure_runtime()
+    """
+    Starts Streamlit without spawning this EXE again.
+    This avoids infinite launcher recursion from using sys.executable.
+    """
+    _configure_streamlit_runtime()
+
     import streamlit.web.cli as stcli
 
     sys.argv = [
         "streamlit",
         "run",
         str(app_file),
-        "--server.address", HOST,
-        "--server.port", str(PORT),
-        "--server.headless", "true",
-        "--browser.gatherUsageStats", "false",
-        "--global.developmentMode", "false",
+        "--server.address",
+        HOST,
+        "--server.port",
+        str(PORT),
+        "--server.headless",
+        "true",
+        "--browser.gatherUsageStats",
+        "false",
+        "--global.developmentMode",
+        "false",
     ]
+
     log("Starting Streamlit in-process.")
     stcli.main()
 
@@ -373,43 +289,48 @@ def _open_browser_once() -> None:
         return
     _opened_browser = True
     log(f"Opening browser once: {URL}")
-    webbrowser.open_new(URL)
+    webbrowser.open(URL, new=1, autoraise=True)
 
 
 def _wait_and_open_browser() -> None:
     log(f"Waiting for Streamlit server at {URL}")
-    deadline = time.time() + 90
-    while time.time() < deadline:
+    for _ in range(120):
         if _port_open():
             time.sleep(0.8)
             _open_browser_once()
-            _start_update_check_in_background()
             return
-        time.sleep(0.35)
-    log("Streamlit did not respond before timeout. Opening browser once anyway.")
-    _open_browser_once()
-    _start_update_check_in_background()
+        time.sleep(0.5)
+    log("Timed out waiting for Streamlit. Browser was not opened.")
 
 
 def main() -> int:
     log("Launcher starting.")
     try:
+        # Pre-launch update: if update exists, updater shows progress and relaunches updated app.
+        if _run_prelaunch_update_if_available():
+            return 0
+
         app_file = _find_app_file()
         log(f"Using app file: {app_file}")
 
-        browser_thread = threading.Thread(target=_wait_and_open_browser, daemon=True)
-        browser_thread.start()
+        if _port_open():
+            log("Streamlit already running. Reusing existing server.")
+            _open_browser_once()
+            return 0
+
+        opener = threading.Thread(target=_wait_and_open_browser, daemon=True)
+        opener.start()
 
         _run_streamlit_in_process(app_file)
         return 0
-    except Exception as exc:
+
+    except BaseException as exc:
         log(f"Launcher fatal error: {type(exc).__name__}: {exc}")
         log(traceback.format_exc())
         try:
-            print(f"\n{APP_NAME} failed to start. See log:\n{LOG_FILE}\n")
-            input("Press Enter to close...")
+            input("Dropz Universal Agent failed to start. Press Enter to close...")
         except Exception:
-            pass
+            time.sleep(8)
         return 1
     finally:
         log("Launcher stopped.")

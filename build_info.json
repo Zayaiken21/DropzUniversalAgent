@@ -1,8 +1,9 @@
-{
-  "version": "1.0.1",
-  "build_id": "ands.GetDateCommand",
-  "build_time_utc": " ",
-  "github_owner": "Zayaiken21",
-  "github_repo": "DropzUniversalAgent",
-  "asset_name": "DropzUniversalAgent-Windows.zip"
+﻿{
+    "version":  "1.0.1",
+    "build_id":  "ands.GetDateCommand",
+    "signature":  "ands.GetDateCommand",
+    "asset_name":  "DropzUniversalAgent-Windows.zip",
+    "github_owner":  "Zayaiken21",
+    "build_time_utc":  "ands.GetDateCommand",
+    "github_repo":  "DropzUniversalAgent"
 }
