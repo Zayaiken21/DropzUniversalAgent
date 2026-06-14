@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('streamlit_app.py', '.'), ('frontend', 'frontend'), ('components', 'components'), ('chat_backend', 'chat_backend'), ('backend', 'backend'), ('agents', 'agents'), ('strategies', 'strategies'), ('styles', 'styles'), ('tools', 'tools'), ('assets', 'assets'), ('data', 'data'), ('frontend\\dropz.db', 'frontend'), ('version_manifest.json', '.'), ('update_manifest_url.txt', '.'), ('build_info.json', '.'), ('chat_agent.py', '.')]
+datas = [('streamlit_app.py', '.'), ('frontend', 'frontend'), ('components', 'components'), ('chat_backend', 'chat_backend'), ('backend', 'backend'), ('agents', 'agents'), ('strategies', 'strategies'), ('styles', 'styles'), ('tools', 'tools'), ('assets', 'assets'), ('data', 'data'), ('frontend\\dropz.db', 'frontend'), ('version_manifest.json', '.'), ('update_manifest_url.txt', '.'), ('build_info.json', '.'), ('public_config.json', '.'), ('chat_agent.py', '.')]
 binaries = []
 hiddenimports = ['cryptography', 'cryptography.fernet', 'cryptography.hazmat.bindings._rust', 'cryptography.hazmat.primitives', 'cffi', '_cffi_backend', 'requests', 'certifi', 'chat_agent', 'components', 'components.charts', 'components.dashboard_mt5_data', 'chat_backend', 'backend']
 tmp_ret = collect_all('streamlit')
