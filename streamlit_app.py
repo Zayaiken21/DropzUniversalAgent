@@ -72,18 +72,46 @@ st.markdown(
         padding-bottom: 0.6rem !important;
         max-width: 100% !important;
     }
+
+    /* Stop global font-size clamp from inflating menu button labels */
+    .st-key-top_menu_area div[data-testid="stButton"] button,
+    .st-key-top_menu_area div[data-testid="stButton"] button p {
+        font-size: 12px !important;
+    }
+
     @media (max-width: 768px) {
         .block-container {
             padding-left: 0.45rem !important;
             padding-right: 0.45rem !important;
         }
-        /* Stack columns on mobile EXCEPT the top navigation menu */
-        [data-testid="stHorizontalBlock"]:not(.st-key-top_menu_area [data-testid="stHorizontalBlock"]) {
+        /* Stack columns on mobile for all blocks EXCEPT the top nav menu */
+        [data-testid="stHorizontalBlock"]:not(
+            .st-key-top_menu_area [data-testid="stHorizontalBlock"]
+        ) {
             flex-direction: column !important;
         }
-        [data-testid="stHorizontalBlock"]:not(.st-key-top_menu_area [data-testid="stHorizontalBlock"]) > [data-testid="column"] {
+        [data-testid="stHorizontalBlock"]:not(
+            .st-key-top_menu_area [data-testid="stHorizontalBlock"]
+        ) > [data-testid="column"] {
             width: 100% !important;
             flex: 1 1 100% !important;
+        }
+
+        /* Keep menu as 7-column grid on mobile — never stacked */
+        .st-key-top_menu_area div[data-testid="stHorizontalBlock"] {
+            display: grid !important;
+            grid-template-columns: repeat(7, minmax(0, 1fr)) !important;
+            flex-direction: unset !important;
+        }
+        .st-key-top_menu_area [data-testid="column"] {
+            width: 100% !important;
+            flex: unset !important;
+        }
+
+        /* Mobile menu button font */
+        .st-key-top_menu_area div[data-testid="stButton"] button,
+        .st-key-top_menu_area div[data-testid="stButton"] button p {
+            font-size: 9.8px !important;
         }
     }
     </style>
