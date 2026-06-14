@@ -633,3 +633,197 @@ UPGRADE: REDUCE PAGE SWITCH FLICKER
 .stSpinner {
     background: transparent !important;
 }
+
+/* =========================================
+DROPZ MOBILE TOP MENU - EBAY STYLE LOGIC
+Keeps existing Dropz theme, but sizes the top menu like the eBay app.
+========================================= */
+
+.st-key-top_menu_area {
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 auto 0.45rem auto !important;
+}
+
+.st-key-top_menu_area .top-menu-wrap {
+    position: sticky !important;
+    top: 0 !important;
+    z-index: 9999 !important;
+    padding: 0.42rem 0.5rem !important;
+    margin: 0 auto 0.45rem auto !important;
+    border-radius: 22px !important;
+    background:
+        linear-gradient(
+            135deg,
+            rgba(0, 212, 255, 0.18),
+            rgba(10, 80, 122, 0.62),
+            rgba(25, 200, 209, 0.22)
+        ),
+        rgba(8, 26, 40, 0.82) !important;
+    border: 1px solid rgba(255,255,255,0.14) !important;
+    backdrop-filter: blur(18px) !important;
+    -webkit-backdrop-filter: blur(18px) !important;
+    box-shadow: 0 14px 34px rgba(0,0,0,0.16) !important;
+    overflow: hidden !important;
+}
+
+.st-key-top_menu_area div[data-testid="stHorizontalBlock"] {
+    display: grid !important;
+    grid-template-columns: repeat(7, minmax(0, 1fr)) !important;
+    gap: 7px !important;
+    width: 100% !important;
+    max-width: 100% !important;
+}
+
+.st-key-top_menu_area div[data-testid="stHorizontalBlock"] > div,
+.st-key-top_menu_area [data-testid="column"] {
+    min-width: 0 !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+}
+
+.st-key-top_menu_area div[data-testid="stButton"] button {
+    width: 100% !important;
+    min-width: 0 !important;
+    height: 40px !important;
+    min-height: 40px !important;
+    padding: 0 0.25rem !important;
+    border-radius: 999px !important;
+    border: 1px solid rgba(0,212,255,0.18) !important;
+    background:
+        linear-gradient(
+            135deg,
+            rgba(255,255,255,0.15),
+            rgba(6,24,37,0.70),
+            rgba(0,212,255,0.10)
+        ) !important;
+    color: #f2fbff !important;
+    font-size: 12px !important;
+    font-weight: 850 !important;
+    letter-spacing: -0.12px !important;
+    line-height: 1 !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: clip !important;
+    box-shadow: 0 7px 18px rgba(0,0,0,0.13) !important;
+}
+
+.st-key-top_menu_area div[data-testid="stButton"] button p {
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 !important;
+    color: #f2fbff !important;
+    font-size: 12px !important;
+    font-weight: 850 !important;
+    letter-spacing: -0.12px !important;
+    line-height: 1 !important;
+    text-align: center !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: clip !important;
+}
+
+.st-key-top_menu_area button[kind="primary"],
+.st-key-top_menu_area [data-testid="stBaseButton-primary"],
+.st-key-top_menu_area div[data-testid="stButton"] button[kind="primary"] {
+    background:
+        linear-gradient(
+            135deg,
+            #00d4ff,
+            #0a507a,
+            #19c8d1
+        ) !important;
+    color: #ffffff !important;
+    border: 1px solid rgba(255,255,255,0.20) !important;
+    box-shadow: 0 10px 24px rgba(0,212,255,0.22) !important;
+}
+
+.st-key-top_menu_area button[kind="primary"] p,
+.st-key-top_menu_area [data-testid="stBaseButton-primary"] p,
+.st-key-top_menu_area div[data-testid="stButton"] button[kind="primary"] p {
+    color: #ffffff !important;
+}
+
+/* Mobile keeps all buttons on one row, sized down instead of stacking. */
+@media screen and (max-width: 700px) {
+    .block-container {
+        padding-left: 0.28rem !important;
+        padding-right: 0.28rem !important;
+        padding-top: 0.35rem !important;
+        max-width: 100vw !important;
+    }
+
+    .brand-card {
+        padding: 0.72rem 0.55rem !important;
+        border-radius: 18px !important;
+        margin-bottom: 0.35rem !important;
+    }
+
+    .brand-card h1 {
+        font-size: clamp(1.55rem, 7vw, 2.1rem) !important;
+        letter-spacing: -0.7px !important;
+        line-height: 1.02 !important;
+    }
+
+    .brand-card .muted {
+        font-size: 0.78rem !important;
+        line-height: 1.25 !important;
+    }
+
+    .st-key-top_menu_area .top-menu-wrap {
+        position: sticky !important;
+        top: 0 !important;
+        padding: 0.32rem 0.22rem !important;
+        margin-bottom: 0.35rem !important;
+        border-radius: 18px !important;
+        overflow: hidden !important;
+    }
+
+    .st-key-top_menu_area div[data-testid="stHorizontalBlock"] {
+        display: grid !important;
+        grid-template-columns: repeat(7, minmax(0, 1fr)) !important;
+        gap: 1px !important;
+        flex-direction: initial !important;
+    }
+
+    .st-key-top_menu_area div[data-testid="stHorizontalBlock"] > div,
+    .st-key-top_menu_area [data-testid="column"] {
+        width: 100% !important;
+        min-width: 0 !important;
+        max-width: 100% !important;
+        flex: initial !important;
+    }
+
+    .st-key-top_menu_area div[data-testid="stButton"] button,
+    .st-key-top_menu_area div[data-testid="stButton"] button p {
+        height: 41px !important;
+        min-height: 41px !important;
+        font-size: 10.4px !important;
+        font-weight: 850 !important;
+        letter-spacing: -0.66px !important;
+        line-height: 1 !important;
+        padding: 0 1px !important;
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-align: center !important;
+    }
+}
+
+@media screen and (max-width: 430px) {
+    .st-key-top_menu_area div[data-testid="stButton"] button,
+    .st-key-top_menu_area div[data-testid="stButton"] button p {
+        font-size: 9.9px !important;
+        letter-spacing: -0.72px !important;
+    }
+}
+
+@media screen and (max-width: 390px) {
+    .st-key-top_menu_area div[data-testid="stButton"] button,
+    .st-key-top_menu_area div[data-testid="stButton"] button p {
+        font-size: 9.35px !important;
+        letter-spacing: -0.76px !important;
+    }
+}
+

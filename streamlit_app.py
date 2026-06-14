@@ -198,43 +198,57 @@ def _render_header():
 
 
 def _render_menu():
-    st.markdown('<div class="top-menu-wrap">', unsafe_allow_html=True)
+    """
+    Top menu uses the same Streamlit layout logic as the eBay app:
+    - keyed container: st-key-top_menu_area
+    - one compact row on mobile
+    - primary button type for the active page
+    Existing Dropz routes and logout behavior stay unchanged.
+    """
+    with st.container(key="top_menu_area"):
+        st.markdown('<div class="top-menu-wrap">', unsafe_allow_html=True)
 
-    menu_cols = st.columns([1, 1, 1, 1, 1, 1, 1])
-    menu_labels = [
-        "Dashboard",
-        "Education",
-        "TradeSmart",
-        "Chat",
-        "Tools",
-        "Settings",
-        "Logout",
-    ]
+        menu_labels = [
+            "Dashboard",
+            "Education",
+            "TradeSmart",
+            "Chat",
+            "Tools",
+            "Settings",
+            "Logout",
+        ]
 
-    for col, label in zip(menu_cols, menu_labels):
-        with col:
-            page_key = label.lower()
-            current_page = "education" if st.session_state.selected_page == "accounts" else st.session_state.selected_page
-            is_active = page_key == current_page
-            button_label = f"● {label}" if is_active and label != "Logout" else label
+        menu_cols = st.columns(len(menu_labels), gap="small")
 
-            if label == "Logout":
-                st.button(
-                    button_label,
-                    use_container_width=True,
-                    key=f"top_{label}",
-                    on_click=_logout,
-                )
-            else:
-                st.button(
-                    button_label,
-                    use_container_width=True,
-                    key=f"top_{label}",
-                    on_click=_go,
-                    args=(page_key,),
-                )
+        current_page = (
+            "education"
+            if st.session_state.selected_page == "accounts"
+            else st.session_state.selected_page
+        )
 
-    st.markdown("</div>", unsafe_allow_html=True)
+        for index, label in enumerate(menu_labels):
+            with menu_cols[index]:
+                page_key = label.lower()
+                is_active = page_key == current_page
+
+                if label == "Logout":
+                    st.button(
+                        "Logout",
+                        use_container_width=True,
+                        key=f"top_{label}",
+                        on_click=_logout,
+                    )
+                else:
+                    if st.button(
+                        label,
+                        use_container_width=True,
+                        key=f"top_{label}",
+                        type="primary" if is_active else "secondary",
+                    ):
+                        _go(page_key)
+                        st.rerun()
+
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 def _render_page():
