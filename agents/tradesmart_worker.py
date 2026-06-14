@@ -49,6 +49,16 @@ def run_worker() -> None:
 
             state["last_result"] = result
             state["last_run"] = datetime.now().isoformat(timespec="seconds")
+
+            # Safety kill-switch: once the agent reports max-loss reached, the
+            # worker disables itself immediately. This prevents the background
+            # process from continuing to scan/open trades after the UI toggle is
+            # forced off. The user must manually re-enable TradeSmart later.
+            if result.get("max_daily_loss_reached"):
+                state["enabled"] = False
+                state["disabled_reason"] = result.get("message") or "Max loss limit reached."
+                state["disabled_at"] = datetime.now().isoformat(timespec="seconds")
+
             STATE_FILE.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
 
             _log(str(result.get("message") or result.get("phase") or "cycle complete"))

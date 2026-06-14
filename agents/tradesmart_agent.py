@@ -545,14 +545,43 @@ class TradeSmartAgent:
         volume  = max(min_vol, min(float(volume), max_vol))
         return round(round(volume / step) * step, 2)
 
-    def _max_loss_hit(self, snapshot: Dict[str, Any]) -> Tuple[bool, float]:
+    def _max_loss_hit(self, snapshot: Dict[str, Any], positions: Optional[List[Dict[str, Any]]] = None) -> Tuple[bool, float, str]:
+        """
+        Hard risk stop for TradeSmart tracked positions.
+
+        The old check only compared balance vs equity. That can miss edge cases
+        where MT5/account data is delayed or where one tracked position is already
+        beyond the loss limit while the combined equity field has not refreshed yet.
+
+        This checks all three live-loss views and trips if ANY reaches the limit:
+          1. balance - equity           -> whole account floating drawdown
+          2. sum of negative positions  -> all tracked TradeSmart trades combined
+          3. worst negative position    -> one tracked trade by itself
+        """
         max_loss = float(self.rules.get("max_daily_loss_amount", 0) or 0)
         if max_loss <= 0:
-            return False, 0.0
+            return False, 0.0, "disabled"
+
+        positions = positions or []
         balance = float(snapshot.get("balance", 0) or 0)
         equity  = float(snapshot.get("equity", balance) or balance)
-        loss    = max(0.0, balance - equity)
-        return loss >= max_loss, round(loss, 2)
+
+        equity_loss = max(0.0, balance - equity)
+        position_losses = [
+            max(0.0, -float(pos.get("profit", 0) or 0))
+            for pos in positions
+        ]
+        combined_position_loss = sum(position_losses)
+        worst_position_loss = max(position_losses) if position_losses else 0.0
+
+        loss_views = {
+            "account equity drawdown": equity_loss,
+            "combined tracked trade loss": combined_position_loss,
+            "single tracked trade loss": worst_position_loss,
+        }
+        reason, live_loss = max(loss_views.items(), key=lambda item: item[1])
+        live_loss = round(float(live_loss), 2)
+        return live_loss >= max_loss, live_loss, reason
 
     def _mark_entry_attempt(self, account_state: Dict[str, Any],
                              signal: TradeSignal) -> None:
@@ -769,22 +798,26 @@ class TradeSmartAgent:
                 self._write_draws(ctx, None)
                 return result
 
-            # Max daily loss
-            max_loss_hit, live_loss = self._max_loss_hit(snapshot)
+            # Max daily loss / hard kill-switch
+            max_loss_hit, live_loss, loss_reason = self._max_loss_hit(snapshot, positions)
             if max_loss_hit:
                 result.update({
                     "max_daily_loss_reached": True,
+                    "risk_lock_reason": loss_reason,
                     "event":   "Max Loss Reached",
-                    "message": f"Max daily loss ${live_loss} reached. Agent stopped.",
-                    "thinking": f"Risk lock: drawdown ${live_loss}.",
+                    "message": f"Max loss limit reached by {loss_reason}: ${live_loss}. Agent stopped and tracked trades are being closed.",
+                    "thinking": f"Risk lock: {loss_reason} ${live_loss}. No new trades until the agent is manually turned back on.",
                 })
-                result["risk_blocks"].append(f"Max Daily Loss: ${live_loss}")
+                result["risk_blocks"].append(f"Max Loss ({loss_reason}): ${live_loss}")
                 closes = []
                 if execution_enabled and positions:
                     for pos in positions:
-                        closes.append(self._close_position(mt5, pos.get("ticket")))
+                        ticket = pos.get("ticket")
+                        if ticket not in (None, ""):
+                            closes.append(self._close_position(mt5, ticket))
                 result["order_result"] = closes
-                result["order_sent"]   = any(c.get("ok") for c in closes)
+                result["order_sent"]   = any(isinstance(c, dict) and c.get("ok") for c in closes)
+                result["closed_for_risk"] = closes
                 self._write_draws(ctx, result)
                 return result
 

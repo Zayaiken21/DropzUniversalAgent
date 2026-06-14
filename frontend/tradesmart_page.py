@@ -611,6 +611,20 @@ def _run_agent_cycle(profile: Dict[str, Any], mode: str, risk: Dict[str, Any], e
 
     st.session_state["tradesmart_last_result"] = result
     st.session_state[_last_result_key(user_key, mode)] = result
+
+    # Hard stop persistence: if the agent hits the max-loss lock, immediately
+    # write disabled state to the worker file so the background worker cannot
+    # keep running while the Streamlit UI reruns. The UI toggle is also forced
+    # off below, so the user must manually turn it back on.
+    if result.get("max_daily_loss_reached"):
+        _save_tradesmart_worker_state(
+            enabled=False,
+            mode=mode,
+            profile=profile,
+            risk=risk,
+            user_key=user_key,
+        )
+
     account = _set_account_snapshot(user_key, mode, result.get("account") or {}, result)
 
     decision = result.get("decision") or {}
@@ -809,6 +823,13 @@ def render_tradesmart(role: str = "client") -> None:
     agent_key = f"enable_tradesmart_agent_{user_key}_{mode}"
     if st.session_state.pop(force_stop_key, False):
         st.session_state[agent_key] = False
+        _save_tradesmart_worker_state(
+            enabled=False,
+            mode=mode,
+            profile=profile,
+            risk={},
+            user_key=user_key,
+        )
 
     _section("AI Trading Agent Status")
     agent_enabled = st.toggle("Enable TradeSmart Agent", value=False, key=agent_key)
@@ -841,7 +862,7 @@ def render_tradesmart(role: str = "client") -> None:
     with r3:
         max_daily_loss_amount = st.number_input("Max Daily Loss Amount", min_value=0.0, max_value=100000.0, value=1.00, step=0.50, format="%.2f", key=f"ts_max_loss_{user_key}")
 
-    st.caption("Max Daily Loss Amount is tracked against account balance/equity and can block new trades or close TradeSmart positions when reached.")
+    st.caption("Max Daily Loss Amount is a hard kill-switch. If one tracked trade, all tracked trades combined, or account equity drawdown reaches this amount, TradeSmart closes tracked trades, turns the agent off, and requires you to turn it back on manually.")
 
     _section("AI Agent Instructions")
     ai_instructions = st.text_area(
