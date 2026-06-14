@@ -20,6 +20,17 @@ TRADESMART_OUTPUT_LIMIT = 50
 TRADESMART_WORKER_STATE_FILE = Path("data/tradesmart_worker_state.json")
 
 
+
+
+def _load_tradesmart_worker_state() -> Dict[str, Any]:
+    if not TRADESMART_WORKER_STATE_FILE.exists():
+        return {}
+    try:
+        data = json.loads(TRADESMART_WORKER_STATE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
 def _save_tradesmart_worker_state(
     *,
     enabled: bool,
@@ -30,13 +41,18 @@ def _save_tradesmart_worker_state(
 ) -> None:
     """Persist the TradeSmart run state for agents/tradesmart_worker.py."""
     TRADESMART_WORKER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    risk_payload = dict(risk or {})
+    if enabled and not risk_payload.get("risk_session_id"):
+        risk_payload["risk_session_id"] = f"{user_key}:{mode}:{datetime.now().timestamp()}"
+
     payload = {
         "enabled": bool(enabled),
         "mode": str(mode or "Demo"),
         "symbol": SYMBOL,
         "user_key": user_key,
         "profile": dict(profile or {}),
-        "risk": dict(risk or {}),
+        "risk": risk_payload,
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
     TRADESMART_WORKER_STATE_FILE.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
@@ -650,6 +666,14 @@ def _run_agent_cycle(profile: Dict[str, Any], mode: str, risk: Dict[str, Any], e
         message_parts.append("Execution: order accepted by MT5.")
     elif order_result and isinstance(order_result, dict) and order_result.get("message"):
         message_parts.append(f"Execution: {_strip_legacy_html(order_result.get('message'))}")
+    elif order_result and isinstance(order_result, list):
+        close_msgs = [
+            _strip_legacy_html(item.get("message", "close attempted"))
+            for item in order_result
+            if isinstance(item, dict)
+        ]
+        if close_msgs:
+            message_parts.append("Risk close: " + " | ".join(close_msgs[:5]))
 
     if positions:
         tracked = []
@@ -821,8 +845,36 @@ def render_tradesmart(role: str = "client") -> None:
         )
 
     agent_key = f"enable_tradesmart_agent_{user_key}_{mode}"
+
+    # If the background worker already hit the kill-switch, do not let the UI
+    # write enabled=True back into the worker state on the next rerun. This was
+    # one source of intermittent behavior: the worker correctly disabled itself,
+    # then Streamlit reran with the toggle still visually on and re-enabled it.
+    worker_state = _load_tradesmart_worker_state()
+    worker_disabled_reason = str(worker_state.get("disabled_reason") or "")
+    worker_last_result = worker_state.get("last_result") if isinstance(worker_state.get("last_result"), dict) else {}
+    worker_hit_loss = bool(worker_disabled_reason) or bool(worker_last_result.get("max_daily_loss_reached"))
+    if worker_hit_loss:
+        st.session_state[agent_key] = False
+        st.session_state[f"tradesmart_prev_agent_enabled_{user_key}_{mode}"] = False
+        st.session_state.pop(f"tradesmart_risk_session_{user_key}_{mode}", None)
+        if worker_disabled_reason:
+            st.session_state[loss_msg_key] = worker_disabled_reason
+        # Clear the worker notice after forcing the UI off once. This keeps the
+        # agent OFF, but allows the user to manually turn it back on later, which
+        # creates a brand-new risk_session_id and resets the risk lock.
+        _save_tradesmart_worker_state(
+            enabled=False,
+            mode=mode,
+            profile=profile,
+            risk={},
+            user_key=user_key,
+        )
+
     if st.session_state.pop(force_stop_key, False):
         st.session_state[agent_key] = False
+        st.session_state[f"tradesmart_prev_agent_enabled_{user_key}_{mode}"] = False
+        st.session_state.pop(f"tradesmart_risk_session_{user_key}_{mode}", None)
         _save_tradesmart_worker_state(
             enabled=False,
             mode=mode,
@@ -832,7 +884,21 @@ def render_tradesmart(role: str = "client") -> None:
         )
 
     _section("AI Trading Agent Status")
+    risk_session_key = f"tradesmart_risk_session_{user_key}_{mode}"
+    prev_agent_key = f"tradesmart_prev_agent_enabled_{user_key}_{mode}"
+
+    previous_agent_enabled = bool(st.session_state.get(prev_agent_key, False))
     agent_enabled = st.toggle("Enable TradeSmart Agent", value=False, key=agent_key)
+
+    # New manual enable = new risk session. This resets the loss counter only
+    # after the user intentionally turns the agent back on.
+    if agent_enabled and not previous_agent_enabled:
+        st.session_state[risk_session_key] = f"{user_key}:{mode}:{datetime.now().timestamp()}"
+
+    if not agent_enabled:
+        st.session_state.pop(risk_session_key, None)
+
+    st.session_state[prev_agent_key] = bool(agent_enabled)
 
     loss_msg = st.session_state.pop(loss_msg_key, None)
     if loss_msg:
@@ -880,6 +946,7 @@ def render_tradesmart(role: str = "client") -> None:
         "allow_live_execution": mode == "Live",
         "entry_cooldown_seconds": 60,
         "check_interval_seconds": TRADESMART_CHECK_INTERVAL_SECONDS,
+        "risk_session_id": st.session_state.get(risk_session_key, ""),
     }
 
     _save_tradesmart_worker_state(

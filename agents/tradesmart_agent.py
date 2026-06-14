@@ -35,7 +35,7 @@ os.environ.setdefault(
 )
 
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -545,43 +545,215 @@ class TradeSmartAgent:
         volume  = max(min_vol, min(float(volume), max_vol))
         return round(round(volume / step) * step, 2)
 
-    def _max_loss_hit(self, snapshot: Dict[str, Any], positions: Optional[List[Dict[str, Any]]] = None) -> Tuple[bool, float, str]:
+    def _tracked_history_loss_since(self, mt5, since_epoch: float) -> Tuple[float, List[Dict[str, Any]]]:
         """
-        Hard risk stop for TradeSmart tracked positions.
+        Return realized losses from TradeSmart-tracked XAUUSD deals since the
+        current risk session started.
 
-        The old check only compared balance vs equity. That can miss edge cases
-        where MT5/account data is delayed or where one tracked position is already
-        beyond the loss limit while the combined equity field has not refreshed yet.
+        This fixes the production bug where back-to-back closed losses could be
+        missed because they disappear from open positions before the next cycle.
+        """
+        try:
+            since_epoch = float(since_epoch or 0)
+        except Exception:
+            since_epoch = 0.0
 
-        This checks all three live-loss views and trips if ANY reaches the limit:
-          1. balance - equity           -> whole account floating drawdown
-          2. sum of negative positions  -> all tracked TradeSmart trades combined
-          3. worst negative position    -> one tracked trade by itself
+        if since_epoch <= 0:
+            return 0.0, []
+
+        start = datetime.fromtimestamp(since_epoch, tz=timezone.utc)
+        end = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+        try:
+            deals = mt5.history_deals_get(start, end)
+        except Exception:
+            deals = None
+
+        if deals is None:
+            return 0.0, []
+
+        losses: List[Dict[str, Any]] = []
+        total_loss = 0.0
+
+        for deal in deals:
+            data = self._row_to_dict(deal)
+            if not data:
+                continue
+
+            if str(data.get("symbol", "")).upper() != self.symbol.upper():
+                continue
+
+            comment = str(data.get("comment", ""))
+            magic = int(data.get("magic", 0) or 0)
+
+            # TradeSmart orders use MAGIC and comments. Keep both so older
+            # orders from previous builds are still protected.
+            if magic != MAGIC and "TradeSmart" not in comment:
+                continue
+
+            profit = float(data.get("profit", 0) or 0)
+            swap = float(data.get("swap", 0) or 0)
+            commission = float(data.get("commission", 0) or 0)
+            fee = float(data.get("fee", 0) or 0)
+            net = profit + swap + commission + fee
+
+            if net < 0:
+                loss = abs(net)
+                total_loss += loss
+                losses.append({
+                    "ticket": data.get("ticket"),
+                    "position_id": data.get("position_id"),
+                    "time": data.get("time"),
+                    "profit": round(net, 2),
+                    "loss": round(loss, 2),
+                    "comment": comment,
+                    "magic": magic,
+                })
+
+        return round(total_loss, 2), losses
+
+    def _sync_position_loss_memory(
+        self,
+        account_state: Dict[str, Any],
+        positions: Optional[List[Dict[str, Any]]],
+    ) -> float:
+        """
+        Local fail-safe loss memory for open/closed TradeSmart positions.
+
+        MT5 history can be delayed or returned in broker/server time. This memory
+        records every tracked open ticket each cycle. If a ticket disappears and
+        its last known floating profit was negative, that loss is added to a
+        session-local closed-loss bucket. This means a -$8 trade that closes is
+        still remembered before the next trade is allowed to keep running.
+        """
+        positions = positions or []
+        previous = account_state.get("risk_seen_positions")
+        if not isinstance(previous, dict):
+            previous = {}
+
+        current: Dict[str, Dict[str, Any]] = {}
+        for pos in positions:
+            ticket = str(pos.get("ticket") or "").strip()
+            if not ticket:
+                continue
+            current[ticket] = {
+                "ticket": ticket,
+                "profit": float(pos.get("profit", 0) or 0),
+                "volume": pos.get("volume"),
+                "type": pos.get("type"),
+                "time": pos.get("time"),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        closed_loss_memory = float(account_state.get("risk_closed_loss_memory", 0) or 0)
+        closed_tickets = account_state.get("risk_closed_loss_tickets")
+        if not isinstance(closed_tickets, dict):
+            closed_tickets = {}
+
+        for ticket, old in previous.items():
+            if ticket in current or ticket in closed_tickets:
+                continue
+            old_profit = float((old or {}).get("profit", 0) or 0)
+            if old_profit < 0:
+                loss = round(abs(old_profit), 2)
+                closed_loss_memory += loss
+                closed_tickets[ticket] = {
+                    "ticket": ticket,
+                    "loss": loss,
+                    "last_profit": round(old_profit, 2),
+                    "remembered_at": datetime.now(timezone.utc).isoformat(),
+                    "source": "last_seen_open_position",
+                }
+
+        account_state["risk_seen_positions"] = current
+        account_state["risk_closed_loss_memory"] = round(closed_loss_memory, 2)
+        account_state["risk_closed_loss_tickets"] = closed_tickets
+        return round(closed_loss_memory, 2)
+
+    def _max_loss_hit(
+        self,
+        snapshot: Dict[str, Any],
+        positions: Optional[List[Dict[str, Any]]] = None,
+        mt5: Any = None,
+        account_state: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, float, str, Dict[str, Any]]:
+        """
+        Hard TradeSmart kill-switch.
+
+        The key production fix is **session total loss**:
+            remembered/realized closed losses + current open floating losses.
+
+        That catches cases like: first trade closes -$8, second trade floats -$2
+        with a $10 limit. The agent locks immediately at $10 instead of waiting
+        for the second trade to close.
         """
         max_loss = float(self.rules.get("max_daily_loss_amount", 0) or 0)
+        details: Dict[str, Any] = {
+            "max_loss": round(max_loss, 2),
+            "session_start_epoch": None,
+            "session_start_equity": None,
+            "history_losses": [],
+            "memory_closed_losses": [],
+            "loss_views": {},
+        }
+
         if max_loss <= 0:
-            return False, 0.0, "disabled"
+            return False, 0.0, "disabled", details
 
+        account_state = account_state or {}
         positions = positions or []
-        balance = float(snapshot.get("balance", 0) or 0)
-        equity  = float(snapshot.get("equity", balance) or balance)
 
-        equity_loss = max(0.0, balance - equity)
+        balance = float(snapshot.get("balance", 0) or 0)
+        equity = float(snapshot.get("equity", balance) or balance)
+
+        start_equity = float(account_state.get("risk_start_equity", 0) or 0)
+        start_epoch = float(account_state.get("risk_session_start_epoch", 0) or 0)
+
+        details["session_start_epoch"] = start_epoch
+        details["session_start_equity"] = start_equity
+
+        session_equity_loss = max(0.0, start_equity - equity) if start_equity > 0 else 0.0
+        floating_equity_loss = max(0.0, balance - equity)
+
         position_losses = [
             max(0.0, -float(pos.get("profit", 0) or 0))
             for pos in positions
         ]
-        combined_position_loss = sum(position_losses)
-        worst_position_loss = max(position_losses) if position_losses else 0.0
+        combined_open_loss = round(sum(position_losses), 2)
+        worst_open_loss = round(max(position_losses), 2) if position_losses else 0.0
+
+        memory_closed_loss = self._sync_position_loss_memory(account_state, positions)
+
+        realized_history_loss = 0.0
+        history_losses: List[Dict[str, Any]] = []
+        if mt5 is not None:
+            realized_history_loss, history_losses = self._tracked_history_loss_since(mt5, start_epoch)
+
+        # Do not double-count the same closed trade from MT5 history and local
+        # memory. Use whichever closed-loss source is currently larger.
+        closed_loss_total = round(max(float(realized_history_loss or 0), float(memory_closed_loss or 0)), 2)
+        session_total_trade_loss = round(closed_loss_total + combined_open_loss, 2)
 
         loss_views = {
-            "account equity drawdown": equity_loss,
-            "combined tracked trade loss": combined_position_loss,
-            "single tracked trade loss": worst_position_loss,
+            "session total closed + open tracked loss": session_total_trade_loss,
+            "session equity drawdown": session_equity_loss,
+            "account floating drawdown": floating_equity_loss,
+            "combined open tracked trade loss": combined_open_loss,
+            "single open tracked trade loss": worst_open_loss,
+            "closed tracked trade loss": closed_loss_total,
         }
+
+        details["loss_views"] = {k: round(float(v), 2) for k, v in loss_views.items()}
+        details["history_losses"] = history_losses
+        details["memory_closed_losses"] = list((account_state.get("risk_closed_loss_tickets") or {}).values())
+        details["closed_loss_total"] = closed_loss_total
+        details["combined_open_loss"] = combined_open_loss
+        details["session_total_trade_loss"] = session_total_trade_loss
+
         reason, live_loss = max(loss_views.items(), key=lambda item: item[1])
         live_loss = round(float(live_loss), 2)
-        return live_loss >= max_loss, live_loss, reason
+
+        return live_loss >= max_loss, live_loss, reason, details
 
     def _mark_entry_attempt(self, account_state: Dict[str, Any],
                              signal: TradeSignal) -> None:
@@ -662,52 +834,98 @@ class TradeSmartAgent:
     # ──────────────────────────────────────────
 
     def _close_position(self, mt5, ticket: Any) -> Dict[str, Any]:
-        target = next((p for p in self._positions(mt5)
-                       if str(p.get("ticket")) == str(ticket)), None)
-        if target is None:
-            return {"ok": False, "message": f"Position {ticket} not found.", "retcode": None}
+        """Close one tracked position with broker-compatible retries.
 
+        Some brokers reject one filling type even when the same close would work
+        with another. This tries the common filling modes and re-reads the
+        position before every attempt. If the ticket is already gone, we treat
+        it as safely closed so the kill-switch does not keep looping forever.
+        """
         allowed, msg = self._terminal_trade_allowed(mt5)
         if not allowed:
             return {"ok": False, "message": msg, "retcode": None}
 
-        tick = mt5.symbol_info_tick(self.symbol)
-        if tick is None:
-            return {"ok": False, "message": f"No live tick.", "retcode": None}
-
-        pos_type   = int(target.get("type", 0) or 0)
-        close_type = (mt5.ORDER_TYPE_SELL
-                      if pos_type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY)
-        price      = float(tick.bid if pos_type == mt5.POSITION_TYPE_BUY else tick.ask)
-
-        request = {
-            "action":       mt5.TRADE_ACTION_DEAL,
-            "position":     int(target.get("ticket")),
-            "symbol":       self.symbol,
-            "volume":       float(target.get("volume", 0.01) or 0.01),
-            "type":         close_type,
-            "price":        price,
-            "deviation":    int(self.rules.get("deviation", 30) or 30),
-            "magic":        MAGIC,
-            "comment":      "TradeSmart Agent Close",
-            "type_time":    mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+        success_codes = {
+            int(getattr(mt5, "TRADE_RETCODE_DONE", 10009)),
+            int(getattr(mt5, "TRADE_RETCODE_PLACED", 10008)),
+            int(getattr(mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010)),
         }
+        filling_modes = []
+        for name in ("ORDER_FILLING_IOC", "ORDER_FILLING_FOK", "ORDER_FILLING_RETURN"):
+            value = getattr(mt5, name, None)
+            if value is not None and value not in filling_modes:
+                filling_modes.append(value)
+        if not filling_modes:
+            filling_modes = [getattr(mt5, "ORDER_FILLING_IOC", 1)]
 
-        result  = mt5.order_send(request)
-        if result is None:
-            return {"ok": False,
-                    "message": f"close order_send None: {mt5.last_error()}",
-                    "request": request}
+        attempts: List[Dict[str, Any]] = []
+        last_message = "Close not attempted."
 
-        data    = result._asdict() if hasattr(result, "_asdict") else dict(result)
-        retcode = int(data.get("retcode", 0) or 0)
-        success = {int(getattr(mt5, "TRADE_RETCODE_DONE",   10009)),
-                   int(getattr(mt5, "TRADE_RETCODE_PLACED", 10008))}
-        ok = retcode in success
-        return {"ok": ok,
-                "message": "Closed." if ok else f"Close failed. Retcode: {retcode}",
-                "retcode": retcode, "request": request, "result": data}
+        for attempt in range(1, 4):
+            target = next((p for p in self._positions(mt5)
+                           if str(p.get("ticket")) == str(ticket)), None)
+            if target is None:
+                return {
+                    "ok": True,
+                    "message": f"Position {ticket} already closed.",
+                    "retcode": None,
+                    "attempts": attempts,
+                }
+
+            tick = mt5.symbol_info_tick(self.symbol)
+            if tick is None:
+                return {"ok": False, "message": "No live tick for close.", "retcode": None, "attempts": attempts}
+
+            pos_type = int(target.get("type", 0) or 0)
+            close_type = (mt5.ORDER_TYPE_SELL
+                          if pos_type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY)
+            price = float(tick.bid if pos_type == mt5.POSITION_TYPE_BUY else tick.ask)
+            volume = float(target.get("volume", 0.01) or 0.01)
+
+            for filling in filling_modes:
+                request = {
+                    "action":       mt5.TRADE_ACTION_DEAL,
+                    "position":     int(target.get("ticket")),
+                    "symbol":       self.symbol,
+                    "volume":       volume,
+                    "type":         close_type,
+                    "price":        price,
+                    "deviation":    int(self.rules.get("deviation", 50) or 50),
+                    "magic":        MAGIC,
+                    "comment":      "TradeSmart Risk Close",
+                    "type_time":    mt5.ORDER_TIME_GTC,
+                    "type_filling": filling,
+                }
+                result = mt5.order_send(request)
+                if result is None:
+                    data = {"last_error": mt5.last_error()}
+                    retcode = None
+                    last_message = f"close order_send None: {data['last_error']}"
+                else:
+                    data = result._asdict() if hasattr(result, "_asdict") else dict(result)
+                    retcode = int(data.get("retcode", 0) or 0)
+                    last_message = data.get("comment") or data.get("message") or f"Close retcode {retcode}"
+
+                attempts.append({"attempt": attempt, "filling": filling, "retcode": retcode, "message": last_message})
+
+                if retcode in success_codes:
+                    return {
+                        "ok": True,
+                        "message": f"Closed position {ticket} for risk.",
+                        "retcode": retcode,
+                        "request": request,
+                        "result": data,
+                        "attempts": attempts,
+                    }
+
+            time.sleep(0.20)
+
+        return {
+            "ok": False,
+            "message": f"Risk close failed for {ticket}: {last_message}",
+            "retcode": attempts[-1].get("retcode") if attempts else None,
+            "attempts": attempts,
+        }
 
     # ──────────────────────────────────────────
     #  DRAW + DEBUG HELPERS
@@ -798,15 +1016,73 @@ class TradeSmartAgent:
                 self._write_draws(ctx, None)
                 return result
 
+            # Persistent risk session state. This is required because realized
+            # losses disappear from positions after a trade closes. The UI/worker
+            # passes a new risk_session_id when the user manually turns the agent
+            # back on; that resets the lock and starts a fresh loss counter.
+            state = self._load_state()
+            key = self._state_key()
+            account_state = state.setdefault(key, {})
+
+            incoming_session_id = str(self.rules.get("risk_session_id") or "").strip()
+            current_session_id = str(account_state.get("risk_session_id") or "").strip()
+
+            if incoming_session_id and incoming_session_id != current_session_id:
+                account_state.clear()
+                account_state["risk_session_id"] = incoming_session_id
+                account_state["risk_session_start_epoch"] = datetime.now(timezone.utc).timestamp()
+                account_state["risk_session_start_time"] = datetime.now(timezone.utc).isoformat()
+                account_state["risk_start_balance"] = snapshot.get("balance")
+                account_state["risk_start_equity"] = snapshot.get("equity")
+                account_state["risk_locked"] = False
+                account_state["risk_lock_reason"] = ""
+
+            if not account_state.get("risk_session_start_epoch"):
+                account_state["risk_session_id"] = incoming_session_id or current_session_id or f"session-{datetime.now(timezone.utc).timestamp()}"
+                account_state["risk_session_start_epoch"] = datetime.now(timezone.utc).timestamp()
+                account_state["risk_session_start_time"] = datetime.now(timezone.utc).isoformat()
+                account_state["risk_start_balance"] = snapshot.get("balance")
+                account_state["risk_start_equity"] = snapshot.get("equity")
+                account_state["risk_locked"] = False
+                account_state["risk_lock_reason"] = ""
+
+            account_state["risk_max_loss_amount"] = float(self.rules.get("max_daily_loss_amount", 0) or 0)
+            account_state["risk_last_checked_at"] = datetime.now(timezone.utc).isoformat()
+            self._save_state(state)
+
             # Max daily loss / hard kill-switch
-            max_loss_hit, live_loss, loss_reason = self._max_loss_hit(snapshot, positions)
+            locked_already = bool(account_state.get("risk_locked"))
+            max_loss_hit, live_loss, loss_reason, risk_details = self._max_loss_hit(
+                snapshot,
+                positions,
+                mt5=mt5,
+                account_state=account_state,
+            )
+
+            if locked_already:
+                max_loss_hit = True
+                loss_reason = str(account_state.get("risk_lock_reason") or loss_reason or "previous max-loss lock")
+                live_loss = max(float(live_loss or 0), float(account_state.get("risk_locked_loss", 0) or 0))
+
+            result["risk_details"] = risk_details
+            # _max_loss_hit updates persistent loss memory every cycle. Save it
+            # even when the limit has not been reached yet, so closed trades are
+            # remembered on the very next tick/rerun.
+            self._save_state(state)
+
             if max_loss_hit:
+                account_state["risk_locked"] = True
+                account_state["risk_locked_loss"] = round(float(live_loss), 2)
+                account_state["risk_lock_reason"] = loss_reason
+                account_state["risk_locked_at"] = datetime.now(timezone.utc).isoformat()
+                self._save_state(state)
+
                 result.update({
                     "max_daily_loss_reached": True,
                     "risk_lock_reason": loss_reason,
                     "event":   "Max Loss Reached",
                     "message": f"Max loss limit reached by {loss_reason}: ${live_loss}. Agent stopped and tracked trades are being closed.",
-                    "thinking": f"Risk lock: {loss_reason} ${live_loss}. No new trades until the agent is manually turned back on.",
+                    "thinking": f"Risk lock: {loss_reason} ${live_loss}. Realized/open losses are counted together for this session. No new trades until the agent is manually turned back on.",
                 })
                 result["risk_blocks"].append(f"Max Loss ({loss_reason}): ${live_loss}")
                 closes = []
@@ -815,6 +1091,16 @@ class TradeSmartAgent:
                         ticket = pos.get("ticket")
                         if ticket not in (None, ""):
                             closes.append(self._close_position(mt5, ticket))
+
+                    # Re-read positions after close attempts so the UI/log reflects
+                    # what is still open, if anything failed to close.
+                    positions = self._positions(mt5)
+                    snapshot = self._account_snapshot(account or {}, positions)
+                    result["positions"] = positions
+                    result["position_summary"] = self._position_summary(positions, m1)
+                    result["open_positions_count"] = len(positions)
+                    result["account"] = snapshot
+
                 result["order_result"] = closes
                 result["order_sent"]   = any(isinstance(c, dict) and c.get("ok") for c in closes)
                 result["closed_for_risk"] = closes
@@ -843,10 +1129,7 @@ class TradeSmartAgent:
             self._write_debug(ctx, raw_decision, cmd_count)
             result["draw_command_count"] = cmd_count
 
-            state         = self._load_state()
-            key           = self._state_key()
-            account_state = state.setdefault(key, {})
-
+            # state/account_state already loaded above for persistent risk tracking.
             # ── SCAN — just display status ─────────
             if signal.action == "SCAN":
                 result["event"]   = "Scanning"

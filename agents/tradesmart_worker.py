@@ -50,14 +50,28 @@ def run_worker() -> None:
             state["last_result"] = result
             state["last_run"] = datetime.now().isoformat(timespec="seconds")
 
-            # Safety kill-switch: once the agent reports max-loss reached, the
-            # worker disables itself immediately. This prevents the background
-            # process from continuing to scan/open trades after the UI toggle is
-            # forced off. The user must manually re-enable TradeSmart later.
+            # Safety kill-switch: once max loss is reached, do not open any new
+            # trades. First, make several immediate close-only retry cycles so a
+            # temporary broker requote/filling failure does not leave positions
+            # open. The agent's persistent risk_lock prevents new entries during
+            # these retry cycles. After that, the worker is disabled and the UI
+            # must be manually turned on again by the user.
             if result.get("max_daily_loss_reached"):
+                _log("KILL SWITCH: " + str(result.get("message") or "Max loss limit reached."))
+                for retry in range(1, 5):
+                    if int(result.get("open_positions_count") or 0) <= 0:
+                        break
+                    time.sleep(0.35)
+                    _log(f"Risk close retry {retry}: open positions still detected.")
+                    result = agent.run_cycle(execution_enabled=True)
+                    state["last_result"] = result
+                    state["last_run"] = datetime.now().isoformat(timespec="seconds")
+
                 state["enabled"] = False
                 state["disabled_reason"] = result.get("message") or "Max loss limit reached."
                 state["disabled_at"] = datetime.now().isoformat(timespec="seconds")
+                risk["risk_session_id"] = ""
+                state["risk"] = risk
 
             STATE_FILE.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
 

@@ -1,5 +1,5 @@
 """
-strategy_common.py  —  TradeSmart SMC Scalp Engine  v4.0
+strategy_common.py  —  TradeSmart SMC Scalp Engine  v5.0
 =========================================================
 WHAT CHANGED IN v4
 ------------------
@@ -89,6 +89,16 @@ BREAKOUT_TP_MULT = 2.0
 # Liquidity grab: wick beyond extreme by at least this much
 LIQ_GRAB_MIN    = 0.40
 
+# Enhanced PO3 / session engine
+FIRST_15M_SECONDS = 900      # First 15 minutes of the active 1H candle
+HOUR_SECONDS      = 3600
+SESSION_TZ_OFFSET_HOURS = 0  # MT5 server-time offset. Keep 0 unless your broker needs adjustment.
+VALUE_AREA_RATIO  = 0.70
+PROFILE_BINS      = 24
+MIN_BREAKOUT_SCORE = 0.86
+MIN_SWEEP_SCORE    = 0.88
+MAX_ALLOWED_SPREAD = 80      # broker points from MT5 spread column; skip entries if wider
+
 
 # ══════════════════════════════════════════════
 #  UTILITY
@@ -124,6 +134,122 @@ def normalize_candle(c: Any) -> Dict[str, Any]:
 
 def floor_15m(ts: int) -> int:
     return int(ts) - (int(ts) % 900)
+
+
+def floor_1h(ts: int) -> int:
+    return int(ts) - (int(ts) % HOUR_SECONDS)
+
+
+def _closed(candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return candles[:-1] if len(candles) > 1 else list(candles or [])
+
+
+def session_context(ts: int) -> Dict[str, Any]:
+    """Return a simple MT5-server-time session map for XAUUSD intraday logic."""
+    try:
+        from datetime import datetime, timezone, timedelta
+        dt = datetime.fromtimestamp(int(ts), tz=timezone.utc) + timedelta(hours=SESSION_TZ_OFFSET_HOURS)
+        hour = dt.hour
+        dow = dt.weekday()  # Mon=0 ... Sun=6
+        if 0 <= hour < 7:
+            name, quality = "ASIA", 0.55
+        elif 7 <= hour < 12:
+            name, quality = "LONDON", 0.85
+        elif 12 <= hour < 17:
+            name, quality = "NEW_YORK_AM", 1.00
+        elif 17 <= hour < 21:
+            name, quality = "NEW_YORK_PM", 0.72
+        else:
+            name, quality = "ROLLOVER", 0.20
+        tradable = name in ("LONDON", "NEW_YORK_AM", "NEW_YORK_PM") and dow < 5
+        if dow == 4 and hour >= 17:
+            tradable = False
+            quality = min(quality, 0.35)
+        if dow >= 5:
+            tradable = False
+            quality = 0.0
+        return {
+            "name": name, "quality": quality, "tradable": tradable,
+            "hour": hour, "weekday": dow, "iso": dt.isoformat(timespec="seconds"),
+        }
+    except Exception:
+        return {"name": "UNKNOWN", "quality": 0.0, "tradable": False, "hour": 0, "weekday": 0}
+
+
+def ema(values: List[float], period: int) -> Optional[float]:
+    vals = [float(v) for v in values if v is not None]
+    if len(vals) < period:
+        return None
+    k = 2.0 / (period + 1.0)
+    e = sum(vals[:period]) / period
+    for v in vals[period:]:
+        e = (v * k) + (e * (1.0 - k))
+    return e
+
+
+def trend_context(h1: List[Dict[str, Any]]) -> Dict[str, Any]:
+    closed = _closed(h1)
+    closes = [fv(c.get("close")) for c in closed if fv(c.get("close")) > 0]
+    e13 = ema(closes, 13)
+    e21 = ema(closes, 21)
+    if e13 is None or e21 is None:
+        return {"bias": HOLD, "ema13": e13, "ema21": e21, "quality": 0.50}
+    if e13 > e21:
+        return {"bias": BUY, "ema13": round(e13, 2), "ema21": round(e21, 2), "quality": 0.75}
+    if e13 < e21:
+        return {"bias": SELL, "ema13": round(e13, 2), "ema21": round(e21, 2), "quality": 0.75}
+    return {"bias": HOLD, "ema13": round(e13, 2), "ema21": round(e21, 2), "quality": 0.50}
+
+
+def volume_ratio(candles: List[Dict[str, Any]], lookback: int = VOL_LOOKBACK) -> float:
+    closed = _closed(candles)
+    if len(closed) < 3:
+        return 1.0
+    last = fv(closed[-1].get("tick_volume"))
+    avg = avg_volume(closed[:-1], lookback)
+    return round(last / avg, 2) if avg > 0 else 1.0
+
+
+def volume_profile_levels(candles: List[Dict[str, Any]], bins: int = PROFILE_BINS) -> Dict[str, Any]:
+    """Internal MT5-only volume profile using OHLC + tick_volume bars."""
+    rows = [c for c in candles if fv(c.get("high")) > fv(c.get("low"))]
+    if len(rows) < 5:
+        return {"valid": False}
+    lo = min(fv(c.get("low")) for c in rows)
+    hi = max(fv(c.get("high")) for c in rows)
+    rng = hi - lo
+    if rng <= 0:
+        return {"valid": False}
+    bins = max(8, min(int(bins), 80))
+    step = rng / bins
+    hist = [0.0 for _ in range(bins)]
+    for c in rows:
+        mid = (fv(c.get("high")) + fv(c.get("low")) + fv(c.get("close"))) / 3.0
+        idx = int((mid - lo) / step)
+        idx = max(0, min(bins - 1, idx))
+        hist[idx] += max(1.0, fv(c.get("tick_volume"), 1.0))
+    total = sum(hist)
+    if total <= 0:
+        return {"valid": False}
+    poc_i = max(range(bins), key=lambda i: hist[i])
+    included = {poc_i}
+    vol = hist[poc_i]
+    low_i = high_i = poc_i
+    while vol < total * VALUE_AREA_RATIO and (low_i > 0 or high_i < bins - 1):
+        left = hist[low_i - 1] if low_i > 0 else -1
+        right = hist[high_i + 1] if high_i < bins - 1 else -1
+        if right >= left and high_i < bins - 1:
+            high_i += 1; included.add(high_i); vol += hist[high_i]
+        elif low_i > 0:
+            low_i -= 1; included.add(low_i); vol += hist[low_i]
+        else:
+            break
+    def price_at(i: int) -> float:
+        return round(lo + (i + 0.5) * step, 2)
+    return {
+        "valid": True, "poc": price_at(poc_i), "val": price_at(low_i), "vah": price_at(high_i),
+        "low": round(lo, 2), "high": round(hi, 2), "bins": bins, "total_volume": round(total, 2),
+    }
 
 
 def avg_volume(candles: List[Dict[str, Any]], n: int = VOL_LOOKBACK) -> float:
@@ -216,64 +342,79 @@ def get_timeframes(ctx: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
 # ══════════════════════════════════════════════
 
 def build_15m_range(m1: List[Dict[str, Any]], m15: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Enhanced PO3 range builder.
+
+    The range is now the WICK HIGH/LOW of the FIRST 15 minutes of the ACTIVE 1H candle.
+    While that first 15m window is forming, M1 wicks build it live. After the first
+    15m closes, the range locks and stays fixed for the rest of the hour.
+    """
     if not m1:
         return {"valid": False, "reason": "No M1 data."}
 
-    # Identify current 15M bar start
-    ref_ts    = int(m1[-1].get("time", 0) or time.time())
-    bar_start = floor_15m(ref_ts)
+    ref_ts     = int(m1[-1].get("time", 0) or time.time())
+    hour_start = floor_1h(ref_ts)
+    first_end  = hour_start + FIRST_15M_SECONDS
+    hour_end   = hour_start + HOUR_SECONDS
 
-    # Check if the current 15M bar has already CLOSED (appears in M15 closed list)
-    # M15 list from MT5 includes the forming candle as the last element.
-    # Closed bars = all except the last.
-    m15_closed = m15[:-1] if len(m15) > 1 else []
-    locked_bars = [c for c in m15_closed if int(c.get("time", 0) or 0) == bar_start]
+    m15_closed = _closed(m15)
+    first_15 = [c for c in m15_closed if int(c.get("time", 0) or 0) == hour_start]
 
-    if locked_bars:
-        # Use the closed 15M candle's wick extremes directly
-        bar   = locked_bars[-1]
+    if first_15:
+        bar = first_15[-1]
         high  = fv(bar.get("high"))
         low   = fv(bar.get("low"))
         open_ = fv(bar.get("open"))
         close = fv(bar.get("close"))
-        source = "locked_15m_candle"
+        source = "locked_first_15m_of_1h"
         is_locked = True
     else:
-        # Bar is still forming — build from M1 wicks in the first 5 minutes
-        first5_end = bar_start + 300
-        window = [c for c in m1 if bar_start <= int(c.get("time", 0) or 0) < first5_end]
+        window = [c for c in m1 if hour_start <= int(c.get("time", 0) or 0) < min(ref_ts + 60, first_end)]
         if not window:
-            return {"valid": False,
-                    "reason": f"Waiting for first M1 candle of 15M bar at {bar_start}.",
-                    "active_15m_start": bar_start}
+            return {
+                "valid": False,
+                "reason": f"Waiting for first M1 candle of active 1H range at {hour_start}.",
+                "active_1h_start": hour_start,
+                "range_start": hour_start,
+                "range_end": hour_end,
+            }
         high  = max(fv(c.get("high")) for c in window)
-        low   = min(fv(c.get("low"))  for c in window)
+        low   = min(fv(c.get("low")) for c in window)
         open_ = fv(window[0].get("open"))
         close = fv(window[-1].get("close"))
-        source = "live_first5m"
+        source = "building_first_15m_of_1h"
         is_locked = False
 
     rng = high - low
     if rng < MIN_RANGE_SIZE:
-        return {"valid": False, "reason": f"Range too small ({rng:.2f} pts).",
-                "active_15m_start": bar_start}
+        return {
+            "valid": False,
+            "reason": f"First 15M 1H range too small ({rng:.2f} pts).",
+            "active_1h_start": hour_start,
+            "range_start": hour_start,
+            "range_end": hour_end,
+        }
 
     direction = BUY if close > open_ else SELL if close < open_ else HOLD
+    sess = session_context(ref_ts)
     return {
-        "valid":            True,
-        "locked":           is_locked,
-        "source":           source,
-        "active_15m_start": bar_start,
-        "range_start":      bar_start,
-        "range_end":        bar_start + 900,
-        "range_high":       high,
-        "range_low":        low,
-        "range_mid":        (high + low) / 2.0,
-        "range_size":       rng,
-        "range_open":       open_,
-        "range_close":      close,
-        "range_direction":  direction,
-        "reason":           "Range locked." if is_locked else "Range building (first 5M).",
+        "valid": True,
+        "locked": is_locked,
+        "source": source,
+        "active_1h_start": hour_start,
+        "active_15m_start": hour_start,
+        "range_start": hour_start,
+        "range_end": hour_end,
+        "first_15m_end": first_end,
+        "range_high": high,
+        "range_low": low,
+        "range_mid": (high + low) / 2.0,
+        "range_size": rng,
+        "range_open": open_,
+        "range_close": close,
+        "range_direction": direction,
+        "session": sess,
+        "reason": "First 15M of 1H range locked." if is_locked else "Building first 15M wick range for active 1H candle.",
     }
 
 
@@ -507,8 +648,8 @@ def make_signal(
         "enabled":          True,
         "active":           True,
         "valid":            True,
-        "strategy":         "xauusd_m15_wick_scalp",
-        "name":             "xauusd_m15_wick_scalp",
+        "strategy":         "xauusd_first15m_1h_po3",
+        "name":             "xauusd_first15m_1h_po3",
         "symbol":           symbol_from_context(ctx),
         "volume":           fv(rules.get("volume") or rules.get("trade_volume") or ctx.get("volume"), 0.01),
         "action":           action,
@@ -598,43 +739,56 @@ def build_decision(ctx: Dict[str, Any]) -> Dict[str, Any]:
     m1  = tfs.get("M1",  [])
     m5  = tfs.get("M5",  [])
     m15 = tfs.get("M15", [])
+    h1  = tfs.get("H1",  [])
 
     positions = ctx.get("positions") or []
 
-    # Guard: need enough data
-    if len(m1) < 5:
+    if len(m1) < 20:
         return make_signal(SCAN, "SCAN: Waiting for M1 candle history.", 0.0, ctx)
     if len(m15) < 3:
         return make_signal(SCAN, "SCAN: Waiting for M15 candle history.", 0.0, ctx)
 
-    # Current price
     current_price = fv(m1[-1].get("close"))
+    current_spread = int(fv(m1[-1].get("spread"), 0))
 
-    # Build the 15M range
+    # First 15 minutes of the active 1H candle, using wick high/low.
     rng = build_15m_range(m1, m15)
 
-    # Swing levels for context
-    levels = nearest_swing_levels(m15, current_price, lookback=10)
+    levels  = nearest_swing_levels(m15, current_price, lookback=16)
+    trend   = trend_context(h1)
+    sess    = rng.get("session") or session_context(int(m1[-1].get("time", time.time())))
+    vol_m1  = volume_ratio(m1)
+    vol_m5  = volume_ratio(m5) if m5 else 1.0
+
+    hour_start = int(rng.get("active_1h_start") or floor_1h(int(m1[-1].get("time", time.time()))))
+    hour_m1 = [c for c in m1 if hour_start <= int(c.get("time", 0) or 0) < hour_start + HOUR_SECONDS]
+    profile = volume_profile_levels(hour_m1 or _closed(m1)[-80:])
 
     setup: Dict[str, Any] = {
         **rng,
-        "_m1":      m1,
-        "_m5":      m5,
-        "_m15":     m15,
-        "levels":   levels,
-        "price":    current_price,
+        "_m1": m1,
+        "_m5": m5,
+        "_m15": m15,
+        "_h1": h1,
+        "levels": levels,
+        "trend": trend,
+        "session": sess,
+        "volume_ratio_m1": vol_m1,
+        "volume_ratio_m5": vol_m5,
+        "volume_profile": profile,
+        "price": current_price,
+        "spread": current_spread,
     }
 
-    # ── Manage open position FIRST ─────────────
+    # Manage open positions before looking for new trades.
     if positions:
         sig = maybe_close(ctx, setup)
         if sig is not None:
-            sig["data"].update({"levels": levels})
+            sig["data"].update({"levels": levels, "trend": trend, "session": sess, "volume_profile": profile})
             return sig
 
     if not rng.get("valid"):
-        return make_signal(SCAN, f"SCAN: {rng.get('reason', 'No valid range.')}",
-                           0.0, ctx, data=setup)
+        return make_signal(SCAN, f"SCAN: {rng.get('reason', 'No valid first-15M 1H range.')}", 0.0, ctx, data=setup)
 
     range_high = fv(rng["range_high"])
     range_low  = fv(rng["range_low"])
@@ -642,98 +796,127 @@ def build_decision(ctx: Dict[str, Any]) -> Dict[str, Any]:
     range_size = fv(rng["range_size"])
     tol        = max(range_size * ZONE_TOL_RATIO, MIN_ZONE_TOL)
 
-    # ── Breakout check ─────────────────────────
+    # Do not open trades until the first 15M range locks. Still draw it while building.
+    if not rng.get("locked"):
+        return make_signal(
+            SCAN,
+            f"SCAN: 1H first-15M range building {range_low:.2f}-{range_high:.2f} | {sess.get('name')} | waiting lock.",
+            0.0, ctx, data=setup,
+        )
+
+    # Session + spread guards. These do not stop markup, only live entries.
+    if not bool(sess.get("tradable")):
+        return make_signal(
+            SCAN,
+            f"SCAN: {sess.get('name')} session filter active. Range {range_low:.2f}-{range_high:.2f}; no new entries.",
+            0.0, ctx, data=setup,
+        )
+    if current_spread and current_spread > MAX_ALLOWED_SPREAD:
+        return make_signal(
+            HOLD,
+            f"HOLD: spread too wide ({current_spread}) for clean execution. Range {range_low:.2f}-{range_high:.2f}.",
+            0.0, ctx, data=setup,
+        )
+
     bo = breakout_check(m5, range_high, range_low)
     setup["breakout"] = bo
 
-    if bo["confirmed"]:
-        direction = bo["direction"]
-        liq = detect_liq_grab(m1,
-                               range_low  if direction == BUY  else range_high,
-                               direction)
-        # Entry = close of last closed M1 candle
-        closed_m1 = m1[:-1] if len(m1) > 1 else m1
-        entry = fv(closed_m1[-1].get("close")) if closed_m1 else current_price
-        entry_ct  = int(closed_m1[-1].get("time", 0)) if closed_m1 else 0
+    closed_m1 = _closed(m1)
+    closed_m5 = _closed(m5)
+    last1 = closed_m1[-1] if closed_m1 else m1[-1]
+    last5 = closed_m5[-1] if closed_m5 else (m5[-1] if m5 else last1)
+    entry_ct = int(last1.get("time", 0) or 0)
 
-        rr  = {
-            BUY:  {"sl": round(range_low  - max(SL_BUFFER, MIN_SL_POINTS), 2),
-                   "tp": round(entry + (entry - (range_low - SL_BUFFER)) * 3, 2)},
-            SELL: {"sl": round(range_high + max(SL_BUFFER, MIN_SL_POINTS), 2),
-                   "tp": round(entry - ((range_high + SL_BUFFER) - entry) * 3, 2)},
-        }[direction]
+    trend_bias = trend.get("bias", HOLD)
+    profile_poc = fv(profile.get("poc")) if profile.get("valid") else 0.0
+    profile_vah = fv(profile.get("vah")) if profile.get("valid") else 0.0
+    profile_val = fv(profile.get("val")) if profile.get("valid") else 0.0
 
-        conf = min(0.88 + (0.08 if liq else 0.0), 1.0)
-        setup.update({"entry_level": entry, "sl": rr["sl"], "tp": rr["tp"]})
-        return make_signal(
-            direction,
-            f"{direction} BREAKOUT: {bo['count']} M5 closes outside range. "
-            f"E={entry:.2f}  SL={rr['sl']:.2f}  TP={rr['tp']:.2f}"
-            + (" [LIQ]" if liq else ""),
-            conf, ctx, data=setup, sl=rr["sl"], tp=rr["tp"],
-            entry_candle_time=entry_ct,
-        )
+    def confluence_score(direction: str, setup_type: str, liq: bool) -> float:
+        score = 0.0
+        score += 0.18 if rng.get("locked") else 0.0
+        score += min(float(sess.get("quality", 0.0)), 1.0) * 0.14
+        score += 0.14 if liq else 0.0
+        score += 0.10 if vol_m1 >= 0.85 else 0.0
+        score += 0.08 if vol_m5 >= 0.90 else 0.0
+        score += 0.10 if trend_bias in (direction, HOLD) else 0.02
+        if profile.get("valid"):
+            if direction == BUY:
+                score += 0.08 if current_price >= profile_poc else 0.04
+                score += 0.06 if range_low <= profile_val + tol else 0.03
+            else:
+                score += 0.08 if current_price <= profile_poc else 0.04
+                score += 0.06 if range_high >= profile_vah - tol else 0.03
+        score += 0.14 if setup_type == "SWEEP" else 0.10
+        score += 0.08 if range_size >= MIN_RANGE_SIZE * 2 else 0.04
+        score += 0.08  # closed-candle confirmation baseline
+        return round(min(score, 1.0), 2)
 
-    # ── Zone touch detection ───────────────────
-    last_m1 = m1[-1]
-    lo1     = fv(last_m1.get("low"))
-    hi1     = fv(last_m1.get("high"))
+    # Liquidity sweep reversal: sweep one side, close back inside, target the other side.
+    sweep_buy  = detect_liq_grab(closed_m1, range_low, BUY)
+    sweep_sell = detect_liq_grab(closed_m1, range_high, SELL)
 
-    at_buy_zone  = lo1 <= range_low  + tol
+    if sweep_buy:
+        direction = BUY
+        entry = round(range_low, 2)  # range low line is the planned reclaim entry zone
+        rr = calc_rr(direction, entry, range_high, range_low, liq_grab=True)
+        # For sweep reversals, first target is the opposite range wick, then runner uses RR.
+        rr["tp"] = max(round(range_high, 2), rr["tp"])
+        score = confluence_score(direction, "SWEEP", True)
+        setup.update({"entry_level": entry, "sl": rr["sl"], "tp": rr["tp"], "setup_type": "LIQUIDITY_SWEEP_BUY"})
+        if score < MIN_SWEEP_SCORE:
+            return make_signal(HOLD, f"HOLD: BUY sweep seen but score {score:.2f} < {MIN_SWEEP_SCORE:.2f} | {sess.get('name')} | POC {profile_poc:.2f}", score, ctx, data=setup)
+        return make_signal(BUY, f"BUY SWEEP: first-15M 1H low {range_low:.2f} swept/reclaimed | entry line {entry:.2f} | TP {rr['tp']:.2f} | {sess.get('name')} | score {score:.2f}", score, ctx, data=setup, sl=rr["sl"], tp=rr["tp"], entry_candle_time=entry_ct)
+
+    if sweep_sell:
+        direction = SELL
+        entry = round(range_high, 2)  # range high line is the planned rejection entry zone
+        rr = calc_rr(direction, entry, range_high, range_low, liq_grab=True)
+        rr["tp"] = min(round(range_low, 2), rr["tp"])
+        score = confluence_score(direction, "SWEEP", True)
+        setup.update({"entry_level": entry, "sl": rr["sl"], "tp": rr["tp"], "setup_type": "LIQUIDITY_SWEEP_SELL"})
+        if score < MIN_SWEEP_SCORE:
+            return make_signal(HOLD, f"HOLD: SELL sweep seen but score {score:.2f} < {MIN_SWEEP_SCORE:.2f} | {sess.get('name')} | POC {profile_poc:.2f}", score, ctx, data=setup)
+        return make_signal(SELL, f"SELL SWEEP: first-15M 1H high {range_high:.2f} swept/reclaimed | entry line {entry:.2f} | TP {rr['tp']:.2f} | {sess.get('name')} | score {score:.2f}", score, ctx, data=setup, sl=rr["sl"], tp=rr["tp"], entry_candle_time=entry_ct)
+
+    # Breakout continuation: 2 closed 5M candles outside the first-15M 1H wick range.
+    if bo.get("confirmed"):
+        direction = bo.get("direction", HOLD)
+        if direction in (BUY, SELL):
+            # Entry line is the range extreme that broke. We prefer continuation only with volume.
+            entry = round(range_high if direction == BUY else range_low, 2)
+            if direction == BUY:
+                sl = round(range_low - max(SL_BUFFER, MIN_SL_POINTS), 2)
+                risk = max(entry - sl, MIN_SL_POINTS)
+                tp = round(entry + risk * 2.5, 2)
+            else:
+                sl = round(range_high + max(SL_BUFFER, MIN_SL_POINTS), 2)
+                risk = max(sl - entry, MIN_SL_POINTS)
+                tp = round(entry - risk * 2.5, 2)
+            score = confluence_score(direction, "BREAKOUT", False)
+            if vol_m5 < 1.0:
+                score = round(score - 0.08, 2)
+            if trend_bias not in (direction, HOLD):
+                score = round(score - 0.08, 2)
+            setup.update({"entry_level": entry, "sl": sl, "tp": tp, "setup_type": f"BREAKOUT_{direction}"})
+            if score < MIN_BREAKOUT_SCORE:
+                return make_signal(HOLD, f"HOLD: {direction} breakout x{bo.get('count')} but score {score:.2f} < {MIN_BREAKOUT_SCORE:.2f}; waiting retest/volume.", score, ctx, data=setup)
+            return make_signal(direction, f"{direction} BREAKOUT: 2x M5 outside first-15M 1H range | entry line {entry:.2f} | SL {sl:.2f} | TP {tp:.2f} | {sess.get('name')} | score {score:.2f}", score, ctx, data=setup, sl=sl, tp=tp, entry_candle_time=entry_ct)
+
+    # Zone watch / no trade.
+    lo1 = fv(m1[-1].get("low")); hi1 = fv(m1[-1].get("high"))
+    at_buy_zone  = lo1 <= range_low + tol
     at_sell_zone = hi1 >= range_high - tol
+    if at_buy_zone or at_sell_zone:
+        side = BUY if at_buy_zone else SELL
+        zone = range_low if side == BUY else range_high
+        return make_signal(HOLD, f"HOLD: price testing {side} line {zone:.2f}; waiting sweep/reclaim or 2x M5 breakout | {sess.get('name')} | vol {vol_m1:.2f}/{vol_m5:.2f}", 0.0, ctx, data=setup)
 
-    if not at_buy_zone and not at_sell_zone:
-        return make_signal(
-            SCAN,
-            f"SCAN: {range_low:.2f}–{range_high:.2f} | Price {current_price:.2f} — watching zones.",
-            0.0, ctx, data=setup,
-        )
-
-    direction    = BUY if at_buy_zone else SELL
-    zone_extreme = range_low if direction == BUY else range_high
-
-    # ── 5M confirmation ────────────────────────
-    if len(m5) >= 3:
-        if not confirm_5m(m5, direction, zone_extreme):
-            return make_signal(
-                HOLD,
-                f"HOLD: Price at {direction} zone {zone_extreme:.2f} — waiting for 5M rejection candle.",
-                0.0, ctx, data=setup,
-            )
-
-    # ── 1M trigger  (candle color + volume) ───
-    m1_ok, vol_ok, trigger_candle = confirm_1m(m1, direction, zone_extreme)
-
-    if not m1_ok:
-        return make_signal(
-            HOLD,
-            f"HOLD: 5M at {direction} zone — waiting for 1M {'red' if direction == BUY else 'green'} trigger candle.",
-            0.0, ctx, data=setup,
-        )
-
-    # ── Liquidity grab confluence ───────────────
-    liq   = detect_liq_grab(m1, zone_extreme, direction)
-
-    # Entry = close of the trigger candle
-    entry    = fv(trigger_candle.get("close"))
-    entry_ct = int(trigger_candle.get("time", 0))
-
-    rr    = calc_rr(direction, entry, range_high, range_low, liq_grab=liq)
-    score = min(0.78 + (0.12 if liq else 0.0) + (0.07 if vol_ok else 0.0), 1.0)
-
-    setup.update({"entry_level": entry, "sl": rr["sl"], "tp": rr["tp"],
-                  "trigger_candle": trigger_candle})
-
-    tag_liq = " [LIQ]"  if liq   else ""
-    tag_vol = " [VOL+]" if vol_ok else ""
-    reason  = (
-        f"{direction}: 15M {range_low:.2f}–{range_high:.2f} | "
-        f"5M+1M {'red' if direction==BUY else 'green'} trigger{tag_liq}{tag_vol} | "
-        f"E={entry:.2f}  SL={rr['sl']:.2f}  TP={rr['tp']:.2f}  (1:3)"
+    return make_signal(
+        SCAN,
+        f"SCAN: 1H first-15M wick range {range_low:.2f}-{range_high:.2f} | price {current_price:.2f} | {sess.get('name')} | trend {trend_bias} | POC {profile_poc:.2f}",
+        0.0, ctx, data=setup,
     )
-    return make_signal(direction, reason, score, ctx,
-                       data=setup, sl=rr["sl"], tp=rr["tp"],
-                       entry_candle_time=entry_ct)
 
 
 # ══════════════════════════════════════════════
@@ -743,127 +926,139 @@ def build_decision(ctx: Dict[str, Any]) -> Dict[str, Any]:
 def build_draw_commands(ctx: Dict[str, Any],
                         decision: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """
-    Clean chart markup:
-      - Active 15M range box + HIGH / LOW rays only
-      - 2 nearest resistance rays (red, short)
-      - 2 nearest support rays   (green, short)
-      - Entry / SL / TP rays when trade is live
-      - Status text anchored LEFT of current bar (not drifting right)
+    Enhanced live markup:
+      - First 15M wick range of the active 1H candle, extended through the full hour
+      - High/low/mid entry framework
+      - Session label and trend context
+      - Internal MT5-volume profile POC / VAH / VAL from tick volume
+      - Entry / SL / TP rays from real signal prices
     """
     cmds: List[Dict[str, Any]] = [{"type": "clear_all"}]
-    now  = int(time.time())
+    now = int(time.time())
+    data = (decision or {}).get("data") or {}
+    action = str((decision or {}).get("action", SCAN)).upper()
 
-    data     = (decision or {}).get("data") or {}
-    action   = (decision or {}).get("action", SCAN)
-
-    # Pull candle lists from data or re-fetch
     m15_list = data.get("_m15") or []
-    m1_list  = data.get("_m1")  or []
+    m1_list = data.get("_m1") or []
     if not m15_list or not m1_list:
         tfs_ctx = get_timeframes(ctx)
-        if not m15_list:
-            m15_list = tfs_ctx.get("M15", [])
-        if not m1_list:
-            m1_list  = tfs_ctx.get("M1",  [])
+        m15_list = m15_list or tfs_ctx.get("M15", [])
+        m1_list = m1_list or tfs_ctx.get("M1", [])
 
     current_price = fv((m1_list[-1] if m1_list else {}).get("close"))
-
-    # ── Active 15M range ───────────────────────
-    rng_high  = fv(data.get("range_high"))
-    rng_low   = fv(data.get("range_low"))
-    rng_mid   = fv(data.get("range_mid"))
-    bar_start = int(data.get("range_start") or now - 900)
-    bar_end   = int(data.get("range_end")   or bar_start + 900)
-    locked    = bool(data.get("locked"))
-    rng_dir   = data.get("range_direction", HOLD)
+    rng_high = fv(data.get("range_high"))
+    rng_low = fv(data.get("range_low"))
+    rng_mid = fv(data.get("range_mid"))
+    bar_start = int(data.get("range_start") or now - HOUR_SECONDS)
+    bar_end = int(data.get("range_end") or bar_start + HOUR_SECONDS)
+    first_end = int(data.get("first_15m_end") or bar_start + FIRST_15M_SECONDS)
+    locked = bool(data.get("locked"))
+    rng_dir = data.get("range_direction", HOLD)
+    sess = data.get("session") or session_context(now)
+    trend = data.get("trend") or {}
+    profile = data.get("volume_profile") or {}
 
     if rng_high > 0 and rng_low > 0:
         box_color = "green" if rng_dir == BUY else "red" if rng_dir == SELL else "yellow"
-        status    = "RANGE" if locked else "BUILDING"
+        status = "1H PO3 LOCKED" if locked else "1H PO3 BUILDING"
 
-        # Box spanning only the active bar
-        cmds.append({"type": "box", "name": "TS_RANGE_BOX",
+        # First 15M source box only, matching your wick range concept.
+        cmds.append({"type": "box", "name": "TS_FIRST15_SOURCE_BOX",
+                     "time1": bar_start, "time2": first_end,
+                     "price1": rng_high, "price2": rng_low,
+                     "color": box_color, "text": ""})
+
+        # Full active-hour range box so the 1H chart is marked like your TradingView example.
+        cmds.append({"type": "box", "name": "TS_1H_PO3_RANGE_BOX",
                      "time1": bar_start, "time2": bar_end,
                      "price1": rng_high, "price2": rng_low,
                      "color": box_color, "text": ""})
 
-        # HIGH ray — anchored at bar start, label LEFT of bar
         cmds.append({"type": "ray", "name": "TS_RANGE_HIGH",
                      "time1": bar_start, "price1": rng_high,
                      "color": "red", "width": 2,
-                     "text": f"{status} H {rng_high:.2f}"})
-
-        # LOW ray
+                     "text": f"{status} HIGH / SELL-SWEEP / BUY-BO {rng_high:.2f}"})
         cmds.append({"type": "ray", "name": "TS_RANGE_LOW",
                      "time1": bar_start, "price1": rng_low,
                      "color": "green", "width": 2,
-                     "text": f"{status} L {rng_low:.2f}"})
+                     "text": f"{status} LOW / BUY-SWEEP / SELL-BO {rng_low:.2f}"})
+        cmds.append({"type": "ray", "name": "TS_RANGE_MID",
+                     "time1": bar_start, "price1": rng_mid,
+                     "color": "yellow", "width": 1,
+                     "text": f"MID / CONTROL {rng_mid:.2f}"})
 
-    # ── Nearest swing levels ───────────────────
-    levels = data.get("levels") or (
-        nearest_swing_levels(m15_list, current_price, lookback=10) if m15_list else {}
-    )
-    ray_start = now - 120  # short rays, anchored near current bar
+        label = f"{status} | Range {rng_high-rng_low:.2f} USD | {sess.get('name')} | Trend {trend.get('bias', HOLD)}"
+        cmds.append({"type": "text", "name": "TS_PO3_LABEL",
+                     "time": max(bar_start, now - 300), "price": rng_mid,
+                     "color": "yellow", "text": label[:95]})
 
+    # Volume profile levels calculated from MT5 bars/tick volume.
+    if profile.get("valid"):
+        for nm, lv, col, txt in [
+            ("TS_VP_POC", fv(profile.get("poc")), "blue", "POC"),
+            ("TS_VP_VAH", fv(profile.get("vah")), "orange", "VAH"),
+            ("TS_VP_VAL", fv(profile.get("val")), "cyan", "VAL"),
+        ]:
+            if lv > 0:
+                cmds.append({"type": "ray", "name": nm,
+                             "time1": bar_start, "price1": lv,
+                             "color": col, "width": 1,
+                             "text": f"{txt} {lv:.2f}"})
+
+    # Nearest swing levels.
+    levels = data.get("levels") or (nearest_swing_levels(m15_list, current_price, lookback=16) if m15_list else {})
+    ray_start = now - 240
     for j, lv in enumerate(levels.get("resistance", [])[:2]):
         cmds.append({"type": "ray", "name": f"TS_RES_{j}",
                      "time1": ray_start, "price1": lv,
                      "color": "orange", "width": 1,
-                     "text": f"R {lv:.2f}"})
-
+                     "text": f"Nearest R {lv:.2f}"})
     for j, lv in enumerate(levels.get("support", [])[:2]):
         cmds.append({"type": "ray", "name": f"TS_SUP_{j}",
                      "time1": ray_start, "price1": lv,
                      "color": "cyan", "width": 1,
-                     "text": f"S {lv:.2f}"})
+                     "text": f"Nearest S {lv:.2f}"})
 
-    # ── Entry / SL / TP ────────────────────────
     entry_level = fv(data.get("entry_level"))
-    tp_level    = fv((decision or {}).get("tp") or data.get("tp"))
-    sl_level    = fv((decision or {}).get("sl") or data.get("sl"))
+    tp_level = fv((decision or {}).get("tp") or data.get("tp"))
+    sl_level = fv((decision or {}).get("sl") or data.get("sl"))
+    setup_type = str(data.get("setup_type") or "")
 
     if entry_level > 0 and action in (BUY, SELL):
         e_color = "green" if action == BUY else "red"
         cmds.append({"type": "ray", "name": "TS_ENTRY",
-                     "time1": now - 60, "price1": entry_level,
+                     "time1": now - 180, "price1": entry_level,
                      "color": e_color, "width": 3,
-                     "text": f"ENTRY {entry_level:.2f}"})
+                     "text": f"{action} ENTRY LINE {entry_level:.2f} {setup_type}"})
     if tp_level > 0:
         cmds.append({"type": "ray", "name": "TS_TP",
-                     "time1": now - 60, "price1": tp_level,
+                     "time1": now - 180, "price1": tp_level,
                      "color": "blue", "width": 2,
-                     "text": f"TP {tp_level:.2f}"})
+                     "text": f"TAKE PROFIT {tp_level:.2f}"})
     if sl_level > 0:
         cmds.append({"type": "ray", "name": "TS_SL",
-                     "time1": now - 60, "price1": sl_level,
+                     "time1": now - 180, "price1": sl_level,
                      "color": "orange", "width": 2,
-                     "text": f"SL {sl_level:.2f}"})
+                     "text": f"STOP LOSS {sl_level:.2f}"})
 
-    # ── Breakout marker ────────────────────────
     bo = data.get("breakout", {})
     if bo.get("confirmed") and rng_mid > 0:
-        bo_dir   = bo.get("direction", HOLD)
+        bo_dir = bo.get("direction", HOLD)
         bo_color = "green" if bo_dir == BUY else "red"
-        # Offset text slightly above/below mid so it doesn't overlap range lines
-        offset   = (rng_high - rng_low) * 0.15 if rng_high > rng_low else 0.5
-        lbl_price= rng_mid + (offset if bo_dir == BUY else -offset)
+        offset = (rng_high - rng_low) * 0.18 if rng_high > rng_low else 0.5
+        lbl_price = rng_mid + (offset if bo_dir == BUY else -offset)
         cmds.append({"type": "text", "name": "TS_BO_LABEL",
-                     "time": now - 60, "price": lbl_price,
+                     "time": now - 120, "price": lbl_price,
                      "color": bo_color,
-                     "text": f"BO {bo_dir} x{bo.get('count')}"})
+                     "text": f"BREAKOUT {bo_dir} x{bo.get('count')}"})
 
-    # ── Status label  (anchored 2 bars LEFT) ──
-    reason   = str((decision or {}).get("reason", "Scanning..."))
-    # Truncate to 80 chars max so it fits within the chart window
-    short_reason = reason[:80]
+    reason = str((decision or {}).get("reason", "Scanning..."))[:100]
     lbl_price = rng_mid if rng_mid > 0 else current_price
-    # Place label at now - 2 bars (120s) so it appears on the chart, not off-screen
-    lbl_time  = now - 120
-    a_color   = "green" if action == BUY else "red" if action == SELL else "yellow"
+    a_color = "green" if action == BUY else "red" if action == SELL else "yellow"
     cmds.append({"type": "text", "name": "TS_STATUS",
-                 "time": lbl_time, "price": lbl_price,
+                 "time": now - 180, "price": lbl_price,
                  "color": a_color,
-                 "text": f"{action} | {short_reason}"})
+                 "text": f"{action} | {reason}"})
 
     return cmds
 
@@ -891,9 +1086,9 @@ def write_json(path: Path, payload: Dict[str, Any]) -> None:
 def write_draws(ctx: Dict[str, Any], decision: Optional[Dict[str, Any]] = None) -> int:
     cmds    = build_draw_commands(ctx, decision)
     payload = {
-        "version":       14,
+        "version":       21,
         "source":        "TradeSmartAI",
-        "strategy":      "m15_wick_scalp_v4",
+        "strategy":      "first15m_1h_po3_liquidity_v5",
         "updated":       time.time(),
         "command_count": len(cmds),
         "commands":      cmds,
