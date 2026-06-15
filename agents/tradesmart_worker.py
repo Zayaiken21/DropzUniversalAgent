@@ -1,87 +1,79 @@
-
 from __future__ import annotations
 
 import json
+import os
+import hashlib
+import re
 import time
-import traceback
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
-from agents.tradesmart_agent import TradeSmartAgent
-
-STATE_FILE = Path("data/tradesmart_worker_state.json")
-LOG_FILE = Path("data/tradesmart_worker.log")
-CHECK_SECONDS = 3
+DRAW_ENV = "TRADESMART_MT5_BRIDGE_FILE"
+DRAW_JSON1 = "TradeSmart_AI_DrawCommands.json1"
+DRAW_JSONL = "TradeSmart_AI_DrawCommands.jsonl"
 
 
-def _log(message: str) -> None:
-    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with LOG_FILE.open("a", encoding="utf-8") as f:
-        f.write(f"[{datetime.now().isoformat(timespec='seconds')}] {message}\n")
+def _safe_user_id(value: Any) -> str:
+    raw = str(value or "default")
+    clean = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("._-")[:64]
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
+    return f"{clean or 'user'}_{digest}"
 
 
-def _load_state() -> Dict[str, Any]:
-    if not STATE_FILE.exists():
-        return {"enabled": False}
-    try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {"enabled": False}
-    except Exception:
-        return {"enabled": False}
+def draw_paths(project_root: Path | None = None, user_key: str | None = None) -> List[Path]:
+    user_id = _safe_user_id(user_key or "default")
+    env_key = f"{DRAW_ENV}_{user_id.upper()}"
+    raw = os.environ.get(env_key) or os.environ.get(DRAW_ENV)
+    if raw:
+        p = Path(raw)
+        # If the global bridge path is used, write a user-scoped sibling too so
+        # app-side outputs never collide across clients.
+        suffix = p.suffix or ".json1"
+        scoped = p.with_name(f"{p.stem}_{user_id}{suffix}")
+        alt = scoped.with_suffix(".jsonl" if scoped.suffix.lower() == ".json1" else ".json1")
+        return [p, scoped, alt]
+    root = Path(project_root or Path.cwd())
+    files_dir = root / "data" / "users" / user_id / "mt5_files"
+    return [files_dir / DRAW_JSON1, files_dir / DRAW_JSONL]
 
 
-def run_worker() -> None:
-    _log("TradeSmart worker started.")
-    while True:
-        state = _load_state()
-        if not state.get("enabled"):
-            time.sleep(CHECK_SECONDS)
-            continue
-
-        try:
-            profile = state.get("profile") or {}
-            risk = state.get("risk") or {}
-            mode = state.get("mode") or "Demo"
-
-            agent = TradeSmartAgent(profile=profile, rules={**risk, "mode": mode, "symbol": "XAUUSD"})
-            result = agent.run_cycle(execution_enabled=True)
-
-            state["last_result"] = result
-            state["last_run"] = datetime.now().isoformat(timespec="seconds")
-
-            # Safety kill-switch: once max loss is reached, do not open any new
-            # trades. First, make several immediate close-only retry cycles so a
-            # temporary broker requote/filling failure does not leave positions
-            # open. The agent's persistent risk_lock prevents new entries during
-            # these retry cycles. After that, the worker is disabled and the UI
-            # must be manually turned on again by the user.
-            if result.get("max_daily_loss_reached"):
-                _log("KILL SWITCH: " + str(result.get("message") or "Max loss limit reached."))
-                for retry in range(1, 5):
-                    if int(result.get("open_positions_count") or 0) <= 0:
-                        break
-                    time.sleep(0.35)
-                    _log(f"Risk close retry {retry}: open positions still detected.")
-                    result = agent.run_cycle(execution_enabled=True)
-                    state["last_result"] = result
-                    state["last_run"] = datetime.now().isoformat(timespec="seconds")
-
-                state["enabled"] = False
-                state["disabled_reason"] = result.get("message") or "Max loss limit reached."
-                state["disabled_at"] = datetime.now().isoformat(timespec="seconds")
-                risk["risk_session_id"] = ""
-                state["risk"] = risk
-
-            STATE_FILE.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
-
-            _log(str(result.get("message") or result.get("phase") or "cycle complete"))
-        except Exception as exc:
-            _log(f"Worker error: {exc}")
-            _log(traceback.format_exc())
-
-        time.sleep(CHECK_SECONDS)
+def _atomic_write(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    tmp.replace(path)
 
 
-if __name__ == "__main__":
-    run_worker()
+def write_draw_commands(result: Dict[str, Any], project_root: Path | None = None, user_key: str | None = None) -> int:
+    """Drawing-only worker hook.
+
+    The TradeSmart page owns the 3-second live cycle. The agent owns MT5 order
+    execution. This module only writes the MT5 bridge draw file from the winning
+    strategy decision, so chart drawing can be upgraded without changing the page.
+    """
+    result = result or {}
+    decision = result.get("decision") or {}
+    strategy_info = result.get("strategy_info") or {}
+    raw = strategy_info.get("raw") if isinstance(strategy_info.get("raw"), dict) else {}
+    commands = decision.get("draw_commands") or raw.get("draw_commands") or []
+    if not isinstance(commands, list):
+        commands = []
+    user_id = _safe_user_id(user_key or result.get("user_id") or result.get("user_key") or "default")
+    payload = {
+        "version": 31,
+        "user_id": user_id,
+        "user_key": str(user_key or result.get("user_key") or "default"),
+        "source": "TradeSmartAI",
+        "strategy": result.get("strategy") or strategy_info.get("winner") or "strategy",
+        "updated": time.time(),
+        "command_count": len(commands),
+        "commands": commands,
+    }
+    for path in draw_paths(project_root, user_id):
+        _atomic_write(path, payload)
+    return len(commands)
+
+
+# Backward-compatible alias for old imports.
+def run_worker_once(result: Dict[str, Any], project_root: Path | None = None, user_key: str | None = None) -> int:
+    return write_draw_commands(result, project_root, user_key=user_key)

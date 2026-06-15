@@ -1,322 +1,118 @@
 from __future__ import annotations
 
 from datetime import datetime
-from html import escape
-import json
-from pathlib import Path
+import hashlib
 import re
-from typing import Any, Dict, List, Optional
+from html import escape
+from pathlib import Path
+from typing import Any, Dict, Tuple
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 import streamlit.components.v1 as components
 
 from agents.tradesmart_agent import TradeSmartAgent
+from agents.tradesmart_worker import write_draw_commands
+from agents.outputs import build_live_thinking_html
 
-SYMBOL = "XAUUSD"
-
-# Easy throttle: change this number if you want the page/agent to check faster or slower.
-TRADESMART_CHECK_INTERVAL_SECONDS = 3
-TRADESMART_OUTPUT_LIMIT = 50
-TRADESMART_WORKER_STATE_FILE = Path("data/tradesmart_worker_state.json")
-
+SYMBOL              = "XAUUSD"
+REFRESH_ON_SECONDS  = 3     # fragment refresh when agent is ON
+MARKET_TZ           = ZoneInfo("America/New_York")
 
 
+# ══════════════════════════════════════════════
+#  PATHS / CSS
+# ══════════════════════════════════════════════
 
-def _load_tradesmart_worker_state() -> Dict[str, Any]:
-    if not TRADESMART_WORKER_STATE_FILE.exists():
-        return {}
-    try:
-        data = json.loads(TRADESMART_WORKER_STATE_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-def _save_tradesmart_worker_state(
-    *,
-    enabled: bool,
-    mode: str,
-    profile: Dict[str, Any],
-    risk: Dict[str, Any],
-    user_key: str,
-) -> None:
-    """Persist the TradeSmart run state for agents/tradesmart_worker.py."""
-    TRADESMART_WORKER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-    risk_payload = dict(risk or {})
-    if enabled and not risk_payload.get("risk_session_id"):
-        risk_payload["risk_session_id"] = f"{user_key}:{mode}:{datetime.now().timestamp()}"
-
-    payload = {
-        "enabled": bool(enabled),
-        "mode": str(mode or "Demo"),
-        "symbol": SYMBOL,
-        "user_key": user_key,
-        "profile": dict(profile or {}),
-        "risk": risk_payload,
-        "updated_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    TRADESMART_WORKER_STATE_FILE.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[1]
 
 
+def _inject_css() -> None:
+    for css_path in (
+        _project_root() / "styles" / "tradesmart_page.css",
+        _project_root() / "styles" / "TradeSmartpage.css",
+    ):
+        if css_path.exists():
+            st.markdown(
+                f"<style>{css_path.read_text(encoding='utf-8')}</style>",
+                unsafe_allow_html=True,
+            )
+            return
 
-def _inject_tradesmart_styles() -> None:
+
+def _section(title: str) -> None:
     st.markdown(
-        """
-        <style>
-            .ts-hero {
-                padding: 22px 24px;
-                border-radius: 24px;
-                background: linear-gradient(135deg, rgba(255,255,255,.08), rgba(255,255,255,.03));
-                border: 1px solid rgba(255,255,255,.12);
-                box-shadow: 0 18px 55px rgba(0,0,0,.22);
-                margin-bottom: 18px;
-                color: inherit;
-            }
-
-            .ts-title {
-                font-size: 30px;
-                font-weight: 900;
-                color: inherit;
-                margin: 0 0 8px 0;
-                letter-spacing: -.02em;
-            }
-
-            .ts-muted {
-                opacity: .72;
-                font-size: 14px;
-                line-height: 1.55;
-                color: inherit;
-            }
-
-            .ts-section-title {
-                padding: 15px 18px;
-                border-radius: 20px;
-                background: linear-gradient(145deg, rgba(255,255,255,.075), rgba(255,255,255,.025));
-                border: 1px solid rgba(255,255,255,.11);
-                box-shadow: 0 14px 42px rgba(0,0,0,.18);
-                margin: 16px 0 12px 0;
-                font-size: 16px;
-                font-weight: 850;
-                color: inherit;
-            }
-
-            .ts-pill {
-                display: inline-flex;
-                align-items: center;
-                gap: 8px;
-                border-radius: 999px;
-                padding: 8px 12px;
-                border: 1px solid rgba(255,255,255,.13);
-                background: rgba(255,255,255,.055);
-                font-size: 12px;
-                font-weight: 800;
-                margin: 6px 0 8px 0;
-                color: inherit;
-            }
-
-            .ts-dot {
-                width: 8px;
-                height: 8px;
-                border-radius: 99px;
-                background: #00ffa3;
-                box-shadow: 0 0 18px rgba(0,255,163,.85);
-            }
-
-            .ts-spinner {
-                width: 16px;
-                height: 16px;
-                border-radius: 999px;
-                border: 2px solid rgba(255,255,255,.18);
-                border-top-color: #00ffa3;
-                animation: ts-spin .9s linear infinite;
-                display: inline-block;
-                vertical-align: middle;
-                margin-right: 8px;
-            }
-
-            @keyframes ts-spin {
-                to { transform: rotate(360deg); }
-            }
-
-            .ts-live-box {
-                padding: 15px 16px;
-                border-radius: 18px;
-                background: rgba(0,255,163,.07);
-                border: 1px solid rgba(0,255,163,.18);
-                color: inherit;
-                margin: 10px 0 12px 0;
-            }
-
-            .ts-live-head {
-                font-weight: 900;
-                margin-bottom: 6px;
-                display: flex;
-                align-items: center;
-                color: inherit;
-            }
-
-            .ts-live-msg {
-                opacity: .82;
-                line-height: 1.45;
-                font-size: 13px;
-                color: inherit;
-            }
-
-            .ts-grid {
-                display: grid;
-                grid-template-columns: repeat(4, minmax(0, 1fr));
-                gap: 10px;
-                margin: 10px 0 16px 0;
-            }
-
-            .ts-summary {
-                display: grid;
-                grid-template-columns: repeat(3, minmax(0, 1fr));
-                gap: 10px;
-                margin: 10px 0 16px 0;
-            }
-
-            .ts-metric {
-                padding: 13px;
-                border-radius: 16px;
-                background: rgba(255,255,255,.045);
-                border: 1px solid rgba(255,255,255,.09);
-                min-height: 78px;
-                color: inherit;
-            }
-
-            .ts-metric-label {
-                opacity: .58;
-                font-size: 11px;
-                text-transform: uppercase;
-                letter-spacing: .08em;
-                font-weight: 800;
-                color: inherit;
-            }
-
-            .ts-metric-value {
-                font-size: 18px;
-                font-weight: 900;
-                margin-top: 7px;
-                color: inherit;
-                word-break: break-word;
-            }
-
-            .ts-log-wrap {
-                max-height: 320px;
-                overflow-y: auto;
-                padding: 10px;
-                border-radius: 18px;
-                background: linear-gradient(145deg, rgba(5,8,18,.96), rgba(12,18,34,.92)) !important;
-                border: 1px solid rgba(255,255,255,.12) !important;
-                color: rgba(255,255,255,.94) !important;
-                box-shadow: inset 0 0 0 1px rgba(255,255,255,.035);
-                color-scheme: dark;
-                margin-bottom: 8px;
-            }
-
-            .ts-log-wrap * {
-                color: rgba(255,255,255,.92) !important;
-                color-scheme: dark;
-            }
-
-            .ts-log-wrap::-webkit-scrollbar {
-                width: 8px;
-            }
-
-            .ts-log-wrap::-webkit-scrollbar-thumb {
-                background: rgba(255,255,255,.22);
-                border-radius: 99px;
-            }
-
-            .ts-log-item {
-                padding: 12px 12px;
-                border-radius: 14px;
-                background: rgba(255,255,255,.07) !important;
-                border: 1px solid rgba(255,255,255,.10) !important;
-                margin-bottom: 8px;
-            }
-
-            .ts-log-title {
-                font-weight: 900;
-                font-size: 13px;
-                margin-bottom: 5px;
-            }
-
-            .ts-log-msg {
-                font-size: 13px;
-                line-height: 1.35;
-                opacity: .82;
-            }
-
-            @media (max-width: 900px) {
-                .ts-grid, .ts-summary {
-                    grid-template-columns: repeat(2, minmax(0, 1fr));
-                }
-            }
-
-            @media (max-width: 560px) {
-                .ts-grid, .ts-summary {
-                    grid-template-columns: 1fr;
-                }
-            }
-        </style>
-        """,
+        f'<div class="ts-section-title">{escape(title)}</div>',
         unsafe_allow_html=True,
     )
 
 
-def _section(title: str) -> None:
-    st.markdown(f'<div class="ts-section-title">{escape(title)}</div>', unsafe_allow_html=True)
+# ══════════════════════════════════════════════
+#  USER / SCOPE HELPERS  (no user display name exposed)
+# ══════════════════════════════════════════════
 
-
-def _get_user_key() -> str:
+def _user_key() -> str:
     user = st.session_state.get("user")
     if isinstance(user, dict):
-        for field in ("id", "token", "email", "username", "name", "role"):
-            value = user.get(field)
-            if value not in (None, ""):
-                return f"user_{value}"
-    return str(st.session_state.get("authenticated_user") or st.session_state.get("role") or "default")
+        for key in ("id", "email", "username", "token", "name", "role"):
+            if user.get(key):
+                return f"user_{user[key]}"
+    return str(
+        st.session_state.get("authenticated_user")
+        or st.session_state.get("role")
+        or "default"
+    )
 
+
+def _safe_user_id(value: Any) -> str:
+    raw   = str(value or "default")
+    clean = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("._-")[:64]
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
+    return f"{clean or 'user'}_{digest}"
+
+
+def _set_scope(user_key: str, mode: str) -> None:
+    st.session_state["_tradesmart_scope_user"]    = user_key
+    st.session_state["_tradesmart_scope_user_id"] = _safe_user_id(user_key)
+    st.session_state["_tradesmart_scope_mode"]    = str(mode or "Demo").title()
+
+
+def _scope_key(name: str, user_key: str | None = None, mode: str | None = None) -> str:
+    user_id   = _safe_user_id(user_key or st.session_state.get("_tradesmart_scope_user") or _user_key())
+    mode_text = str(mode or st.session_state.get("_tradesmart_scope_mode") or "Demo").title()
+    return f"{name}_{user_id}_{mode_text}"
+
+
+# ══════════════════════════════════════════════
+#  MT5 PROFILE
+# ══════════════════════════════════════════════
 
 def _load_mt5_profile(mode: str) -> Dict[str, Any]:
-    """Load the exact Demo/Live profile saved in Settings using mt5_secure_store."""
     mode = str(mode or "Demo").title()
     try:
         import frontend.mt5_secure_store as store
-
-        # Use the same key system as Settings. This is what keeps Dashboard and
-        # TradeSmart reading the same encrypted saved MT5 profile.
         for role in ("client", "ceo"):
             try:
-                user_key = store.get_signed_in_user_key(role)
-                profile = store.load_mt5_profile(user_key, mode, role=role)
+                key     = store.get_signed_in_user_key(role)
+                profile = store.load_mt5_profile(key, mode, role=role)
                 if isinstance(profile, dict) and (
                     profile.get("login") or profile.get("password") or profile.get("server")
                 ):
-                    profile = dict(profile)
-                    profile["mode"] = mode
-                    return profile
+                    out       = dict(profile)
+                    out["mode"] = mode
+                    return out
             except Exception:
                 continue
-
-        # Store-level fallback for migrated/legacy keys.
-        try:
-            profile = store.load_mt5_profile("", mode, role="client")
-            if isinstance(profile, dict) and (
-                profile.get("login") or profile.get("password") or profile.get("server")
-            ):
-                profile = dict(profile)
-                profile["mode"] = mode
-                return profile
-        except Exception:
-            pass
     except Exception:
         pass
-
     return {}
 
+
+def _complete_profile(profile: Dict[str, Any]) -> bool:
+    return bool(
+        profile.get("login") and profile.get("password") and profile.get("server")
+    )
 
 
 def _masked_login(profile: Dict[str, Any]) -> str:
@@ -324,692 +120,805 @@ def _masked_login(profile: Dict[str, Any]) -> str:
     return f"*{login[-4:]}" if login else "Not saved"
 
 
-def _is_complete_profile(profile: Dict[str, Any]) -> bool:
-    return bool(profile.get("login") and profile.get("password") and profile.get("server"))
+# ══════════════════════════════════════════════
+#  MARKET STATUS
+# ══════════════════════════════════════════════
+
+def _market_status(now: datetime | None = None) -> Tuple[bool, str, datetime]:
+    et   = (now or datetime.now(tz=MARKET_TZ)).astimezone(MARKET_TZ)
+    wd   = et.weekday()
+    mins = et.hour * 60 + et.minute
+    if wd == 5:
+        return False, "Weekend closure. Gold reopens Sunday 6:00 PM Eastern.", et
+    if wd == 6 and mins < 18 * 60:
+        return False, "Weekend closure. Gold reopens Sunday 6:00 PM Eastern.", et
+    if wd == 4 and mins >= 17 * 60:
+        return False, "Friday closure after 5:00 PM Eastern.", et
+    if 17 * 60 <= mins < 18 * 60:
+        return False, "Daily gold rollover 5–6 PM Eastern.", et
+    return True, "Market open.", et
 
 
+# ══════════════════════════════════════════════
+#  LOG HELPERS
+# ══════════════════════════════════════════════
 
-def _strip_legacy_html(value: Any) -> str:
-    """Prevent old saved HTML log/metric strings from rendering as visible markup."""
-    text = str(value if value is not None else "")
-    if "<" in text and ">" in text:
-        text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
-        text = re.sub(r"</div\s*>", " ", text, flags=re.IGNORECASE)
-        text = re.sub(r"<[^>]+>", "", text)
-        text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def _sanitize_existing_logs() -> None:
-    logs = st.session_state.get("tradesmart_logs")
-    if not isinstance(logs, list):
-        st.session_state["tradesmart_logs"] = []
-        return
-
-    clean_logs = []
-    for item in logs[:60]:
-        if isinstance(item, dict):
-            clean_logs.append(
-                {
-                    "time": _strip_legacy_html(item.get("time", "")),
-                    "title": _strip_legacy_html(item.get("title", "Update")) or "Update",
-                    "message": _strip_legacy_html(item.get("message", "")),
-                    "balance": item.get("balance"),
-                    "equity": item.get("equity"),
-                }
-            )
-        else:
-            clean_logs.append(
-                {
-                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "title": "Agent Update",
-                    "message": _strip_legacy_html(item),
-                    "balance": None,
-                    "equity": None,
-                }
-            )
-    st.session_state["tradesmart_logs"] = clean_logs
-
-def _add_log(title: str, message: str, balance: Any = None, equity: Any = None) -> None:
-    logs = st.session_state.setdefault("tradesmart_logs", [])
-    logs.insert(
-        0,
-        {
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "title": _strip_legacy_html(title),
-            "message": _strip_legacy_html(message),
-            "balance": balance,
-            "equity": equity,
-        },
-    )
-    del logs[TRADESMART_OUTPUT_LIMIT:]
+def _add_log(title: str, message: str, result: Dict[str, Any] | None = None) -> None:
+    log_key = _scope_key("tradesmart_logs")
+    logs    = st.session_state.setdefault(log_key, [])
+    account = (result or {}).get("account") or {}
+    logs.insert(0, {
+        "time":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "title":   str(title),
+        "message": str(message),
+        "balance": account.get("balance"),
+        "equity":  account.get("equity"),
+    })
+    st.session_state[log_key] = logs[:60]
 
 
+# ══════════════════════════════════════════════
+#  RISK SESSION MANAGEMENT
+# ══════════════════════════════════════════════
 
-def _render_logs() -> None:
-    _sanitize_existing_logs()
-    logs: List[Dict[str, Any]] = st.session_state.get("tradesmart_logs", [])
+def _ensure_risk_session(user_key: str, mode: str, enabled: bool) -> str:
+    session_key       = f"tradesmart_risk_session_{user_key}_{mode}"
+    prev_key          = f"tradesmart_prev_enabled_{user_key}_{mode}"
+    force_stopped_key = _scope_key("tradesmart_force_stopped")
+    force_reason_key  = _scope_key("tradesmart_force_stop_reason")
+    force_key         = _scope_key("tradesmart_force_stop_key")
 
-    def esc(value: Any) -> str:
-        return escape(str(value if value is not None else "—"))
+    was_enabled      = bool(st.session_state.get(prev_key, False))
+    was_force_stopped = bool(st.session_state.get(force_stopped_key, False))
 
-    if not logs:
-        items_html = """
-        <div class="log-item">
-            <div class="log-title">TradeSmart Waiting</div>
-            <div class="log-msg">Enable the agent after connecting MT5 to start live tracking.</div>
-        </div>
-        """
-    else:
-        parts = []
-        for item in logs[:TRADESMART_OUTPUT_LIMIT]:
-            balance = item.get("balance")
-            equity = item.get("equity")
-            meta = ""
-            if balance is not None:
-                meta = f'<div class="log-meta">Balance {esc(balance)} • Equity {esc(equity)}</div>'
-            parts.append(
-                f"""
-                <div class="log-item">
-                    <div class="log-title">{esc(item.get("title", "Update"))} <span>{esc(item.get("time", ""))}</span></div>
-                    <div class="log-msg">{esc(item.get("message", ""))}</div>
-                    {meta}
-                </div>
-                """
-            )
-        items_html = "".join(parts)
+    if enabled and (not was_enabled or was_force_stopped):
+        # Brand-new session
+        st.session_state[session_key] = f"{user_key}:{mode}:{datetime.now().timestamp()}"
+        st.session_state[f"tradesmart_session_start_{user_key}_{mode}"] = datetime.now().isoformat(timespec="seconds")
+        _reset_session_accounting(user_key, mode, st.session_state[session_key])
+        st.session_state[force_stopped_key] = False
+        st.session_state.pop(force_reason_key, None)
+        st.session_state.pop(force_key, None)
+        _add_log("Risk Session Reset", "New session started. Previous P/L is the baseline.")
 
-    html = f"""
-    <!doctype html>
-    <html>
-    <head>
-      <style>
-        html, body {{
-          margin: 0;
-          padding: 0;
-          background: transparent;
-          font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-          color: rgba(255,255,255,.94);
-        }}
-        .log-wrap {{
-          height: 320px;
-          overflow-y: auto;
-          padding: 10px;
-          border-radius: 18px;
-          background: linear-gradient(145deg, rgba(5,8,18,.97), rgba(12,18,34,.94));
-          border: 1px solid rgba(255,255,255,.13);
-          box-shadow: inset 0 0 0 1px rgba(255,255,255,.035);
-          box-sizing: border-box;
-        }}
-        .log-wrap::-webkit-scrollbar {{ width: 8px; }}
-        .log-wrap::-webkit-scrollbar-thumb {{
-          background: rgba(255,255,255,.24);
-          border-radius: 99px;
-        }}
-        .log-item {{
-          padding: 12px;
-          border-radius: 14px;
-          background: rgba(255,255,255,.075);
-          border: 1px solid rgba(255,255,255,.10);
-          margin-bottom: 8px;
-        }}
-        .log-title {{
-          font-weight: 900;
-          font-size: 13px;
-          margin-bottom: 5px;
-          color: rgba(255,255,255,.96);
-        }}
-        .log-title span {{
-          opacity: .55;
-          font-weight: 650;
-          margin-left: 6px;
-        }}
-        .log-msg {{
-          font-size: 13px;
-          line-height: 1.38;
-          color: rgba(255,255,255,.84);
-        }}
-        .log-meta {{
-          margin-top: 5px;
-          font-size: 12px;
-          color: rgba(255,255,255,.62);
-        }}
-      </style>
-    </head>
-    <body>
-      <div class="log-wrap">{items_html}</div>
-    </body>
-    </html>
-    """
-    components.html(html, height=350, scrolling=False)
+    if not enabled and was_enabled:
+        _add_log("Agent OFF", "Live tracking stopped. Turn ON to start a fresh session.")
+
+    st.session_state[prev_key] = bool(enabled)
+    if not st.session_state.get(session_key):
+        st.session_state[session_key] = f"{user_key}:{mode}:idle"
+    return str(st.session_state[session_key])
 
 
-def _render_metric_grid(items: List[tuple[str, Any]], summary: bool = False) -> None:
-    cols_per_row = 3 if summary else 4
-    for i in range(0, len(items), cols_per_row):
-        row = items[i:i + cols_per_row]
-        cols = st.columns(len(row))
-        for col, (label, value) in zip(cols, row):
-            with col:
-                st.metric(str(label), str(value))
+# ══════════════════════════════════════════════
+#  FORMATTING
+# ══════════════════════════════════════════════
 
-def _render_metrics(account: Optional[Dict[str, Any]], mode: str, connected: bool) -> None:
-    account = account or {}
-    _render_metric_grid(
-        [
-            ("Mode", mode),
-            ("Symbol", SYMBOL),
-            ("Connection", "Connected" if connected else "Disconnected"),
-            ("Balance", account.get("balance", "—")),
-            ("Equity", account.get("equity", "—")),
-            ("Currency", account.get("currency", "—")),
-            ("Open Trades", account.get("open_positions", "—")),
-            ("Today P/L", account.get("daily_pl", "—")),
-        ]
-    )
-
-
-def _render_summary(mode: str, profile: Dict[str, Any], agent_enabled: bool, risk: Dict[str, Any]) -> None:
-    _render_metric_grid(
-        [
-            ("Mode", mode),
-            ("Symbol", SYMBOL),
-            ("Agent", "Enabled" if agent_enabled else "Idle"),
-            ("Login", _masked_login(profile)),
-            ("Server", profile.get("server") or "Not saved"),
-            ("Volume", risk["trade_volume"]),
-            ("Max Open Trades", risk["max_open_trades"]),
-            ("Max Daily Loss", f"${risk['max_daily_loss_amount']:.2f}"),
-            ("AI Rules", "Saved" if risk.get("ai_instructions") else "Empty"),
-        ],
-        summary=True,
-    )
-
-
-
-def _account_snapshot_key(user_key: str, mode: str) -> str:
-    return f"tradesmart_account_snapshot_{user_key}_{mode}"
-
-
-def _last_result_key(user_key: str, mode: str) -> str:
-    return f"tradesmart_last_result_{user_key}_{mode}"
-
-
-def _get_account_snapshot(user_key: str, mode: str) -> Dict[str, Any]:
-    snapshot = st.session_state.get(_account_snapshot_key(user_key, mode), {})
-    return snapshot if isinstance(snapshot, dict) else {}
-
-
-def _set_account_snapshot(user_key: str, mode: str, account: Optional[Dict[str, Any]], result: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    account = dict(account or {})
-    result = result or {}
-    account["open_positions"] = result.get("open_positions_count", account.get("open_positions", 0))
-    account["daily_pl"] = account.get("daily_pl", result.get("daily_pl", account.get("daily_pl", "—")))
-    account["mode"] = mode
-    account["symbol"] = SYMBOL
-    account["refreshed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    st.session_state[_account_snapshot_key(user_key, mode)] = account
-    # Keep the old key synced for any existing code that still reads it.
-    st.session_state["tradesmart_account_snapshot"] = account
-    return account
-
-
-
-def _connect_profile_for_tradesmart(profile: Dict[str, Any], mode: str) -> Dict[str, Any]:
-    """
-    Use the same MT5 auto-login path as Dashboard/Settings for the initial
-    TradeSmart connection. This avoids the Demo IPC issue caused by initializing
-    MT5 through a different code path.
-    """
+def _money(value: Any) -> str:
     try:
-        import frontend.mt5_secure_store as store
-
-        profile = dict(profile or {})
-        profile["mode"] = mode
-        ok, message, account = store.connect_mt5(profile)
-        positions = []
-        if ok:
-            try:
-                positions = [
-                    p for p in store.get_mt5_positions()
-                    if str(p.get("symbol", "")).upper() == SYMBOL
-                ]
-            except Exception:
-                positions = []
-
-        return {
-            "ok": bool(ok),
-            "phase": "connect",
-            "event": "Connected" if ok else "Connection Failed",
-            "message": message,
-            "thinking": message,
-            "account": account or {},
-            "open_positions_count": len(positions),
-            "positions": positions,
-        }
-    except Exception as exc:
-        return {
-            "ok": False,
-            "phase": "connect",
-            "event": "Connection Failed",
-            "message": f"MT5 auto-login failed: {exc}",
-            "thinking": str(exc),
-            "account": {},
-            "open_positions_count": 0,
-            "positions": [],
-        }
+        val    = float(value or 0.0)
+        prefix = "+" if val > 0 else ""
+        return f"{prefix}${val:,.2f}"
+    except Exception:
+        return "—"
 
 
-def _refresh_account_snapshot(profile: Dict[str, Any], mode: str, user_key: str) -> Dict[str, Any]:
-    agent = TradeSmartAgent(profile=profile, rules={"mode": mode, "symbol": SYMBOL})
-    result = agent.snapshot_only()
-    st.session_state[_last_result_key(user_key, mode)] = result
-    if result.get("ok"):
-        account = _set_account_snapshot(user_key, mode, result.get("account"), result)
-        positions = result.get("positions") or []
-        if positions:
-            tracked = []
-            for pos in positions[:5]:
-                p_type = int(pos.get("type", 0) or 0)
-                direction = "BUY" if p_type == 0 else "SELL"
-                tracked.append(f"{direction} ticket {pos.get('ticket')} profit {pos.get('profit')}")
-            _add_log("Live Refresh", "Updated selected account. " + " | ".join(tracked), account.get("balance"), account.get("equity"))
-        return account
-
-    _add_log("Refresh Failed", result.get("message", "Could not refresh selected MT5 account."))
-    return _get_account_snapshot(user_key, mode)
+def _plain(value: Any) -> str:
+    return escape(str(value if value not in (None, "") else "—"))
 
 
+def _float_value(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value if value not in (None, "") else default)
+    except Exception:
+        return float(default)
 
-def _run_agent_cycle(profile: Dict[str, Any], mode: str, risk: Dict[str, Any], execution_enabled: bool, user_key: str) -> Dict[str, Any]:
-    agent = TradeSmartAgent(profile=profile, rules={**risk, "mode": mode, "symbol": SYMBOL})
-    result = agent.run_cycle(execution_enabled=execution_enabled)
 
-    st.session_state["tradesmart_last_result"] = result
-    st.session_state[_last_result_key(user_key, mode)] = result
+def _session_start_label(user_key: str, mode: str) -> str:
+    raw = st.session_state.get(f"tradesmart_session_start_{user_key}_{mode}")
+    if not raw:
+        return "Not started"
+    try:
+        dt = datetime.fromisoformat(str(raw))
+        return dt.strftime("%I:%M:%S %p")
+    except Exception:
+        return str(raw)
 
-    # Hard stop persistence: if the agent hits the max-loss lock, immediately
-    # write disabled state to the worker file so the background worker cannot
-    # keep running while the Streamlit UI reruns. The UI toggle is also forced
-    # off below, so the user must manually turn it back on.
-    if result.get("max_daily_loss_reached"):
-        _save_tradesmart_worker_state(
-            enabled=False,
-            mode=mode,
-            profile=profile,
-            risk=risk,
-            user_key=user_key,
-        )
 
-    account = _set_account_snapshot(user_key, mode, result.get("account") or {}, result)
+def _reset_session_accounting(user_key: str, mode: str, session_id: str) -> None:
+    st.session_state[_scope_key("tradesmart_session_accounting_id", user_key, mode)] = session_id
+    # Baselines are captured from the first MT5 snapshot after the agent starts.
+    # Balance delta is the most reliable page-level realized P/L because MT5 balance
+    # changes only after a trade closes, while equity includes floating P/L.
+    st.session_state[_scope_key("tradesmart_session_closed_baseline", user_key, mode)] = None
+    st.session_state[_scope_key("tradesmart_session_balance_baseline", user_key, mode)] = None
+    st.session_state[_scope_key("tradesmart_session_closed_pl", user_key, mode)] = 0.0
+    st.session_state[_scope_key("tradesmart_session_combined_pl", user_key, mode)] = 0.0
+    st.session_state[_scope_key("tradesmart_session_opened_tickets", user_key, mode)] = set()
+    st.session_state[_scope_key("tradesmart_session_opened_count", user_key, mode)] = 0
 
-    decision = result.get("decision") or {}
-    action = str(decision.get("action", "NONE")).upper()
-    strategy = result.get("strategy") or "strategy core"
-    positions = result.get("positions") or []
+
+def _apply_session_accounting(result: Dict[str, Any], risk: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Enforce TradeSmart page session accounting.
+    A session starts when the agent is toggled ON and ends when it is toggled OFF.
+    Closed P/L shown here is current MT5 closed P/L minus the baseline captured
+    at the first snapshot of this TradeSmart session, so closed trades remain
+    included after they close while the agent is running.
+    """
+    result = dict(result or {})
+    account = dict(result.get("account") or {})
+    user_key = str(risk.get("user_key") or _user_key())
+    mode = str(risk.get("mode") or "Demo")
+    session_id = str(risk.get("risk_session_id") or f"{user_key}:{mode}:idle")
+
+    accounting_id_key = _scope_key("tradesmart_session_accounting_id", user_key, mode)
+    baseline_key = _scope_key("tradesmart_session_closed_baseline", user_key, mode)
+    balance_baseline_key = _scope_key("tradesmart_session_balance_baseline", user_key, mode)
+    session_closed_key = _scope_key("tradesmart_session_closed_pl", user_key, mode)
+    session_combined_key = _scope_key("tradesmart_session_combined_pl", user_key, mode)
+    opened_tickets_key = _scope_key("tradesmart_session_opened_tickets", user_key, mode)
+    opened_count_key = _scope_key("tradesmart_session_opened_count", user_key, mode)
+
+    if st.session_state.get(accounting_id_key) != session_id:
+        _reset_session_accounting(user_key, mode, session_id)
+
+    closed_today_raw = account.get("closed_pl_today")
+    closed_today = _float_value(closed_today_raw, _float_value(account.get("session_closed_pl"), 0.0))
+    balance_now = _float_value(account.get("balance"), 0.0)
+
+    if st.session_state.get(baseline_key) is None:
+        # Baseline means: everything closed before the agent session started.
+        st.session_state[baseline_key] = closed_today
+    if st.session_state.get(balance_baseline_key) is None:
+        # Balance baseline lets the page show realized P/L even if the agent does
+        # not return refreshed closed_pl_today after a deal closes.
+        st.session_state[balance_baseline_key] = balance_now
+
+    closed_baseline = _float_value(st.session_state.get(baseline_key), 0.0)
+    balance_baseline = _float_value(st.session_state.get(balance_baseline_key), balance_now)
+    closed_today_delta = closed_today - closed_baseline
+    balance_delta = balance_now - balance_baseline
+
+    # Realized session P/L: prefer balance delta because it reflects closed trades
+    # immediately after MT5 books the deal. Fall back to closed_pl_today delta when
+    # balance is unavailable.
+    session_closed = balance_delta if account.get("balance") not in (None, "") else closed_today_delta
+
+    floating = _float_value(account.get("floating_pl"), 0.0)
+    combined = session_closed + floating
+
+    opened_tickets = st.session_state.get(opened_tickets_key)
+    if not isinstance(opened_tickets, set):
+        opened_tickets = set(opened_tickets or [])
+    for collection_name in ("position_summary", "positions"):
+        for pos in result.get(collection_name) or []:
+            ticket = pos.get("ticket") or pos.get("position") or pos.get("order")
+            if ticket not in (None, ""):
+                opened_tickets.add(str(ticket))
     order_result = result.get("order_result") or {}
+    if isinstance(order_result, dict):
+        ticket = order_result.get("ticket") or order_result.get("order") or order_result.get("position")
+        if ticket not in (None, ""):
+            opened_tickets.add(str(ticket))
+    opened_count = len(opened_tickets)
 
-    title = str(result.get("event", result.get("phase", "Agent Update"))).replace("_", " ").title()
-    message_parts = []
+    account["session_closed_pl"] = session_closed
+    account["combined_session_pl"] = combined
+    account["session_baseline_closed_pl"] = closed_baseline
+    account["session_balance_baseline"] = balance_baseline
+    account["session_started_at"] = _session_start_label(user_key, mode)
+    account["session_opened_trades"] = opened_count
 
-    main_message = _strip_legacy_html(result.get("message", "TradeSmart checked the market."))
-    thinking = _strip_legacy_html(result.get("thinking", ""))
-    if main_message:
-        message_parts.append(main_message)
-    if thinking and thinking != main_message:
-        message_parts.append(thinking)
+    st.session_state[session_closed_key] = session_closed
+    st.session_state[session_combined_key] = combined
+    st.session_state[opened_tickets_key] = opened_tickets
+    st.session_state[opened_count_key] = opened_count
 
-    if action and action != "NONE":
-        message_parts.append(f"Decision: {action} {SYMBOL}")
-
-    if result.get("order_sent"):
-        message_parts.append("Execution: order accepted by MT5.")
-    elif order_result and isinstance(order_result, dict) and order_result.get("message"):
-        message_parts.append(f"Execution: {_strip_legacy_html(order_result.get('message'))}")
-    elif order_result and isinstance(order_result, list):
-        close_msgs = [
-            _strip_legacy_html(item.get("message", "close attempted"))
-            for item in order_result
-            if isinstance(item, dict)
-        ]
-        if close_msgs:
-            message_parts.append("Risk close: " + " | ".join(close_msgs[:5]))
-
-    if positions:
-        tracked = []
-        for pos in positions[:5]:
-            p_type = int(pos.get("type", 0) or 0)
-            direction = "BUY" if p_type == 0 else "SELL"
-            tracked.append(
-                f"{direction} ticket {pos.get('ticket')} volume {pos.get('volume')} profit {pos.get('profit')}"
-            )
-        message_parts.append("Tracking: " + " | ".join(tracked))
-
-    message = " — ".join([p for p in message_parts if p])
-    _add_log(title, message, account.get("balance"), account.get("equity"))
+    result["account"] = account
+    result["session_opened_trades"] = opened_count
+    result["session_id"] = session_id
+    result["risk_session_id"] = session_id
+    result["session_started_at"] = account.get("session_started_at")
     return result
 
 
 
-def _render_live_output(result: Dict[str, Any]) -> None:
+def _emergency_flatten_positions(profile: Dict[str, Any], risk: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    """Best-effort close of open positions before toggling the agent off.
+    Supports several method names so this page stays compatible with existing
+    TradeSmartAgent versions without breaking if one method is missing.
+    """
+    close_risk = dict(risk or {})
+    close_risk["force_close_reason"] = reason
+    close_risk["emergency_stop"] = True
+    close_risk["close_all"] = True
+    agent = TradeSmartAgent(profile=profile, rules={**close_risk, "symbol": SYMBOL})
+    for method_name in (
+        "close_all_positions",
+        "close_open_positions",
+        "close_positions",
+        "emergency_close_all",
+        "flatten_positions",
+    ):
+        method = getattr(agent, method_name, None)
+        if callable(method):
+            try:
+                result = method(reason=reason)
+            except TypeError:
+                result = method()
+            if isinstance(result, dict):
+                return _apply_session_accounting(result, risk)
+            return {"ok": True, "event": "Emergency Close", "message": str(result)}
+
+    # Last compatible fallback: run one more cycle with emergency flags.
     try:
-        from agents.outputs import build_live_thinking_html
-        html = str(build_live_thinking_html(result))
-    except Exception:
-        decision = result.get("decision") or {}
-        action = escape(str(decision.get("action", "NONE")))
-        msg = escape(str(result.get("thinking") or result.get("message") or "Checking XAUUSD."))
-        html = f"""
-        <!doctype html>
-        <html>
-        <head>
-          <style>
-            html, body {{
-              margin: 0;
-              padding: 0;
-              background: transparent;
-              font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-              color: rgba(255,255,255,.94);
-            }}
-            .box {{
-              padding: 14px 16px;
-              border-radius: 18px;
-              background: rgba(0,255,163,.075);
-              border: 1px solid rgba(0,255,163,.20);
-              box-sizing: border-box;
-            }}
-            .head {{ font-weight: 900; display: flex; align-items: center; margin-bottom: 6px; }}
-            .spin {{
-              width: 16px; height: 16px; border-radius: 50%;
-              border: 2px solid rgba(255,255,255,.18);
-              border-top-color: #00ffa3;
-              animation: spin .9s linear infinite;
-              display:inline-block; margin-right: 8px;
-            }}
-            .msg {{ font-size: 13px; line-height: 1.4; color: rgba(255,255,255,.84); }}
-            @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-          </style>
-        </head>
-        <body>
-          <div class="box">
-            <div class="head"><span class="spin"></span>TradeSmart Thinking</div>
-            <div class="msg">{msg}</div>
-            <div class="msg" style="opacity:.72;">Direction: {action}</div>
-          </div>
-        </body>
-        </html>
-        """
-    components.html(html, height=150, scrolling=False)
+        result = agent.run_cycle(execution_enabled=True)
+        if isinstance(result, dict):
+            return _apply_session_accounting(result, risk)
+    except Exception as exc:
+        return {"ok": False, "event": "Emergency Close Error", "message": str(exc)}
+    return {"ok": False, "event": "Emergency Close", "message": "No close method was available on TradeSmartAgent."}
 
-def render_tradesmart(role: str = "client") -> None:
-    _sanitize_existing_logs()
-    _inject_tradesmart_styles()
-    user_key = _get_user_key()
-    force_stop_key = f"tradesmart_force_stop_{user_key}"
-    loss_msg_key = f"tradesmart_loss_msg_{user_key}"
+def _page_risk_breached(result: Dict[str, Any], risk: Dict[str, Any]) -> Tuple[bool, str]:
+    max_loss = _float_value(risk.get("max_daily_loss_amount"), 0.0)
+    if max_loss <= 0:
+        return False, ""
+    account = (result or {}).get("account") or {}
+    session_closed = _float_value(account.get("session_closed_pl"), 0.0)
+    floating = _float_value(account.get("floating_pl"), 0.0)
+    combined = _float_value(account.get("combined_session_pl"), session_closed + floating)
+    worst = min(session_closed, floating, combined)
+    if worst <= -abs(max_loss):
+        return True, (
+            f"Max session risk reached: closed {_money(session_closed)}, "
+            f"floating {_money(floating)}, total {_money(combined)}. Agent stopped."
+        )
+    return False, ""
 
+
+# ══════════════════════════════════════════════
+#  LIVE SUMMARY — only render when agent is ON
+#  When agent is OFF this section is replaced by
+#  the _build_off_session_html card (no duplicate).
+# ══════════════════════════════════════════════
+
+def _render_live_summary(result: Dict[str, Any], agent_on: bool) -> None:
+    """
+    Render the 6-metric live tracking grid.
+    Only called when the agent is running.  The OFF snapshot card already
+    shows these numbers, so we skip them when agent_on is False.
+    """
+    if not agent_on:
+        return
+
+    result  = result or {}
+    account = result.get("account") or {}
+
+    dot_class = "ts-live-summary-title"
     st.markdown(
-        """
-        <div class="ts-hero">
-            <div class="ts-title">TradeSmart</div>
-            <div class="ts-muted">
-                TradeSmart is your Dropzuniversal AI trading sub-agent for auto-trade monitoring,
-                risk setup, smart entries, exits, portfolio rules, and strategy automation.
-            </div>
-        </div>
-        """,
+        f'<div class="{dot_class}">Live Tracking Summary</div>',
         unsafe_allow_html=True,
     )
 
-    _section("MT5 TradeSmart Connection")
+    def _m(label: str, raw: Any) -> str:
+        return (
+            f"<div class='ts-metric'>"
+            f"<div class='ts-metric-label'>{escape(label)}</div>"
+            f"<div class='ts-metric-value'>{escape(str(raw if raw not in (None, '') else '—'))}</div>"
+            f"</div>"
+        )
 
-    connected_key = f"tradesmart_connected_{user_key}"
-    connected_mode_key = f"tradesmart_connected_mode_{user_key}"
-    active_connected_mode = st.session_state.get(connected_mode_key)
-    connected_now = bool(st.session_state.get(connected_key)) and active_connected_mode in ("Demo", "Live")
+    # Pull the freshest values from the result
+    balance    = account.get("balance")
+    equity     = account.get("equity")
+    float_pl   = account.get("floating_pl")
+    sess_cl    = account.get("session_closed_pl")
+    sess_total = account.get("combined_session_pl")
+    open_cnt   = result.get("open_positions_count", account.get("open_positions", 0))
+    started    = account.get("session_started_at") or result.get("session_started_at") or "Not started"
+    session_opened = result.get("session_opened_trades", account.get("session_opened_trades", 0))
 
-    mode_key = f"tradesmart_mode_{user_key}"
-    if connected_now:
-        # Lock Demo/Live while connected. Users must disconnect before switching.
-        st.session_state[mode_key] = active_connected_mode
+    html = "<div class='ts-summary'>" + "".join([
+        _m("Balance",        _money(balance)),
+        _m("Equity",         _money(equity)),
+        _m("Floating P/L",   _money(float_pl)),
+        _m("Session Closed", _money(sess_cl)),
+        _m("Session P/L",    _money(sess_total)),
+        _m("Open Trades",    open_cnt),
+        _m("Session Start",  started),
+        _m("Session Trades", session_opened),
+    ]) + "</div>"
+    st.markdown(html, unsafe_allow_html=True)
 
-    mode = st.radio(
-        "TradeSmart MT5 Mode",
-        ["Demo", "Live"],
-        horizontal=True,
-        key=mode_key,
-        disabled=connected_now,
-        index=0 if st.session_state.get(mode_key, "Demo") != "Live" else 1,
-    )
 
-    if connected_now:
-        mode = active_connected_mode
-        st.info(f"{active_connected_mode} is currently connected. Disconnect before switching Demo/Live mode.")
+# ══════════════════════════════════════════════
+#  LOGS PANEL
+# ══════════════════════════════════════════════
 
-    profile = _load_mt5_profile(mode)
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("Selected Mode", mode)
-    with c2:
-        st.metric("Saved Login", _masked_login(profile))
-    with c3:
-        st.metric("Server", profile.get("server") or "Not saved")
-
-    if _is_complete_profile(profile):
-        st.success(f"{mode} MT5 credentials are loaded for this signed-in user.")
-    else:
-        st.warning(f"{mode} MT5 credentials are not complete yet. Go to Settings and save MT5 Login, Password, and Server.")
-
-    connected = bool(st.session_state.get(connected_key)) and active_connected_mode == mode
-
-    b1, b2 = st.columns([1, 1])
-    with b1:
-        if not connected:
-            if st.button(f"Connect {mode} MT5", use_container_width=True, disabled=not _is_complete_profile(profile)):
-                result = _connect_profile_for_tradesmart(profile, mode)
-                if result.get("ok"):
-                    st.session_state[connected_key] = True
-                    st.session_state[connected_mode_key] = mode
-                    _set_account_snapshot(user_key, mode, result.get("account", {}), result)
-                    _add_log("Connected", result.get("message", f"Connected to {mode} MT5."), result.get("account", {}).get("balance"), result.get("account", {}).get("equity"))
-                    st.rerun()
-                else:
-                    _add_log("Connection Failed", result.get("message", "MT5 connection failed."))
-                    st.error(result.get("message", "MT5 connection failed."))
-        else:
-            if st.button(f"Disconnect {mode} MT5", use_container_width=True):
-                # One last fresh snapshot before disconnect keeps the page from
-                # showing an old open-trade count after the agent is stopped.
-                if _is_complete_profile(profile):
-                    _refresh_account_snapshot(profile, mode, user_key)
-                TradeSmartAgent(profile=profile, rules={"mode": mode, "symbol": SYMBOL}).disconnect()
-                st.session_state[connected_key] = False
-                st.session_state[connected_mode_key] = None
-                _save_tradesmart_worker_state(
-                    enabled=False,
-                    mode=mode,
-                    profile=profile,
-                    risk={},
-                    user_key=user_key,
-                )
-                _add_log("Disconnected", f"Disconnected from {mode} MT5.")
-                st.rerun()
-
-    with b2:
+def _render_logs() -> None:
+    logs = st.session_state.get(_scope_key("tradesmart_logs"), [])
+    if not logs:
         st.markdown(
-            f"""
-            <div class="ts-pill"><span class="ts-dot"></span>{'Connected' if connected else 'Disconnected'} • {escape(mode)} • {SYMBOL}</div>
-            """,
+            "<div class='ts-log-wrap'>"
+            "<div class='ts-log-item'>"
+            "<div class='ts-log-title'>No logs yet</div>"
+            "<div class='ts-log-msg'>Connect MT5 and turn the agent ON to start live tracking.</div>"
+            "</div></div>",
             unsafe_allow_html=True,
         )
-
-    agent_key = f"enable_tradesmart_agent_{user_key}_{mode}"
-
-    # If the background worker already hit the kill-switch, do not let the UI
-    # write enabled=True back into the worker state on the next rerun. This was
-    # one source of intermittent behavior: the worker correctly disabled itself,
-    # then Streamlit reran with the toggle still visually on and re-enabled it.
-    worker_state = _load_tradesmart_worker_state()
-    worker_disabled_reason = str(worker_state.get("disabled_reason") or "")
-    worker_last_result = worker_state.get("last_result") if isinstance(worker_state.get("last_result"), dict) else {}
-    worker_hit_loss = bool(worker_disabled_reason) or bool(worker_last_result.get("max_daily_loss_reached"))
-    if worker_hit_loss:
-        st.session_state[agent_key] = False
-        st.session_state[f"tradesmart_prev_agent_enabled_{user_key}_{mode}"] = False
-        st.session_state.pop(f"tradesmart_risk_session_{user_key}_{mode}", None)
-        if worker_disabled_reason:
-            st.session_state[loss_msg_key] = worker_disabled_reason
-        # Clear the worker notice after forcing the UI off once. This keeps the
-        # agent OFF, but allows the user to manually turn it back on later, which
-        # creates a brand-new risk_session_id and resets the risk lock.
-        _save_tradesmart_worker_state(
-            enabled=False,
-            mode=mode,
-            profile=profile,
-            risk={},
-            user_key=user_key,
+        return
+    html = ["<div class='ts-log-wrap'>"]
+    for item in logs[:35]:
+        html.append(
+            f"<div class='ts-log-item'>"
+            f"<div class='ts-log-title'>{escape(item.get('time',''))} • {escape(item.get('title','Update'))}</div>"
+            f"<div class='ts-log-msg'>{escape(item.get('message',''))}</div>"
+            f"</div>"
         )
+    html.append("</div>")
+    st.markdown("".join(html), unsafe_allow_html=True)
 
-    if st.session_state.pop(force_stop_key, False):
-        st.session_state[agent_key] = False
-        st.session_state[f"tradesmart_prev_agent_enabled_{user_key}_{mode}"] = False
-        st.session_state.pop(f"tradesmart_risk_session_{user_key}_{mode}", None)
-        _save_tradesmart_worker_state(
-            enabled=False,
-            mode=mode,
-            profile=profile,
-            risk={},
-            user_key=user_key,
-        )
 
-    _section("AI Trading Agent Status")
-    risk_session_key = f"tradesmart_risk_session_{user_key}_{mode}"
-    prev_agent_key = f"tradesmart_prev_agent_enabled_{user_key}_{mode}"
+# ══════════════════════════════════════════════
+#  AGENT OFF SNAPSHOT CARD (self-contained HTML)
+#  Shows last known account numbers without leaking username.
+# ══════════════════════════════════════════════
 
-    previous_agent_enabled = bool(st.session_state.get(prev_agent_key, False))
-    agent_enabled = st.toggle("Enable TradeSmart Agent", value=False, key=agent_key)
-
-    # New manual enable = new risk session. This resets the loss counter only
-    # after the user intentionally turns the agent back on.
-    if agent_enabled and not previous_agent_enabled:
-        st.session_state[risk_session_key] = f"{user_key}:{mode}:{datetime.now().timestamp()}"
-
-    if not agent_enabled:
-        st.session_state.pop(risk_session_key, None)
-
-    st.session_state[prev_agent_key] = bool(agent_enabled)
-
-    loss_msg = st.session_state.pop(loss_msg_key, None)
-    if loss_msg:
-        st.error(loss_msg)
-
-    if agent_enabled and connected:
-        st.markdown(
-            """
-            <div class="ts-live-box">
-                <div class="ts-live-head"><span class="ts-spinner"></span>Agent running</div>
-                <div class="ts-live-msg">Checking XAUUSD every 3 seconds. The agent reads strategies, opens valid setups, tracks open trades, and closes by strategy/risk rules.</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    elif agent_enabled and not connected:
-        st.info("Connect MT5 before enabling live TradeSmart tracking.")
-    else:
-        st.info(f"TradeSmart Agent is idle in {mode} mode.")
-
-    _section("Risk Parameters")
-    r1, r2, r3 = st.columns(3)
-    with r1:
-        trade_volume = st.number_input("Trade Volume", min_value=0.01, max_value=100.0, value=0.01, step=0.01, format="%.2f", key=f"ts_vol_{user_key}")
-    with r2:
-        max_open_trades = st.number_input("Max Open Trades", min_value=1, max_value=20, value=1, step=1, key=f"ts_max_open_{user_key}")
-    with r3:
-        max_daily_loss_amount = st.number_input("Max Daily Loss Amount", min_value=0.0, max_value=100000.0, value=1.00, step=0.50, format="%.2f", key=f"ts_max_loss_{user_key}")
-
-    st.caption("Max Daily Loss Amount is a hard kill-switch. If one tracked trade, all tracked trades combined, or account equity drawdown reaches this amount, TradeSmart closes tracked trades, turns the agent off, and requires you to turn it back on manually.")
-
-    _section("AI Agent Instructions")
-    ai_instructions = st.text_area(
-        "Custom TradeSmart Agent Rules",
-        placeholder="Example: Avoid entries during major news, favor cleaner momentum candles, and keep risk tight.",
-        height=120,
-        key=f"tradesmart_ai_instructions_{user_key}",
-    )
-
-    risk = {
-        "trade_volume": float(trade_volume),
-        "max_open_trades": int(max_open_trades),
-        "max_daily_loss_amount": float(max_daily_loss_amount),
-        "ai_instructions": ai_instructions,
-        "allow_live_execution": mode == "Live",
-        "entry_cooldown_seconds": 60,
-        "check_interval_seconds": TRADESMART_CHECK_INTERVAL_SECONDS,
-        "risk_session_id": st.session_state.get(risk_session_key, ""),
+def _stopped_result(mode: str, reason: str, risk: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    return {
+        "ok": True, "phase": "stopped", "event": "Agent OFF",
+        "message": reason,
+        "thinking": "Agent is OFF. Turn ON to start a new TradeSmart session.",
+        "mode": mode, "symbol": SYMBOL, "agent_off": True,
+        "decision": {"action": "OFF", "reason": reason},
+        "risk": risk or {},
     }
 
-    _save_tradesmart_worker_state(
-        enabled=bool(agent_enabled and connected),
-        mode=mode,
-        profile=profile,
-        risk=risk,
-        user_key=user_key,
+
+def _run_final_session_snapshot(
+    profile: Dict[str, Any], risk: Dict[str, Any], reason: str
+) -> Dict[str, Any]:
+    """One-shot snapshot to capture final MT5 account numbers when agent turns OFF."""
+    snap_risk = dict(risk or {})
+    snap_risk["max_daily_loss_amount"] = 0.0
+    snap_risk["market_open"]           = False
+    result = TradeSmartAgent(profile=profile, rules={**snap_risk, "symbol": SYMBOL}).connect_only()
+    result = _apply_session_accounting(result, risk)
+    result["agent_off"] = True
+    result["phase"]     = "stopped"
+    result["event"]     = "Session Paused"
+    result["message"]   = reason
+    result["thinking"]  = "Execution paused. Session totals captured from MT5."
+    result["decision"]  = {"action": "OFF", "reason": reason}
+    result["risk"]      = snap_risk
+    return result
+
+
+def _build_off_session_html(
+    result: Dict[str, Any], profile: Dict[str, Any], mode: str
+) -> str:
+    """
+    Compact OFF-state card — shows account numbers, masked login, mode, time.
+    Does NOT show any user name / display name string.
+    """
+    result      = result or {}
+    account     = result.get("account") or {}
+    open_trades = result.get("open_positions_count", account.get("open_positions", 0))
+    message     = result.get("message") or "Agent is OFF. Turn ON to start a new TradeSmart session."
+    updated     = datetime.now().strftime("%I:%M:%S %p")
+    login_mask  = _masked_login(profile)
+    started     = account.get("session_started_at") or result.get("session_started_at") or "Not started"
+    session_opened = result.get("session_opened_trades", account.get("session_opened_trades", 0))
+
+    return f"""<!doctype html><html><head><style>
+html,body{{margin:0;padding:0;background:transparent;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:rgba(255,255,255,.94);overflow:hidden}}
+.ts-off-card{{box-sizing:border-box;width:100%;min-height:240px;padding:18px;border-radius:24px;
+  background:radial-gradient(circle at 0% 0%,rgba(0,255,163,.14),transparent 38%),
+             radial-gradient(circle at 100% 0%,rgba(80,145,255,.15),transparent 34%),
+             linear-gradient(145deg,rgba(6,18,34,.96),rgba(8,32,52,.86));
+  border:1px solid rgba(0,255,163,.20);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.07),0 22px 60px rgba(0,0,0,.32)}}
+.ts-head{{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:14px}}
+.ts-head-left{{min-width:0}}
+.ts-title{{font-size:14px;font-weight:950;letter-spacing:-.01em;color:#fff}}
+.ts-sub{{font-size:11px;line-height:1.4;color:rgba(255,255,255,.60);margin-top:3px}}
+.ts-badge{{flex:0 0 auto;border-radius:999px;padding:5px 11px;font-size:10px;font-weight:900;letter-spacing:.06em;
+  color:rgba(255,170,180,.96);border:1px solid rgba(255,96,112,.36);background:rgba(255,96,112,.10)}}
+.ts-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}}
+.ts-box{{min-width:0;border-radius:16px;padding:12px 13px;
+  background:linear-gradient(145deg,rgba(255,255,255,.08),rgba(255,255,255,.035));
+  border:1px solid rgba(255,255,255,.10)}}
+.ts-label{{font-size:9.5px;font-weight:900;letter-spacing:.09em;text-transform:uppercase;
+  color:rgba(255,255,255,.52);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.ts-value{{margin-top:6px;font-size:15px;font-weight:950;letter-spacing:-.02em;
+  color:rgba(255,255,255,.94);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.ts-note{{margin-top:12px;font-size:11.5px;line-height:1.4;color:rgba(255,255,255,.68)}}
+@media(max-width:560px){{.ts-grid{{grid-template-columns:1fr 1fr}}.ts-value{{font-size:13px}}}}
+</style></head><body>
+<div class='ts-off-card'>
+  <div class='ts-head'>
+    <div class='ts-head-left'>
+      <div class='ts-title'>Session Results</div>
+      <div class='ts-sub'>{_plain(mode)} account {_plain(login_mask)} · XAUUSD · start {_plain(started)} · updated {_plain(updated)}</div>
+    </div>
+    <div class='ts-badge'>AGENT OFF</div>
+  </div>
+  <div class='ts-grid'>
+    <div class='ts-box'><div class='ts-label'>Balance</div><div class='ts-value'>{_money(account.get('balance'))}</div></div>
+    <div class='ts-box'><div class='ts-label'>Equity</div><div class='ts-value'>{_money(account.get('equity'))}</div></div>
+    <div class='ts-box'><div class='ts-label'>Floating P/L</div><div class='ts-value'>{_money(account.get('floating_pl'))}</div></div>
+    <div class='ts-box'><div class='ts-label'>Session Closed</div><div class='ts-value'>{_money(account.get('session_closed_pl'))}</div></div>
+    <div class='ts-box'><div class='ts-label'>Session P/L</div><div class='ts-value'>{_money(account.get('combined_session_pl'))}</div></div>
+    <div class='ts-box'><div class='ts-label'>Open Trades</div><div class='ts-value'>{_plain(open_trades)}</div></div>
+    <div class='ts-box'><div class='ts-label'>Session Trades</div><div class='ts-value'>{_plain(session_opened)}</div></div>
+  </div>
+  <div class='ts-note'>{_plain(message)}</div>
+</div>
+</body></html>"""
+
+
+# ══════════════════════════════════════════════
+#  AGENT CYCLE RUNNER
+# ══════════════════════════════════════════════
+
+def _run_live_cycle(
+    profile: Dict[str, Any], risk: Dict[str, Any], enabled: bool
+) -> Dict[str, Any]:
+    agent  = TradeSmartAgent(profile=profile, rules={**risk, "symbol": SYMBOL})
+    result = agent.run_cycle(execution_enabled=enabled)
+    result = _apply_session_accounting(result, risk)
+    try:
+        draw_count = write_draw_commands(
+            result,
+            project_root=_project_root(),
+            user_key=str(risk.get("user_id") or risk.get("user_key") or "default"),
+        )
+        result["draw_command_count"] = draw_count
+    except Exception as exc:
+        result["draw_error"] = str(exc)
+    return result
+
+
+# ══════════════════════════════════════════════
+#  LIVE FRAGMENT
+#  • Agent ON  → run cycle + show live thinking card + live summary grid
+#  • Agent OFF → show static OFF snapshot card ONLY (no live summary grid)
+#  The fragment ONLY runs under st.fragment when the agent is ON.
+# ══════════════════════════════════════════════
+
+def _live_fragment(
+    profile: Dict[str, Any],
+    risk: Dict[str, Any],
+    agent_key: str,
+    market_open: bool,
+    market_reason: str,
+) -> Dict[str, Any]:
+    force_key = st.session_state.get(_scope_key("tradesmart_force_stop_key"))
+    if force_key == agent_key:
+        enabled = False
+    else:
+        enabled = bool(st.session_state.get(agent_key, False))
+
+    # Retrieve last known result (never stale — always the freshest snapshot)
+    result = (
+        st.session_state.get(_scope_key("tradesmart_last_result"))
+        or _stopped_result(risk.get("mode", "Demo"), "Agent is OFF.", risk)
+    )
+    result = _apply_session_accounting(result, risk)
+
+    # ── Market closed mid-session ─────────────────────────────────
+    if enabled and not market_open:
+        st.session_state[agent_key] = False
+        st.session_state[f"tradesmart_prev_enabled_{risk.get('user_key')}_{risk.get('mode')}"] = False
+        st.session_state[_scope_key("tradesmart_force_stop_key")] = agent_key
+        st.session_state[_scope_key("tradesmart_force_stopped")]  = True
+        st.session_state[_scope_key("tradesmart_force_stop_reason")] = market_reason
+        result = (
+            _run_final_session_snapshot(profile, risk, market_reason)
+            if bool(risk.get("connected"))
+            else _stopped_result(risk.get("mode", "Demo"), market_reason, risk)
+        )
+        st.session_state[_scope_key("tradesmart_last_result")] = result
+        _add_log("Market Closed", market_reason, result)
+        enabled = False
+
+    # ── Agent ON — run live cycle ─────────────────────────────────
+    elif enabled:
+        result = _run_live_cycle(profile, risk, enabled=True)
+        st.session_state[_scope_key("tradesmart_last_result")] = result
+        _add_log(
+            result.get("event", "Agent Scan"),
+            result.get("message") or result.get("thinking") or "Scan complete.",
+            result,
+        )
+        # Max session loss kill switch: checks closed, floating, and combined P/L every cycle.
+        page_risk_hit, page_risk_msg = _page_risk_breached(result, risk)
+        if result.get("max_daily_loss_reached") or page_risk_hit:
+            stop_msg = page_risk_msg or result.get("message", "Max session risk reached.")
+            close_result = _emergency_flatten_positions(profile, risk, stop_msg)
+            _add_log(
+                close_result.get("event", "Emergency Close"),
+                close_result.get("message", "Risk lock attempted to close open positions."),
+                close_result,
+            )
+            final    = _run_final_session_snapshot(profile, risk, stop_msg)
+            st.session_state[agent_key] = False
+            st.session_state[f"tradesmart_prev_enabled_{risk.get('user_key')}_{risk.get('mode')}"] = False
+            st.session_state[_scope_key("tradesmart_force_stop_key")]   = agent_key
+            st.session_state[_scope_key("tradesmart_force_stopped")]    = True
+            st.session_state[_scope_key("tradesmart_force_stop_reason")] = stop_msg
+            result  = final
+            enabled = False
+            st.session_state[_scope_key("tradesmart_last_result")] = result
+
+    # ── Agent OFF — preserve last snapshot, mark it off ──────────
+    else:
+        result["agent_off"] = True
+        result["phase"]     = "stopped"
+        result["decision"]  = {
+            **(result.get("decision") or {}),
+            "action": "OFF",
+            "reason": result.get("message") or "Agent is OFF.",
+        }
+        st.session_state[_scope_key("tradesmart_last_result")] = result
+
+    # ── Render ────────────────────────────────────────────────────
+    is_off = bool(result.get("agent_off")) or str(
+        (result.get("decision") or {}).get("action", "")
+    ).upper() == "OFF"
+
+    if is_off:
+        # Static OFF card — only refreshes once when agent turns off (manual snapshot)
+        components.html(
+            _build_off_session_html(result, profile, str(risk.get("mode", "Demo"))),
+            height=285,
+            scrolling=False,
+        )
+        # ← No live summary grid when OFF
+    else:
+        # Live thinking card (auto-refreshed by the fragment)
+        components.html(build_live_thinking_html(result), height=390, scrolling=False)
+        # Live tracking summary grid — only shown when agent is truly ON
+        _render_live_summary(result, agent_on=True)
+
+    return result
+
+
+# ══════════════════════════════════════════════
+#  MAIN PAGE RENDERER
+# ══════════════════════════════════════════════
+
+def render_tradesmart_page(role: str | None = None) -> None:
+    _inject_css()
+    user_key = _user_key()
+    market_open, market_reason, et_now = _market_status()
+
+    # ── HERO ──────────────────────────────────────────────────────
+    st.markdown(
+        "<div class='ts-hero'>"
+        "<div class='ts-title'>⚡ TradeSmart Agent</div>"
+        "<div class='ts-muted'>"
+        "Smart money scalping engine — multi-timeframe SMC liquidity analysis, "
+        "order block detection, FVG targeting, and 1:2 minimum R:R execution. "
+        "Live chart drawings pushed to MT5 every cycle."
+        "</div></div>",
+        unsafe_allow_html=True,
     )
 
-    _section("Live Trade Tracking")
+    # ── ACCOUNT MODE ──────────────────────────────────────────────
+    connected_key      = f"tradesmart_connected_{user_key}"
+    connected_mode_key = f"tradesmart_connected_mode_{user_key}"
+    connected          = bool(st.session_state.get(connected_key, False))
+    selected_mode_key  = f"tradesmart_mode_{user_key}"
 
-    if connected and agent_enabled:
-        @st.fragment(run_every=TRADESMART_CHECK_INTERVAL_SECONDS)
-        def _live_cycle() -> None:
+    if connected:
+        # Lock mode selector while connected
+        st.session_state[selected_mode_key] = st.session_state.get(
+            connected_mode_key,
+            st.session_state.get(selected_mode_key, "Demo"),
+        )
 
-            result = _run_agent_cycle(
-                profile,
-                mode,
-                risk,
-                execution_enabled=True,
-                user_key=user_key,
-            )
+    mode    = st.radio("Account Mode", ["Demo", "Live"], horizontal=True, key=selected_mode_key, disabled=connected)
+    profile = _load_mt5_profile(mode)
+    _set_scope(user_key, mode)
+    complete = _complete_profile(profile)
 
-            account = _get_account_snapshot(user_key, mode)
-            _render_metrics(account, mode, True)
-            _render_live_output(result)
+    # Connection + market status pill
+    conn_text = "CONNECTED" if connected else "DISCONNECTED"
+    pill_cls  = "ts-pill ts-pill--live" if connected else "ts-pill ts-pill--off"
+    st.markdown(
+        f"<div class='{pill_cls}'>"
+        f"<span class='ts-dot{'' if connected else ' off'}'></span>"
+        f"{escape(conn_text)} &bull; {escape(mode)} profile: {escape(_masked_login(profile))} "
+        f"&bull; Market ET {escape(et_now.strftime('%I:%M %p'))}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    if connected:
+        st.info("Disconnect MT5 before switching Demo/Live.")
+    if not market_open:
+        st.warning(market_reason)
+    if not complete:
+        st.warning(f"Save your {mode} MT5 login/password/server in Settings before connecting.")
 
-            if result.get("max_daily_loss_reached"):
-                st.session_state[force_stop_key] = True
-                st.session_state[loss_msg_key] = result.get(
-                    "message",
-                    "Max daily loss limit reached. Agent stopped.",
+    # ── RISK SETTINGS ─────────────────────────────────────────────
+    _section("Risk Settings")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        trade_volume = st.number_input(
+            "Trade volume", min_value=0.01, max_value=100.0,
+            value=float(st.session_state.get("ts_trade_volume", 0.01)),
+            step=0.01, key="ts_trade_volume",
+        )
+    with c2:
+        max_open = st.number_input(
+            "Max open trades", min_value=1, max_value=20,
+            value=int(st.session_state.get("ts_max_open", 1)),
+            step=1, key="ts_max_open",
+        )
+    with c3:
+        max_loss = st.number_input(
+            "Max daily loss $", min_value=0.0, max_value=100000.0,
+            value=float(st.session_state.get("ts_max_loss", 10.0)),
+            step=1.0, key="ts_max_loss",
+        )
+    with c4:
+        min_score = st.slider(
+            "Min strategy score", min_value=0.40, max_value=0.95,
+            value=float(st.session_state.get("ts_min_score", 0.62)),
+            step=0.01, key="ts_min_score",
+        )
+
+    risk = {
+        "mode":                   mode,
+        "trade_volume":           trade_volume,
+        "volume":                 trade_volume,          # alias agents expect
+        "max_open_trades":        int(max_open),
+        "max_daily_loss_amount":  float(max_loss),
+        "min_strategy_score":     float(min_score),
+        "market_open":            bool(market_open),
+        "market_reason":          market_reason,
+        "user_key":               user_key,
+        "user_id":                _safe_user_id(user_key),
+        "output_scope":           f"{_safe_user_id(user_key)}_{mode.lower()}",
+        "connected":              bool(connected),
+    }
+
+    # ── CONNECTION + AGENT CONTROL ────────────────────────────────
+    _section("Connection + Live Agent Control")
+    agent_key = f"tradesmart_agent_enabled_{user_key}_{mode}"
+
+    # Clear any stale force-stop flag that matches this agent key
+    if st.session_state.get(_scope_key("tradesmart_force_stop_key")) == agent_key:
+        st.session_state[agent_key] = False
+        st.session_state[f"tradesmart_prev_enabled_{user_key}_{mode}"] = False
+        st.session_state.pop(_scope_key("tradesmart_force_stop_key"), None)
+
+    cols = st.columns([1.2, 1.2, 2.2])
+    with cols[0]:
+        connect_label = "Disconnect MT5" if connected else "Connect MT5"
+        if st.button(connect_label, use_container_width=True, disabled=(not complete and not connected)):
+            if connected:
+                result = TradeSmartAgent(profile=profile, rules=risk).disconnect_only()
+                st.session_state[connected_key]  = False
+                st.session_state.pop(connected_mode_key, None)
+                st.session_state[agent_key]      = False
+                result["agent_off"]              = True
+                st.session_state[_scope_key("tradesmart_last_result")] = result
+                _add_log("Disconnected", result.get("message", "MT5 disconnected."), result)
+            else:
+                result = TradeSmartAgent(profile=profile, rules=risk).connect_only()
+                st.session_state[_scope_key("tradesmart_last_result")] = result
+                st.session_state[connected_key]  = bool(result.get("ok"))
+                if result.get("ok"):
+                    st.session_state[connected_mode_key] = mode
+                _add_log(
+                    result.get("event", "Connect"),
+                    result.get("message", "MT5 connect complete."),
+                    result,
                 )
-                st.error(st.session_state[loss_msg_key])
                 st.rerun()
 
-        _live_cycle()
-    elif connected:
-        @st.fragment(run_every=TRADESMART_CHECK_INTERVAL_SECONDS)
-        def _snapshot_cycle() -> None:
-            account = _refresh_account_snapshot(profile, mode, user_key)
-            _render_metrics(account, mode, True)
+    with cols[1]:
+        current_enabled = bool(st.session_state.get(agent_key, False))
+        toggle_label    = "TradeSmart Agent: ON" if current_enabled else "TradeSmart Agent: OFF"
+        enabled = st.toggle(
+            toggle_label,
+            value=current_enabled,
+            key=agent_key,
+            disabled=(not complete or not connected or not market_open),
+        )
+        if not market_open and current_enabled:
+            st.session_state[agent_key] = False
+            enabled = False
 
-        _snapshot_cycle()
+    with cols[2]:
+        if st.session_state.get(_scope_key("tradesmart_force_stopped")):
+            st.error(
+                st.session_state.get(
+                    _scope_key("tradesmart_force_stop_reason"),
+                    "Agent stopped by risk lock.",
+                )
+            )
+            if st.button("Clear stop message after review"):
+                st.session_state[_scope_key("tradesmart_force_stopped")]    = False
+                st.session_state.pop(_scope_key("tradesmart_force_stop_reason"), None)
+                st.session_state.pop(_scope_key("tradesmart_force_stop_key"),   None)
+                st.rerun()
+
+    # ── RISK SESSION + MANUAL OFF SNAPSHOT ───────────────────────
+    prev_before_toggle = bool(
+        st.session_state.get(f"tradesmart_prev_enabled_{user_key}_{mode}", False)
+    )
+    risk["risk_session_id"] = _ensure_risk_session(user_key, mode, enabled)
+
+    # User just toggled OFF → capture a one-time snapshot so numbers are fresh
+    manual_off_event = bool(connected and prev_before_toggle and not enabled)
+    if manual_off_event:
+        final_result = _run_final_session_snapshot(
+            profile, risk,
+            "Agent is OFF. Session totals captured at stop.",
+        )
+        st.session_state[_scope_key("tradesmart_last_result")] = final_result
+        _add_log(
+            "Session Snapshot",
+            "Final session totals captured after agent turned OFF.",
+            final_result,
+        )
+
+    # ── STATUS PILL (above thinking section) ─────────────────────
+    if enabled:
+        st.markdown(
+            "<div class='ts-pill ts-pill--live'>"
+            "<span class='ts-spinner'></span>"
+            "Agent ON — scanning, tracking, and executing every 3 seconds."
+            "</div>",
+            unsafe_allow_html=True,
+        )
     else:
-        account = _get_account_snapshot(user_key, mode)
-        _render_metrics(account, mode, connected)
+        st.markdown(
+            "<div class='ts-pill ts-pill--off'>"
+            "<span class='ts-dot off'></span>"
+            "Agent OFF — execution is stopped. Session Results stay locked until the next start."
+            "</div>",
+            unsafe_allow_html=True,
+        )
 
-    _section("TradeSmart Configuration Summary")
-    _render_summary(mode, profile, agent_enabled, risk)
+    # ── THINKING + LIVE TRACKING ─────────────────────────────────
+    _section("TradeSmart Thinking")
 
-    _section("TradeSmart Agent Output")
-    if connected and agent_enabled:
-        @st.fragment(run_every=TRADESMART_CHECK_INTERVAL_SECONDS)
-        def _live_logs_cycle() -> None:
-            _render_logs()
+    if enabled and hasattr(st, "fragment"):
+        # Fragment ONLY created when agent is ON — stops auto-refresh when OFF
+        @st.fragment(run_every=f"{REFRESH_ON_SECONDS}s")
+        def _frag() -> None:
+            _live_fragment(profile, risk, agent_key, market_open, market_reason)
 
-        _live_logs_cycle()
+        _frag()
     else:
-        _render_logs()
+        # Agent OFF: single render, no fragment, no auto-refresh
+        _live_fragment(profile, risk, agent_key, market_open, market_reason)
+
+    # ── AGENT LOG ────────────────────────────────────────────────
+    _section("Agent Log")
+    _render_logs()
 
 
-def render_frontend_tradesmart_page(role: str = "client"):
-    render_tradesmart(role)
-    return None
+# ══════════════════════════════════════════════
+#  ENTRY POINT ALIASES
+# ══════════════════════════════════════════════
+
+def render_page(role: str | None = None) -> None:
+    render_tradesmart_page(role)
+
+
+def render_tradesmart(role: str | None = None) -> None:
+    render_tradesmart_page(role)
+
+
+def render_frontend_tradesmart_page(role: str | None = None) -> None:
+    render_tradesmart_page(role)
+
+
+def render_frontend_tools_page(role: str | None = None) -> None:
+    render_tradesmart_page(role)

@@ -1,243 +1,127 @@
-"""
-tradesmart_agent.py  —  TradeSmart Execution Controller  v4.0
-==============================================================
-KEY FIXES IN v4
----------------
-  1. CANDLE-TIME DEDUP — last_entry_candle_time is now stamped from
-     signal.entry_candle_time (the trigger candle), not from last_closed_m1.
-     Previously the agent stamped the candle BEFORE the strategy cycle ran,
-     then immediately blocked the next cycle's BUY/SELL because it saw the
-     same candle time.
-
-  2. HOLD WITH NO OPEN TRADE — when strategy returns HOLD and there are
-     no open positions, the agent now shows "Scanning" (not "Tracking")
-     and continues without blocking future entries.
-
-  3. SL/TP ALWAYS FORWARDED — signal.sl and signal.tp are read from the
-     strategy signal dict and wired directly into the MT5 order request.
-
-  4. DRAW COMMANDS — called every cycle regardless of action.
-
-  5. strategy_common is PRIMARY — external strategies/core is fallback only.
-"""
-
 from __future__ import annotations
 
 import importlib.util
 import json
-import os
-import sys
 import time
-
-os.environ.setdefault(
-    "TRADESMART_MT5_BRIDGE_FILE",
-    r"C:\Users\Eric\AppData\Roaming\MetaQuotes\Terminal\D0E8209F77C8CF37AD8BF550E51FF075\MQL5\Files\TradeSmart_AI_DrawCommands.json1",
-)
-
-from dataclasses import dataclass, asdict
+import hashlib
+import re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
-SYMBOL = "XAUUSD"
-MAGIC  = 777001
+SYMBOL_DEFAULT = "XAUUSD"
+MAGIC = 777001
+MARKET_TZ = ZoneInfo("America/New_York")
 
 
-# ══════════════════════════════════════════════
-#  SIGNAL DATACLASS
-# ══════════════════════════════════════════════
+def _safe_user_id(value: Any) -> str:
+    """Filesystem/session safe user id for TradeSmart isolation.
 
-@dataclass
-class TradeSignal:
-    action:            str            = "NONE"
-    symbol:            str            = SYMBOL
-    volume:            float          = 0.01
-    reason:            str            = "No signal."
-    close_ticket:      Optional[int]  = None
-    sl:                Optional[float]= None
-    tp:                Optional[float]= None
-    entry_candle_time: Optional[int]  = None   # time of trigger candle for dedup
+    Kept local to this module so the agent does not depend on the Streamlit
+    page helper being imported. This prevents NameError when the agent is
+    constructed from connect/disconnect buttons, scheduled scans, or tests.
+    """
+    raw = str(value or "default")
+    clean = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("._-")[:64]
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
+    return f"{clean or 'user'}_{digest}"
 
-
-# ══════════════════════════════════════════════
-#  STRATEGY LOADER
-# ══════════════════════════════════════════════
-
-def _load_strategy_common(agent_file: Path):
-    candidates = [
-        agent_file.parent / "strategy_common.py",
-        agent_file.parent.parent / "strategies" / "strategy_common.py",
-        agent_file.parent.parent / "strategy_common.py",
-    ]
-    for path in candidates:
-        if path.exists():
-            spec = importlib.util.spec_from_file_location("tradesmart_strategy_common", str(path))
-            if spec and spec.loader:
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                return mod
-    return None
-
-
-# ══════════════════════════════════════════════
-#  AGENT
-# ══════════════════════════════════════════════
 
 class TradeSmartAgent:
-    """
-    TradeSmart execution agent — controller of last resort.
-    strategy_common provides the signal; the agent executes it.
+    """Lean execution controller.
+
+    The page owns the 3-second loop and toggle state. Strategies own market
+    logic. This agent only connects MT5, loads strategies, combines strategy
+    scores, applies risk settings passed by the page, places/closes orders, and
+    returns structured thinking output.
     """
 
-    def __init__(self, profile: Dict[str, Any], rules: Dict[str, Any]):
-        self.profile      = profile or {}
-        self.rules        = rules   or {}
-        self.symbol       = SYMBOL
+    def __init__(self, profile: Dict[str, Any] | None = None, rules: Dict[str, Any] | None = None):
+        self.profile = dict(profile or {})
+        self.rules = dict(rules or {})
+        self.symbol = str(self.rules.get("symbol") or self.profile.get("symbol") or SYMBOL_DEFAULT)
         self.project_root = Path(__file__).resolve().parents[1]
-        self.data_dir     = self.project_root / "data"
-        self.data_dir.mkdir(exist_ok=True)
-        self.state_file   = self.data_dir / "tradesmart_agent_state.json"
-        self._strat_mod   = _load_strategy_common(Path(__file__).resolve())
-        self._strat_error: Optional[str] = None if self._strat_mod else "strategy_common.py not found."
+        self.user_key = str(self.rules.get("user_key") or self.profile.get("user_key") or "default")
+        self.user_id = _safe_user_id(self.rules.get("user_id") or self.user_key)
+        self.output_scope = str(self.rules.get("output_scope") or f"{self.user_id}_{str(self.rules.get('mode') or self.profile.get('mode') or 'Demo').lower()}")
+        self.data_dir = self.project_root / "data" / "users" / self.user_id / "tradesmart"
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.state_file = self.data_dir / "tradesmart_agent_state.json"
 
-    # ──────────────────────────────────────────
-    #  MT5
-    # ──────────────────────────────────────────
-
+    # MT5 connection
     def _mt5(self):
         try:
             import platform
             if platform.system() != "Windows":
-                return None, "MetaTrader5 direct mode only available on Windows."
+                return None, "MetaTrader5 direct mode is only available on Windows."
             import MetaTrader5 as mt5
             return mt5, None
         except Exception as exc:
             return None, f"MetaTrader5 not available: {exc}"
 
-    def _connect(self) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+    def _connect(self) -> Tuple[bool, str, Optional[Dict[str, Any]], Any]:
         profile = dict(self.profile or {})
-        profile["mode"]   = str(self.rules.get("mode") or profile.get("mode") or "Demo").title()
+        profile["mode"] = str(self.rules.get("mode") or profile.get("mode") or "Demo").title()
         profile["symbol"] = self.symbol
-
+        profile["user_key"] = self.user_key
+        profile["user_id"] = self.user_id
+        # Prefer your existing secure-store connector if present, so Demo/Live
+        # saved Settings keep working exactly the same.
         try:
             from frontend.mt5_secure_store import connect_mt5
             ok, message, account = connect_mt5(profile)
-            if not ok:
-                return False, message, None
-            return True, message, account
+            mt5, _ = self._mt5()
+            return bool(ok), str(message), account if isinstance(account, dict) else (account._asdict() if account else None), mt5
         except Exception:
             pass
-
         mt5, error = self._mt5()
         if error:
-            return False, error, None
-
-        login         = profile.get("login")
-        password      = profile.get("password")
-        server        = profile.get("server")
+            return False, error, None, None
+        login = profile.get("login")
+        password = profile.get("password")
+        server = profile.get("server")
         terminal_path = profile.get("terminal_path") or profile.get("path") or None
-        timeout       = min(int(profile.get("timeout", 12000) or 12000), 15000)
-        portable      = bool(profile.get("portable", False))
-
+        timeout = min(int(profile.get("timeout", 12000) or 12000), 15000)
+        portable = bool(profile.get("portable", False))
         if not login or not password or not server:
-            return False, "Missing MT5 login, password, or server.", None
-
+            return False, "Missing MT5 login, password, or server.", None, mt5
         try:
             mt5.shutdown()
         except Exception:
             pass
-
         try:
             init_kwargs = {"timeout": timeout, "portable": portable}
-            ok = (mt5.initialize(path=str(terminal_path), **init_kwargs)
-                  if terminal_path else mt5.initialize(**init_kwargs))
+            ok = mt5.initialize(path=str(terminal_path), **init_kwargs) if terminal_path else mt5.initialize(**init_kwargs)
         except Exception as exc:
-            return False, f"MT5 initialize error: {exc}", None
-
+            return False, f"MT5 initialize error: {exc}", None, mt5
         if not ok:
-            return False, f"MT5 init failed: {mt5.last_error()}", None
-
+            return False, f"MT5 init failed: {mt5.last_error()}", None, mt5
         try:
-            login_ok = mt5.login(int(str(login).strip()), password=str(password),
-                                 server=str(server).strip(), timeout=timeout)
+            login_ok = mt5.login(int(str(login).strip()), password=str(password), server=str(server).strip(), timeout=timeout)
         except Exception as exc:
             login_ok = False
             last_err = f"MT5 login exception: {exc}"
         else:
             last_err = mt5.last_error()
-
         account = mt5.account_info()
-        if not login_ok:
-            if account is not None:
-                data = account._asdict()
-                if str(data.get("login", "")).strip() == str(login).strip():
-                    return True, f"MT5 connected to {login}.", data
+        if not login_ok and account is None:
+            return False, f"MT5 login failed for {login}: {last_err}", None, mt5
+        data = account._asdict() if account is not None else {}
+        if str(data.get("login", "")).strip() and str(data.get("login", "")).strip() != str(login).strip():
             mt5.shutdown()
-            return False, f"MT5 login failed for {login}: {last_err}", None
-
-        if account is None:
-            mt5.shutdown()
-            return False, f"MT5 account_info failed: {mt5.last_error()}", None
-
-        data = account._asdict()
-        if str(data.get("login", "")).strip() != str(login).strip():
-            mt5.shutdown()
-            return False, f"Wrong account. Expected {login}, got {data.get('login')}.", None
-
-        return True, "Connected to MT5 successfully.", data
+            return False, f"Wrong account. Expected {login}, got {data.get('login')}.", None, mt5
+        return True, "Connected to MT5 successfully.", data, mt5
 
     def disconnect(self) -> None:
         mt5, error = self._mt5()
-        if not error:
+        if not error and mt5 is not None:
             try:
                 mt5.shutdown()
             except Exception:
                 pass
 
-    # ──────────────────────────────────────────
-    #  PUBLIC SNAPSHOTS
-    # ──────────────────────────────────────────
-
-    def connect_only(self) -> Dict[str, Any]:
-        ok, message, account = self._connect()
-        if not ok:
-            return {"ok": False, "phase": "connect", "event": "Connection Failed",
-                    "message": message, "thinking": message}
-        mt5, _ = self._mt5()
-        positions = self._positions(mt5)
-        snapshot  = self._account_snapshot(account or {}, positions)
-        self.disconnect()
-        return {"ok": True, "phase": "connect", "event": "Connected",
-                "message": message, "thinking": message,
-                "account": snapshot, "open_positions_count": len(positions),
-                "positions": positions}
-
-    def snapshot_only(self) -> Dict[str, Any]:
-        ok, message, account = self._connect()
-        if not ok:
-            return {"ok": False, "phase": "snapshot", "event": "Snapshot Failed",
-                    "message": message, "thinking": message,
-                    "account": {}, "positions": [], "open_positions_count": 0}
-        mt5, _ = self._mt5()
-        try:
-            positions = self._positions(mt5)
-            m1        = self._rates_tf(mt5, mt5.TIMEFRAME_M1, 120)
-            snapshot  = self._account_snapshot(account or {}, positions)
-            return {"ok": True, "phase": "snapshot", "event": "Live Snapshot",
-                    "message": "Refreshed.", "thinking": "Snapshot only.",
-                    "account": snapshot, "positions": positions,
-                    "position_summary": self._position_summary(positions, m1),
-                    "open_positions_count": len(positions),
-                    "symbol": self.symbol,
-                    "mode": self.rules.get("mode", self.profile.get("mode", "Demo")),
-                    "execution_enabled": False, "order_sent": False, "order_result": None}
-        finally:
-            self.disconnect()
-
-    # ──────────────────────────────────────────
-    #  DATA CONVERSION
-    # ──────────────────────────────────────────
-
+    # Converters/data
     def _native(self, value: Any) -> Any:
         try:
             if hasattr(value, "item"):
@@ -246,34 +130,36 @@ class TradeSmartAgent:
             pass
         return round(value, 6) if isinstance(value, float) else value
 
-    def _row_to_dict(self, row: Any, parent: Any = None) -> Dict[str, Any]:
+    def _row(self, row: Any, parent: Any = None) -> Dict[str, Any]:
         if hasattr(row, "_asdict"):
             return {str(k): self._native(v) for k, v in row._asdict().items()}
         if isinstance(row, dict):
             return {str(k): self._native(v) for k, v in row.items()}
-        names = getattr(getattr(row, "dtype", None), "names", None)
+        names = getattr(getattr(row, "dtype", None), "names", None) or getattr(getattr(parent, "dtype", None), "names", None)
         if names:
             return {str(n): self._native(row[n]) for n in names}
-        pnames = getattr(getattr(parent, "dtype", None), "names", None)
-        if pnames:
-            return {str(n): self._native(row[n]) for n in pnames}
         return {}
 
-    def _rates_tf(self, mt5, timeframe, count: int = 200) -> List[Dict[str, Any]]:
-        raw = mt5.copy_rates_from_pos(self.symbol, timeframe, 0, count)
+    def _rates_tf(self, mt5: Any, timeframe: Any, count: int) -> List[Dict[str, Any]]:
+        try:
+            raw = mt5.copy_rates_from_pos(self.symbol, timeframe, 0, count)
+        except Exception:
+            return []
         if raw is None:
             return []
-        rows = [self._row_to_dict(r, raw) for r in raw]
+        rows = [self._row(r, raw) for r in raw]
         rows = [r for r in rows if r]
         rows.sort(key=lambda x: int(x.get("time", 0) or 0))
         return rows
 
-    def _rates_multi(self, mt5) -> Dict[str, List[Dict[str, Any]]]:
+    def _rates_multi(self, mt5: Any) -> Dict[str, List[Dict[str, Any]]]:
         tf_map = {
-            "M1":  (getattr(mt5, "TIMEFRAME_M1",  None), 300),
-            "M5":  (getattr(mt5, "TIMEFRAME_M5",  None), 200),
-            "M15": (getattr(mt5, "TIMEFRAME_M15", None), 100),
-            "H1":  (getattr(mt5, "TIMEFRAME_H1",  None),  60),
+            "M1": (getattr(mt5, "TIMEFRAME_M1", None), 360),
+            "M5": (getattr(mt5, "TIMEFRAME_M5", None), 240),
+            "M15": (getattr(mt5, "TIMEFRAME_M15", None), 180),
+            "H1": (getattr(mt5, "TIMEFRAME_H1", None), 140),
+            "H4": (getattr(mt5, "TIMEFRAME_H4", None), 90),
+            "D1": (getattr(mt5, "TIMEFRAME_D1", None), 45),
         }
         out: Dict[str, List[Dict[str, Any]]] = {}
         for tf, (const, count) in tf_map.items():
@@ -283,934 +169,479 @@ class TradeSmartAgent:
                     out[tf] = rows
         return out
 
-    def _positions(self, mt5) -> List[Dict[str, Any]]:
-        raw = mt5.positions_get(symbol=self.symbol)
+    def _positions(self, mt5: Any) -> List[Dict[str, Any]]:
+        try:
+            raw = mt5.positions_get(symbol=self.symbol)
+        except Exception:
+            raw = None
         if raw is None:
             return []
         out: List[Dict[str, Any]] = []
         for pos in raw:
-            data    = self._row_to_dict(pos)
-            comment = str(data.get("comment", ""))
-            magic   = int(data.get("magic", 0) or 0)
-            if magic == MAGIC or "TradeSmart" in comment:
+            data = self._row(pos)
+            if int(data.get("magic", 0) or 0) == MAGIC or "TradeSmart" in str(data.get("comment", "")):
                 out.append(data)
         return out
 
-    def _account_snapshot(self, account: Dict[str, Any],
-                          positions: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-        balance  = float(account.get("balance", 0) or 0)
-        equity   = float(account.get("equity", balance) or balance)
+    def _account_snapshot(self, account: Dict[str, Any], positions: List[Dict[str, Any]], closed_pl: float, session_closed_pl: float | None = None) -> Dict[str, Any]:
+        balance = float(account.get("balance", 0) or 0)
+        equity = float(account.get("equity", balance) or balance)
+        floating = sum(float(p.get("profit", 0) or 0) for p in positions)
+        session_closed = closed_pl if session_closed_pl is None else float(session_closed_pl or 0.0)
         return {
-            "login":          account.get("login"),
-            "server":         account.get("server"),
-            "balance":        round(balance, 2),
-            "equity":         round(equity, 2),
-            "currency":       account.get("currency"),
-            "leverage":       account.get("leverage"),
-            "open_positions": len(positions or []),
-            "daily_pl":       round(equity - balance, 2),
+            "login": account.get("login"),
+            "server": account.get("server"),
+            "balance": round(balance, 2),
+            "equity": round(equity, 2),
+            "currency": account.get("currency"),
+            "leverage": account.get("leverage"),
+            "open_positions": len(positions),
+            "floating_pl": round(floating, 2),
+            "closed_pl_today": round(closed_pl, 2),
+            "session_closed_pl": round(session_closed, 2),
+            "combined_daily_pl": round(closed_pl + floating, 2),
+            "combined_session_pl": round(session_closed + floating, 2),
         }
 
-    def _position_summary(self, positions: List[Dict[str, Any]],
-                          m1: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        summary: List[Dict[str, Any]] = []
-        last_time = int((m1[-2] if len(m1) >= 2 else {}).get("time", 0) or 0)
-        for pos in positions:
-            open_time = int(pos.get("time", 0) or 0)
-            candles   = len([c for c in m1
-                             if open_time < int(c.get("time", 0) or 0) <= last_time])
-            pos_type  = int(pos.get("type", 0) or 0)
-            summary.append({
-                "ticket":            pos.get("ticket"),
-                "direction":         "BUY" if pos_type == 0 else "SELL",
-                "volume":            pos.get("volume"),
-                "profit":            round(float(pos.get("profit", 0) or 0), 2),
-                "candles_since_open": candles,
-                "open_price":        pos.get("price_open"),
-                "sl":                pos.get("sl"),
-                "tp":                pos.get("tp"),
-            })
-        return summary
+    def _risk_session_pl(self, closed_pl_today: float) -> Tuple[str, float, float]:
+        """Return (risk_session_id, baseline_closed_pl, session_closed_delta).
 
-    # ──────────────────────────────────────────
-    #  STATE
-    # ──────────────────────────────────────────
+        Every manual toggle-on from the TradeSmart page sends a new risk_session_id.
+        The first scan of that session stores today's already-closed TradeSmart P/L as
+        the baseline, so old losses do not instantly trigger the max-loss kill switch.
+        The max loss then watches: floating P/L + closed P/L since this toggle-on.
+        """
+        session_id = str(self.rules.get("risk_session_id") or self._state_key())
+        state = self._load_state()
+        key = self._state_key()
+        bucket = state.setdefault(key, {})
+        current = bucket.get("risk_session_id")
+        if current != session_id or "risk_baseline_closed_pl" not in bucket:
+            bucket["risk_session_id"] = session_id
+            bucket["risk_baseline_closed_pl"] = float(closed_pl_today or 0.0)
+            bucket["risk_session_started"] = time.time()
+            bucket.pop("risk_locked", None)
+            bucket.pop("risk_lock_reason", None)
+            self._save_state(state)
+        baseline = float(bucket.get("risk_baseline_closed_pl", 0.0) or 0.0)
+        return session_id, baseline, round(float(closed_pl_today or 0.0) - baseline, 2)
+
+    def _closed_pl_today(self, mt5: Any) -> float:
+        try:
+            now = datetime.now(timezone.utc)
+            start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+            deals = mt5.history_deals_get(start, now + timedelta(minutes=1))
+            if deals is None:
+                return 0.0
+            total = 0.0
+            for deal in deals:
+                d = self._row(deal)
+                if str(d.get("symbol", "")) == self.symbol and (int(d.get("magic", 0) or 0) == MAGIC or "TradeSmart" in str(d.get("comment", ""))):
+                    total += float(d.get("profit", 0) or 0) + float(d.get("commission", 0) or 0) + float(d.get("swap", 0) or 0)
+            return round(total, 2)
+        except Exception:
+            return 0.0
+
+    # Strategy loading/decision
+    def _load_strategies(self) -> List[Any]:
+        core = self.project_root / "strategies" / "core" / "__init__.py"
+        if not core.exists():
+            return []
+        spec = importlib.util.spec_from_file_location("tradesmart_strategy_core", str(core))
+        if not spec or not spec.loader:
+            return []
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        loader = getattr(mod, "load_enabled_strategies", None)
+        if not callable(loader):
+            return []
+        loaded = loader(project_root=self.project_root)
+        return loaded if isinstance(loaded, list) else []
+
+    def _strategy_context(self, rates: Dict[str, List[Dict[str, Any]]], positions: List[Dict[str, Any]], account: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "timeframes": rates,
+            "rates": rates.get("M1", []),
+            "rates_m1": rates.get("M1", []),
+            "rates_m5": rates.get("M5", []),
+            "rates_m15": rates.get("M15", []),
+            "rates_h1": rates.get("H1", []),
+            "rates_h4": rates.get("H4", []),
+            "rates_d1": rates.get("D1", []),
+            "positions": positions,
+            "account": account,
+            "rules": self.rules,
+            "risk": self.rules,
+            "now": datetime.now(timezone.utc).isoformat(),
+            "user_key": self.user_key,
+            "user_id": self.user_id,
+            "output_scope": self.output_scope,
+        }
+
+    def _choose_signal(self, context: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        strategies = self._load_strategies()
+        evaluated: List[Dict[str, Any]] = []
+        best: Optional[Dict[str, Any]] = None
+        for strategy in strategies:
+            name = str(getattr(strategy, "name", strategy.__class__.__name__))
+            try:
+                raw = strategy.evaluate(context) or {}
+            except Exception as exc:
+                evaluated.append({"name": name, "action": "ERROR", "score": 0, "reason": str(exc)})
+                continue
+            action = str(raw.get("action") or raw.get("signal") or "NONE").upper()
+            score = float(raw.get("score", raw.get("confidence", 0)) or 0)
+            reason = str(raw.get("reason") or raw.get("thought") or "No reason.")
+            row = {"name": name, "action": action, "score": round(score, 2), "reason": reason, "raw": raw}
+            evaluated.append(row)
+            if best is None or score > float(best.get("score", 0)):
+                best = row
+        if best is None:
+            best = {"name": "none", "action": "SCAN", "score": 0.0, "reason": "No enabled strategies found.", "raw": {"action": "SCAN", "reason": "No enabled strategies found."}}
+        raw = best.get("raw") if isinstance(best.get("raw"), dict) else {}
+        decision = {
+            "action": str(raw.get("action") or best.get("action") or "SCAN").upper(),
+            "score": float(raw.get("score", best.get("score", 0)) or 0),
+            "confidence": float(raw.get("confidence", raw.get("score", best.get("score", 0))) or 0),
+            "reason": str(raw.get("reason") or best.get("reason") or "Scanning."),
+            "sl": raw.get("sl"),
+            "tp": raw.get("tp"),
+            "entry": raw.get("entry"),
+            "entry_candle_time": raw.get("entry_candle_time"),
+            "close_ticket": raw.get("close_ticket"),
+            "data": raw.get("data") or {},
+            "draw_commands": raw.get("draw_commands") or [],
+        }
+        return decision, {"winner": best.get("name"), "evaluated": evaluated, "loaded_count": len(strategies), "raw": raw}
+
+    # Risk/order helpers
+    def _max_open(self) -> int:
+        return max(1, int(float(self.rules.get("max_open_trades", 1) or 1)))
+
+    def _volume(self, decision: Dict[str, Any]) -> float:
+        return round(float(self.rules.get("trade_volume") or self.rules.get("volume") or decision.get("volume") or 0.01), 2)
 
     def _state_key(self) -> str:
-        login = self.profile.get("login") or "unknown"
-        mode  = self.rules.get("mode") or self.profile.get("mode") or "Demo"
-        return f"{login}:{mode}:{self.symbol}"
+        return f"{self.user_id}:{self.profile.get('login','unknown')}:{self.rules.get('mode', self.profile.get('mode','Demo'))}:{self.symbol}"
 
     def _load_state(self) -> Dict[str, Any]:
-        if not self.state_file.exists():
-            return {}
         try:
-            return json.loads(self.state_file.read_text(encoding="utf-8"))
+            return json.loads(self.state_file.read_text(encoding="utf-8")) if self.state_file.exists() else {}
         except Exception:
             return {}
 
     def _save_state(self, state: Dict[str, Any]) -> None:
         try:
-            self.state_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            self.state_file.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
         except Exception:
             pass
 
-    # ──────────────────────────────────────────
-    #  INPUTS + EXTERNAL STRATEGIES
-    # ──────────────────────────────────────────
+    def _dedup_ok(self, decision: Dict[str, Any]) -> bool:
+        entry_time = decision.get("entry_candle_time")
+        if not entry_time:
+            return True
+        state = self._load_state()
+        key = self._state_key()
+        last = ((state.get(key) or {}).get("last_entry_candle_time"))
+        return str(last) != str(entry_time)
 
-    def _load_neutral_inputs(self) -> Dict[str, Any]:
-        runtime_rules = {
-            "custom_rules":          self.rules.get("ai_instructions", ""),
-            "mode":                  self.rules.get("mode", "Demo"),
-            "symbol":                self.symbol,
-            "trade_volume":          self.rules.get("trade_volume", 0.01),
-            "max_open_trades":       self.rules.get("max_open_trades", 1),
-            "max_daily_loss_amount": self.rules.get("max_daily_loss_amount", 0),
+    def _mark_entry(self, decision: Dict[str, Any]) -> None:
+        entry_time = decision.get("entry_candle_time")
+        if not entry_time:
+            return
+        state = self._load_state()
+        key = self._state_key()
+        state.setdefault(key, {})["last_entry_candle_time"] = entry_time
+        state[key]["updated"] = time.time()
+        self._save_state(state)
+
+    def _close_position(self, mt5: Any, pos: Dict[str, Any], reason: str = "TradeSmart close") -> Dict[str, Any]:
+        tick = mt5.symbol_info_tick(self.symbol)
+        pos_type = int(pos.get("type", 0) or 0)
+        order_type = mt5.ORDER_TYPE_SELL if pos_type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+        price = tick.bid if order_type == mt5.ORDER_TYPE_SELL else tick.ask
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": self.symbol,
+            "volume": float(pos.get("volume", 0.01) or 0.01),
+            "type": order_type,
+            "position": int(pos.get("ticket")),
+            "price": price,
+            "deviation": int(self.rules.get("deviation", 30) or 30),
+            "magic": MAGIC,
+            "comment": reason[:31],
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
         }
-        path = self.project_root / "agents" / "inputs" / "__init__.py"
-        if not path.exists():
-            return runtime_rules
-        try:
-            spec = importlib.util.spec_from_file_location("dropz_tradesmart_inputs", str(path))
-            if spec and spec.loader:
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                loader = getattr(module, "load_tradesmart_inputs", None)
-                if callable(loader):
-                    data = loader(project_root=self.project_root, runtime_rules=runtime_rules)
-                    if isinstance(data, dict):
-                        return data
-        except Exception as exc:
-            runtime_rules["input_loader_error"] = str(exc)
-        return runtime_rules
+        res = mt5.order_send(request)
+        return res._asdict() if hasattr(res, "_asdict") else {"raw": str(res)}
 
-    def _load_enabled_strategies(self) -> List[Any]:
-        strategies: List[Any] = []
-        core_path = self.project_root / "strategies" / "core" / "__init__.py"
-        if not core_path.exists():
-            return strategies
-        try:
-            spec = importlib.util.spec_from_file_location("dropz_local_strategies_core", str(core_path))
-            if spec and spec.loader:
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                loader = getattr(module, "load_enabled_strategies", None)
-                if callable(loader):
-                    result = loader(project_root=self.project_root)
-                    if isinstance(result, list):
-                        strategies.extend(result)
-        except Exception as exc:
-            self._strategy_loader_error = str(exc)
-        return strategies
-
-    # ──────────────────────────────────────────
-    #  STRATEGY SIGNAL
-    # ──────────────────────────────────────────
-
-    def _strategy_signal(
-        self,
-        rates_multi: Dict[str, List[Dict[str, Any]]],
-        positions: List[Dict[str, Any]],
-        neutral_inputs: Dict[str, Any],
-    ) -> Tuple[TradeSignal, Dict[str, Any]]:
-        m1  = rates_multi.get("M1",  [])
-        m5  = rates_multi.get("M5",  [])
-        m15 = rates_multi.get("M15", [])
-        h1  = rates_multi.get("H1",  [])
-
-        context: Dict[str, Any] = {
-            "symbol":     self.symbol,
-            "rates":      m1,
-            "rates_m1":   m1,
-            "rates_m5":   m5,
-            "rates_m15":  m15,
-            "rates_h1":   h1,
-            "timeframes": {"M1": m1, "M5": m5, "M15": m15, "H1": h1},
-            "positions":  positions,
-            "rules":      self.rules,
-            "inputs":     neutral_inputs,
-            "ai_instructions": neutral_inputs.get("custom_rules",
-                                                   self.rules.get("ai_instructions", "")),
-            "now": datetime.now(timezone.utc).isoformat(),
-        }
-
-        thoughts:  List[str] = []
-        evaluated: List[str] = []
-
-        # PRIMARY: strategy_common
-        if self._strat_mod and hasattr(self._strat_mod, "build_decision"):
-            evaluated.append("xauusd_m15_wick_scalp")
-            try:
-                raw    = self._strat_mod.build_decision(context) or {}
-                action = str(raw.get("action", "NONE")).upper()
-                reason = str(raw.get("reason") or raw.get("thought") or "No reason returned.")
-                thoughts.append(f"xauusd_m15_wick_scalp: {reason}")
-
-                if action in ("BUY", "SELL", "CLOSE", "HOLD", "SCAN"):
-                    return TradeSignal(
-                        action            = action,
-                        symbol            = self.symbol,
-                        volume            = float(raw.get("volume",
-                                                   self.rules.get("trade_volume", 0.01)) or 0.01),
-                        reason            = reason,
-                        close_ticket      = raw.get("close_ticket"),
-                        sl                = raw.get("sl"),
-                        tp                = raw.get("tp"),
-                        entry_candle_time = raw.get("entry_candle_time"),
-                    ), {
-                        "strategy":     "xauusd_m15_wick_scalp",
-                        "thoughts":     thoughts,
-                        "evaluated":    evaluated,
-                        "raw":          raw,
-                        "loaded_count": 1,
-                        "loader_error": self._strat_error,
-                        "_signal_data": raw,
-                    }
-            except Exception as exc:
-                err = f"strategy_common error: {exc}"
-                thoughts.append(err)
-                self._strat_error = err
-
-        # FALLBACK: external strategies
-        loaded = self._load_enabled_strategies()
-        for strategy in loaded:
-            name = str(getattr(strategy, "name", strategy.__class__.__name__))
-            evaluated.append(name)
-            try:
-                raw = strategy.evaluate(context) or {}
-            except Exception as exc:
-                thoughts.append(f"{name} error: {exc}")
-                continue
-            thought = str(raw.get("thought") or raw.get("reason") or f"{name} no thought.")
-            thoughts.append(f"{name}: {thought}")
-            action = str(raw.get("action", "NONE")).upper()
-            if action in ("BUY", "SELL", "CLOSE", "HOLD"):
-                return TradeSignal(
-                    action       = action,
-                    symbol       = self.symbol,
-                    volume       = float(raw.get("volume", self.rules.get("trade_volume", 0.01)) or 0.01),
-                    reason       = str(raw.get("reason") or thought),
-                    close_ticket = raw.get("close_ticket"),
-                    sl           = raw.get("sl"),
-                    tp           = raw.get("tp"),
-                ), {
-                    "strategy":     name,
-                    "thoughts":     thoughts,
-                    "evaluated":    evaluated,
-                    "raw":          raw,
-                    "loaded_count": len(loaded),
-                    "loader_error": getattr(self, "_strategy_loader_error", None),
-                    "_signal_data": raw,
-                }
-
-        return TradeSignal(action="NONE", symbol=self.symbol,
-                           reason="No enabled strategy returned a signal."), {
-            "strategy": None, "thoughts": thoughts or ["No strategies loaded."],
-            "evaluated": evaluated, "raw": {}, "loaded_count": len(loaded),
-            "loader_error": getattr(self, "_strat_error", None), "_signal_data": {},
-        }
-
-    # ──────────────────────────────────────────
-    #  RISK HELPERS
-    # ──────────────────────────────────────────
-
-    def _symbol_ready(self, mt5) -> Tuple[bool, str]:
-        info = mt5.symbol_info(self.symbol)
-        if info is None:
-            return False, f"{self.symbol} not in MT5 Market Watch."
-        if not bool(getattr(info, "visible", False)) and not mt5.symbol_select(self.symbol, True):
-            return False, f"{self.symbol} could not be selected."
-        info = mt5.symbol_info(self.symbol)
-        if int(getattr(info, "trade_mode", 0) or 0) == 0:
-            return False, f"{self.symbol} trading disabled by broker."
-        return True, "Symbol ready."
-
-    def _terminal_trade_allowed(self, mt5) -> Tuple[bool, str]:
-        terminal = mt5.terminal_info()
-        account  = mt5.account_info()
-        if terminal is not None and not bool(getattr(terminal, "trade_allowed", True)):
-            return False, "Algo Trading disabled. Enable AutoTrading in MT5."
-        if account is not None and not bool(getattr(account, "trade_allowed", True)):
-            return False, "Trading disabled for this account."
-        return True, "Trading allowed."
-
-    def _normalize_volume(self, mt5, volume: float) -> float:
-        info = mt5.symbol_info(self.symbol)
-        if info is None:
-            return round(float(volume), 2)
-        min_vol = float(getattr(info, "volume_min",  0.01) or 0.01)
-        max_vol = float(getattr(info, "volume_max",  volume) or volume)
-        step    = float(getattr(info, "volume_step", 0.01) or 0.01)
-        volume  = max(min_vol, min(float(volume), max_vol))
-        return round(round(volume / step) * step, 2)
-
-    def _tracked_history_loss_since(self, mt5, since_epoch: float) -> Tuple[float, List[Dict[str, Any]]]:
-        """
-        Return realized losses from TradeSmart-tracked XAUUSD deals since the
-        current risk session started.
-
-        This fixes the production bug where back-to-back closed losses could be
-        missed because they disappear from open positions before the next cycle.
-        """
-        try:
-            since_epoch = float(since_epoch or 0)
-        except Exception:
-            since_epoch = 0.0
-
-        if since_epoch <= 0:
-            return 0.0, []
-
-        start = datetime.fromtimestamp(since_epoch, tz=timezone.utc)
-        end = datetime.now(timezone.utc) + timedelta(minutes=5)
-
-        try:
-            deals = mt5.history_deals_get(start, end)
-        except Exception:
-            deals = None
-
-        if deals is None:
-            return 0.0, []
-
-        losses: List[Dict[str, Any]] = []
-        total_loss = 0.0
-
-        for deal in deals:
-            data = self._row_to_dict(deal)
-            if not data:
-                continue
-
-            if str(data.get("symbol", "")).upper() != self.symbol.upper():
-                continue
-
-            comment = str(data.get("comment", ""))
-            magic = int(data.get("magic", 0) or 0)
-
-            # TradeSmart orders use MAGIC and comments. Keep both so older
-            # orders from previous builds are still protected.
-            if magic != MAGIC and "TradeSmart" not in comment:
-                continue
-
-            profit = float(data.get("profit", 0) or 0)
-            swap = float(data.get("swap", 0) or 0)
-            commission = float(data.get("commission", 0) or 0)
-            fee = float(data.get("fee", 0) or 0)
-            net = profit + swap + commission + fee
-
-            if net < 0:
-                loss = abs(net)
-                total_loss += loss
-                losses.append({
-                    "ticket": data.get("ticket"),
-                    "position_id": data.get("position_id"),
-                    "time": data.get("time"),
-                    "profit": round(net, 2),
-                    "loss": round(loss, 2),
-                    "comment": comment,
-                    "magic": magic,
-                })
-
-        return round(total_loss, 2), losses
-
-    def _sync_position_loss_memory(
-        self,
-        account_state: Dict[str, Any],
-        positions: Optional[List[Dict[str, Any]]],
-    ) -> float:
-        """
-        Local fail-safe loss memory for open/closed TradeSmart positions.
-
-        MT5 history can be delayed or returned in broker/server time. This memory
-        records every tracked open ticket each cycle. If a ticket disappears and
-        its last known floating profit was negative, that loss is added to a
-        session-local closed-loss bucket. This means a -$8 trade that closes is
-        still remembered before the next trade is allowed to keep running.
-        """
-        positions = positions or []
-        previous = account_state.get("risk_seen_positions")
-        if not isinstance(previous, dict):
-            previous = {}
-
-        current: Dict[str, Dict[str, Any]] = {}
+    def _close_all(self, mt5: Any, positions: List[Dict[str, Any]], reason: str) -> List[Dict[str, Any]]:
+        results = []
         for pos in positions:
-            ticket = str(pos.get("ticket") or "").strip()
-            if not ticket:
-                continue
-            current[ticket] = {
-                "ticket": ticket,
-                "profit": float(pos.get("profit", 0) or 0),
-                "volume": pos.get("volume"),
-                "type": pos.get("type"),
-                "time": pos.get("time"),
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
+            results.append(self._close_position(mt5, pos, reason=reason))
+        return results
 
-        closed_loss_memory = float(account_state.get("risk_closed_loss_memory", 0) or 0)
-        closed_tickets = account_state.get("risk_closed_loss_tickets")
-        if not isinstance(closed_tickets, dict):
-            closed_tickets = {}
+    def _send_order(self, mt5: Any, decision: Dict[str, Any]) -> Dict[str, Any]:
+        """Send a market order with broker-safe SL/TP validation.
 
-        for ticket, old in previous.items():
-            if ticket in current or ticket in closed_tickets:
-                continue
-            old_profit = float((old or {}).get("profit", 0) or 0)
-            if old_profit < 0:
-                loss = round(abs(old_profit), 2)
-                closed_loss_memory += loss
-                closed_tickets[ticket] = {
-                    "ticket": ticket,
-                    "loss": loss,
-                    "last_profit": round(old_profit, 2),
-                    "remembered_at": datetime.now(timezone.utc).isoformat(),
-                    "source": "last_seen_open_position",
-                }
-
-        account_state["risk_seen_positions"] = current
-        account_state["risk_closed_loss_memory"] = round(closed_loss_memory, 2)
-        account_state["risk_closed_loss_tickets"] = closed_tickets
-        return round(closed_loss_memory, 2)
-
-    def _max_loss_hit(
-        self,
-        snapshot: Dict[str, Any],
-        positions: Optional[List[Dict[str, Any]]] = None,
-        mt5: Any = None,
-        account_state: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[bool, float, str, Dict[str, Any]]:
+        Retcode 10016 is usually MT5's "invalid stops" response. The
+        strategy can correctly identify a premium/discount event, but the
+        live bid/ask may move after the candle closes. Before sending, this
+        normalizes SL/TP around the actual live tick, respects the broker stop
+        distance, and runs order_check when available so TradeSmart blocks bad
+        requests before they become confusing rejected orders.
         """
-        Hard TradeSmart kill-switch.
+        action = str(decision.get("action", "")).upper()
+        if action not in ("BUY", "SELL"):
+            return {"ok": False, "message": "No buy/sell action."}
 
-        The key production fix is **session total loss**:
-            remembered/realized closed losses + current open floating losses.
-
-        That catches cases like: first trade closes -$8, second trade floats -$2
-        with a $10 limit. The agent locks immediately at $10 instead of waiting
-        for the second trade to close.
-        """
-        max_loss = float(self.rules.get("max_daily_loss_amount", 0) or 0)
-        details: Dict[str, Any] = {
-            "max_loss": round(max_loss, 2),
-            "session_start_epoch": None,
-            "session_start_equity": None,
-            "history_losses": [],
-            "memory_closed_losses": [],
-            "loss_views": {},
-        }
-
-        if max_loss <= 0:
-            return False, 0.0, "disabled", details
-
-        account_state = account_state or {}
-        positions = positions or []
-
-        balance = float(snapshot.get("balance", 0) or 0)
-        equity = float(snapshot.get("equity", balance) or balance)
-
-        start_equity = float(account_state.get("risk_start_equity", 0) or 0)
-        start_epoch = float(account_state.get("risk_session_start_epoch", 0) or 0)
-
-        details["session_start_epoch"] = start_epoch
-        details["session_start_equity"] = start_equity
-
-        session_equity_loss = max(0.0, start_equity - equity) if start_equity > 0 else 0.0
-        floating_equity_loss = max(0.0, balance - equity)
-
-        position_losses = [
-            max(0.0, -float(pos.get("profit", 0) or 0))
-            for pos in positions
-        ]
-        combined_open_loss = round(sum(position_losses), 2)
-        worst_open_loss = round(max(position_losses), 2) if position_losses else 0.0
-
-        memory_closed_loss = self._sync_position_loss_memory(account_state, positions)
-
-        realized_history_loss = 0.0
-        history_losses: List[Dict[str, Any]] = []
-        if mt5 is not None:
-            realized_history_loss, history_losses = self._tracked_history_loss_since(mt5, start_epoch)
-
-        # Do not double-count the same closed trade from MT5 history and local
-        # memory. Use whichever closed-loss source is currently larger.
-        closed_loss_total = round(max(float(realized_history_loss or 0), float(memory_closed_loss or 0)), 2)
-        session_total_trade_loss = round(closed_loss_total + combined_open_loss, 2)
-
-        loss_views = {
-            "session total closed + open tracked loss": session_total_trade_loss,
-            "session equity drawdown": session_equity_loss,
-            "account floating drawdown": floating_equity_loss,
-            "combined open tracked trade loss": combined_open_loss,
-            "single open tracked trade loss": worst_open_loss,
-            "closed tracked trade loss": closed_loss_total,
-        }
-
-        details["loss_views"] = {k: round(float(v), 2) for k, v in loss_views.items()}
-        details["history_losses"] = history_losses
-        details["memory_closed_losses"] = list((account_state.get("risk_closed_loss_tickets") or {}).values())
-        details["closed_loss_total"] = closed_loss_total
-        details["combined_open_loss"] = combined_open_loss
-        details["session_total_trade_loss"] = session_total_trade_loss
-
-        reason, live_loss = max(loss_views.items(), key=lambda item: item[1])
-        live_loss = round(float(live_loss), 2)
-
-        return live_loss >= max_loss, live_loss, reason, details
-
-    def _mark_entry_attempt(self, account_state: Dict[str, Any],
-                             signal: TradeSignal) -> None:
-        now = datetime.now(timezone.utc)
-        account_state["last_entry_attempt_epoch"]  = now.timestamp()
-        account_state["last_entry_attempt_time"]   = now.isoformat()
-        account_state["last_entry_attempt_action"] = signal.action
-
-    # ──────────────────────────────────────────
-    #  ORDER SEND
-    # ──────────────────────────────────────────
-
-    def _send_order(self, mt5, signal: TradeSignal) -> Dict[str, Any]:
-        allowed, msg = self._terminal_trade_allowed(mt5)
-        if not allowed:
-            return {"ok": False, "message": msg, "retcode": None}
-
-        ready, rmsg = self._symbol_ready(mt5)
-        if not ready:
-            return {"ok": False, "message": rmsg, "retcode": None}
+        info = mt5.symbol_info(self.symbol)
+        if info is None:
+            return {"ok": False, "message": f"Symbol info unavailable for {self.symbol}."}
+        if not getattr(info, "visible", True):
+            mt5.symbol_select(self.symbol, True)
+            info = mt5.symbol_info(self.symbol) or info
 
         tick = mt5.symbol_info_tick(self.symbol)
         if tick is None:
-            return {"ok": False, "message": f"No live tick for {self.symbol}.", "retcode": None}
+            return {"ok": False, "message": "No MT5 tick available."}
 
-        direction  = signal.action.upper()
-        order_type = mt5.ORDER_TYPE_BUY if direction == "BUY" else mt5.ORDER_TYPE_SELL
-        price      = float(tick.ask if direction == "BUY" else tick.bid)
-        volume     = self._normalize_volume(mt5, signal.volume)
+        order_type = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
+        price = float(tick.ask if action == "BUY" else tick.bid)
+        point = float(getattr(info, "point", 0.01) or 0.01)
+        digits = int(getattr(info, "digits", 2) or 2)
+        spread = abs(float(getattr(tick, "ask", price) or price) - float(getattr(tick, "bid", price) or price))
+        stops_level = float(getattr(info, "trade_stops_level", 0) or 0) * point
+        freeze_level = float(getattr(info, "trade_freeze_level", 0) or 0) * point
+        # XAUUSD brokers often need a practical floor even when stops_level is 0.
+        min_stop = max(stops_level, freeze_level, spread * 2.0, point * 50.0, 0.50)
 
-        sym_info = mt5.symbol_info(self.symbol)
-        digits   = int(getattr(sym_info, "digits", 2) or 2) if sym_info else 2
+        def r(v: float) -> float:
+            return round(float(v), digits)
 
-        request: Dict[str, Any] = {
-            "action":       mt5.TRADE_ACTION_DEAL,
-            "symbol":       self.symbol,
-            "volume":       volume,
-            "type":         order_type,
-            "price":        price,
-            "deviation":    int(self.rules.get("deviation", 30) or 30),
-            "magic":        MAGIC,
-            "comment":      "TradeSmart Agent",
-            "type_time":    mt5.ORDER_TIME_GTC,
+        sl_raw = float(decision.get("sl") or 0.0)
+        tp_raw = float(decision.get("tp") or 0.0)
+        adjusted = False
+
+        if action == "BUY":
+            if sl_raw <= 0 or sl_raw >= price - min_stop:
+                sl_raw = price - min_stop
+                adjusted = True
+            risk = max(price - sl_raw, min_stop)
+            if tp_raw <= 0 or tp_raw <= price + min_stop:
+                tp_raw = price + (risk * 2.0)
+                adjusted = True
+        else:
+            if sl_raw <= 0 or sl_raw <= price + min_stop:
+                sl_raw = price + min_stop
+                adjusted = True
+            risk = max(sl_raw - price, min_stop)
+            if tp_raw <= 0 or tp_raw >= price - min_stop:
+                tp_raw = price - (risk * 2.0)
+                adjusted = True
+
+        sl = r(sl_raw)
+        tp = r(tp_raw)
+        price = r(price)
+
+        # Final hard validation before MT5 receives the request.
+        if action == "BUY" and not (sl < price and tp > price):
+            return {"ok": False, "message": "Trade blocked before send: BUY SL/TP are not valid around live ask.", "price": price, "sl": sl, "tp": tp}
+        if action == "SELL" and not (sl > price and tp < price):
+            return {"ok": False, "message": "Trade blocked before send: SELL SL/TP are not valid around live bid.", "price": price, "sl": sl, "tp": tp}
+
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": self.symbol,
+            "volume": self._volume(decision),
+            "type": order_type,
+            "price": price,
+            "sl": sl,
+            "tp": tp,
+            "deviation": int(self.rules.get("deviation", 50) or 50),
+            "magic": MAGIC,
+            "comment": "TradeSmart Agent",
+            "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
 
-        if signal.sl is not None and float(signal.sl) > 0:
-            request["sl"] = round(float(signal.sl), digits)
-        if signal.tp is not None and float(signal.tp) > 0:
-            request["tp"] = round(float(signal.tp), digits)
-
-        result = mt5.order_send(request)
-        if result is None:
-            return {"ok": False,
-                    "message": f"order_send returned None: {mt5.last_error()}",
-                    "request": request}
-
-        data    = result._asdict() if hasattr(result, "_asdict") else dict(result)
-        retcode = int(data.get("retcode", 0) or 0)
-        success = {int(getattr(mt5, "TRADE_RETCODE_DONE",   10009)),
-                   int(getattr(mt5, "TRADE_RETCODE_PLACED", 10008))}
-        ok = retcode in success
-
-        if retcode == 10017:
-            message = "Trade failed: Algo Trading disabled."
-        elif ok:
-            sl_txt = f"  SL {signal.sl:.2f}" if signal.sl else ""
-            tp_txt = f"  TP {signal.tp:.2f}" if signal.tp else ""
-            message = f"{direction} {self.symbol} placed.{sl_txt}{tp_txt}"
-        else:
-            message = f"Trade failed. Retcode: {retcode}"
-
-        return {"ok": ok, "message": message, "retcode": retcode,
-                "request": request, "result": data}
-
-    # ──────────────────────────────────────────
-    #  CLOSE POSITION
-    # ──────────────────────────────────────────
-
-    def _close_position(self, mt5, ticket: Any) -> Dict[str, Any]:
-        """Close one tracked position with broker-compatible retries.
-
-        Some brokers reject one filling type even when the same close would work
-        with another. This tries the common filling modes and re-reads the
-        position before every attempt. If the ticket is already gone, we treat
-        it as safely closed so the kill-switch does not keep looping forever.
-        """
-        allowed, msg = self._terminal_trade_allowed(mt5)
-        if not allowed:
-            return {"ok": False, "message": msg, "retcode": None}
-
-        success_codes = {
-            int(getattr(mt5, "TRADE_RETCODE_DONE", 10009)),
-            int(getattr(mt5, "TRADE_RETCODE_PLACED", 10008)),
-            int(getattr(mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010)),
-        }
-        filling_modes = []
-        for name in ("ORDER_FILLING_IOC", "ORDER_FILLING_FOK", "ORDER_FILLING_RETURN"):
-            value = getattr(mt5, name, None)
-            if value is not None and value not in filling_modes:
-                filling_modes.append(value)
-        if not filling_modes:
-            filling_modes = [getattr(mt5, "ORDER_FILLING_IOC", 1)]
-
-        attempts: List[Dict[str, Any]] = []
-        last_message = "Close not attempted."
-
-        for attempt in range(1, 4):
-            target = next((p for p in self._positions(mt5)
-                           if str(p.get("ticket")) == str(ticket)), None)
-            if target is None:
-                return {
-                    "ok": True,
-                    "message": f"Position {ticket} already closed.",
-                    "retcode": None,
-                    "attempts": attempts,
-                }
-
-            tick = mt5.symbol_info_tick(self.symbol)
-            if tick is None:
-                return {"ok": False, "message": "No live tick for close.", "retcode": None, "attempts": attempts}
-
-            pos_type = int(target.get("type", 0) or 0)
-            close_type = (mt5.ORDER_TYPE_SELL
-                          if pos_type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY)
-            price = float(tick.bid if pos_type == mt5.POSITION_TYPE_BUY else tick.ask)
-            volume = float(target.get("volume", 0.01) or 0.01)
-
-            for filling in filling_modes:
-                request = {
-                    "action":       mt5.TRADE_ACTION_DEAL,
-                    "position":     int(target.get("ticket")),
-                    "symbol":       self.symbol,
-                    "volume":       volume,
-                    "type":         close_type,
-                    "price":        price,
-                    "deviation":    int(self.rules.get("deviation", 50) or 50),
-                    "magic":        MAGIC,
-                    "comment":      "TradeSmart Risk Close",
-                    "type_time":    mt5.ORDER_TIME_GTC,
-                    "type_filling": filling,
-                }
-                result = mt5.order_send(request)
-                if result is None:
-                    data = {"last_error": mt5.last_error()}
-                    retcode = None
-                    last_message = f"close order_send None: {data['last_error']}"
-                else:
-                    data = result._asdict() if hasattr(result, "_asdict") else dict(result)
-                    retcode = int(data.get("retcode", 0) or 0)
-                    last_message = data.get("comment") or data.get("message") or f"Close retcode {retcode}"
-
-                attempts.append({"attempt": attempt, "filling": filling, "retcode": retcode, "message": last_message})
-
-                if retcode in success_codes:
-                    return {
-                        "ok": True,
-                        "message": f"Closed position {ticket} for risk.",
-                        "retcode": retcode,
-                        "request": request,
-                        "result": data,
-                        "attempts": attempts,
-                    }
-
-            time.sleep(0.20)
-
-        return {
-            "ok": False,
-            "message": f"Risk close failed for {ticket}: {last_message}",
-            "retcode": attempts[-1].get("retcode") if attempts else None,
-            "attempts": attempts,
-        }
-
-    # ──────────────────────────────────────────
-    #  DRAW + DEBUG HELPERS
-    # ──────────────────────────────────────────
-
-    def _write_draws(self, ctx: Dict[str, Any],
-                     decision: Optional[Dict[str, Any]]) -> int:
-        if self._strat_mod and hasattr(self._strat_mod, "write_draws"):
-            try:
-                return self._strat_mod.write_draws(ctx, decision)
-            except Exception:
-                pass
-        return 0
-
-    def _write_debug(self, ctx: Dict[str, Any],
-                     result: Dict[str, Any], cmd_count: int) -> None:
-        if self._strat_mod and hasattr(self._strat_mod, "write_debug"):
-            try:
-                self._strat_mod.write_debug(ctx, result, cmd_count)
-            except Exception:
-                pass
-
-    # ──────────────────────────────────────────
-    #  MAIN CYCLE
-    # ──────────────────────────────────────────
-
-    def run_cycle(self, execution_enabled: bool = False) -> Dict[str, Any]:
-        ok, message, account = self._connect()
-        if not ok:
-            return {"ok": False, "phase": "connect", "event": "Connection Failed",
-                    "message": message, "thinking": message}
-
-        mt5, _ = self._mt5()
-
+        check_data = None
         try:
-            ready, ready_msg = self._symbol_ready(mt5)
-            positions        = self._positions(mt5)
-            snapshot         = self._account_snapshot(account or {}, positions)
-            rates_multi      = self._rates_multi(mt5)
-            m1               = rates_multi.get("M1", [])
-            last_closed_m1   = m1[-2] if len(m1) >= 2 else {}
-            neutral_inputs   = self._load_neutral_inputs()
+            check = mt5.order_check(req)
+            check_data = check._asdict() if hasattr(check, "_asdict") else {"raw": str(check)}
+            check_retcode = check_data.get("retcode")
+            # 0 is common for successful order_check; some brokers return DONE/PLACED constants.
+            valid_check_codes = {0, getattr(mt5, "TRADE_RETCODE_DONE", 10009), getattr(mt5, "TRADE_RETCODE_PLACED", 10008)}
+            if check_retcode not in valid_check_codes:
+                return {
+                    "ok": False,
+                    "message": f"Trade blocked by MT5 pre-check: retcode {check_retcode}",
+                    "request": req,
+                    "order_check": check_data,
+                    "stops_adjusted": adjusted,
+                    "min_stop_distance": round(min_stop, digits),
+                }
+        except Exception as exc:
+            check_data = {"warning": f"order_check unavailable: {exc}"}
 
-            ctx: Dict[str, Any] = {
-                "symbol":     self.symbol,
-                "rates":      m1,
-                "rates_m1":   m1,
-                "rates_m5":   rates_multi.get("M5",  []),
-                "rates_m15":  rates_multi.get("M15", []),
-                "rates_h1":   rates_multi.get("H1",  []),
-                "timeframes": rates_multi,
-                "positions":  positions,
-                "rules":      self.rules,
-                "inputs":     neutral_inputs,
-                "ai_instructions": neutral_inputs.get("custom_rules",
-                                                       self.rules.get("ai_instructions", "")),
-                "now": datetime.now(timezone.utc).isoformat(),
-            }
+        res = mt5.order_send(req)
+        data = res._asdict() if hasattr(res, "_asdict") else {"raw": str(res)}
+        retcode = data.get("retcode")
+        data["ok"] = retcode in (getattr(mt5, "TRADE_RETCODE_DONE", 10009), getattr(mt5, "TRADE_RETCODE_PLACED", 10008))
+        data.setdefault("message", f"retcode {retcode}")
+        data["request"] = req
+        data["order_check"] = check_data
+        data["stops_adjusted"] = adjusted
+        data["min_stop_distance"] = round(min_stop, digits)
+        if retcode == 10016:
+            data["message"] = f"retcode 10016 invalid stops blocked by broker. Sent price {price}, SL {sl}, TP {tp}, min distance {round(min_stop, digits)}."
+        return data
 
-            result: Dict[str, Any] = {
-                "ok":                   True,
-                "phase":                "scan",
-                "event":                "Strategy Scan",
-                "message":              "TradeSmart scanned XAUUSD.",
-                "thinking":             "Reading M1/M5/M15/H1, account, positions, strategy.",
-                "symbol":               self.symbol,
-                "mode":                 self.rules.get("mode", self.profile.get("mode", "Demo")),
-                "account":              snapshot,
-                "last_closed_m1":       last_closed_m1,
-                "open_positions_count": len(positions),
-                "positions":            positions,
-                "position_summary":     self._position_summary(positions, m1),
-                "decision":             {"action": "NONE", "symbol": self.symbol,
-                                         "reason": "No decision yet."},
-                "strategy":             None,
-                "strategy_info":        {},
-                "inputs":               neutral_inputs,
-                "execution_enabled":    execution_enabled,
-                "order_sent":           False,
-                "order_result":         None,
-                "risk_blocks":          [],
-                "max_daily_loss_reached": False,
-            }
 
-            if not ready:
-                result.update({"event": "Symbol Blocked",
-                                "message": ready_msg, "thinking": ready_msg})
-                self._write_draws(ctx, None)
-                return result
+    def _market_status(self) -> Tuple[bool, str, str]:
+        """Gold/XAUUSD daily maintenance guard in Eastern time.
 
-            # Persistent risk session state. This is required because realized
-            # losses disappear from positions after a trade closes. The UI/worker
-            # passes a new risk_session_id when the user manually turns the agent
-            # back on; that resets the lock and starts a fresh loss counter.
-            state = self._load_state()
-            key = self._state_key()
-            account_state = state.setdefault(key, {})
+        Prevents sending market orders during the common 5:00 PM-6:00 PM ET
+        rollover window and weekend closures, which avoids MT5 retcode 10016
+        from trying to execute while the market is closed.
+        """
+        et = datetime.now(tz=MARKET_TZ)
+        wd = et.weekday()
+        mins = et.hour * 60 + et.minute
+        if wd == 5:
+            return False, "Weekend market closure. Gold reopens Sunday 6:00 PM Eastern.", et.isoformat(timespec="seconds")
+        if wd == 6 and mins < 18 * 60:
+            return False, "Weekend market closure. Gold reopens Sunday 6:00 PM Eastern.", et.isoformat(timespec="seconds")
+        if wd == 4 and mins >= 17 * 60:
+            return False, "Friday market closure after 5:00 PM Eastern.", et.isoformat(timespec="seconds")
+        if 17 * 60 <= mins < 18 * 60:
+            return False, "Daily gold rollover: market is closed from 5:00 PM to 6:00 PM Eastern.", et.isoformat(timespec="seconds")
+        return True, "Market open for TradeSmart execution.", et.isoformat(timespec="seconds")
 
-            incoming_session_id = str(self.rules.get("risk_session_id") or "").strip()
-            current_session_id = str(account_state.get("risk_session_id") or "").strip()
 
-            if incoming_session_id and incoming_session_id != current_session_id:
-                account_state.clear()
-                account_state["risk_session_id"] = incoming_session_id
-                account_state["risk_session_start_epoch"] = datetime.now(timezone.utc).timestamp()
-                account_state["risk_session_start_time"] = datetime.now(timezone.utc).isoformat()
-                account_state["risk_start_balance"] = snapshot.get("balance")
-                account_state["risk_start_equity"] = snapshot.get("equity")
-                account_state["risk_locked"] = False
-                account_state["risk_lock_reason"] = ""
+    def _fresh_account_state(self, mt5: Any, account: Dict[str, Any], closed_pl_fallback: float | None = None) -> Tuple[List[Dict[str, Any]], float, float, Dict[str, Any]]:
+        """Refresh positions and P/L after closes/orders.
 
-            if not account_state.get("risk_session_start_epoch"):
-                account_state["risk_session_id"] = incoming_session_id or current_session_id or f"session-{datetime.now(timezone.utc).timestamp()}"
-                account_state["risk_session_start_epoch"] = datetime.now(timezone.utc).timestamp()
-                account_state["risk_session_start_time"] = datetime.now(timezone.utc).isoformat()
-                account_state["risk_start_balance"] = snapshot.get("balance")
-                account_state["risk_start_equity"] = snapshot.get("equity")
-                account_state["risk_locked"] = False
-                account_state["risk_lock_reason"] = ""
+        MT5 position/deal state can change between cycles or immediately after a
+        close. This keeps the page's 3-second output accurate instead of showing
+        stale open trade amount "here and there".
+        """
+        positions = self._positions(mt5)
+        closed_pl = self._closed_pl_today(mt5)
+        if closed_pl == 0.0 and closed_pl_fallback is not None:
+            closed_pl = float(closed_pl_fallback or 0.0)
+        _, _, session_closed_pl = self._risk_session_pl(closed_pl)
+        return positions, closed_pl, session_closed_pl, self._account_snapshot(account or {}, positions, closed_pl, session_closed_pl)
 
-            account_state["risk_max_loss_amount"] = float(self.rules.get("max_daily_loss_amount", 0) or 0)
-            account_state["risk_last_checked_at"] = datetime.now(timezone.utc).isoformat()
-            self._save_state(state)
+    def _refresh_base_account(self, base: Dict[str, Any], mt5: Any, account: Dict[str, Any], closed_pl_fallback: float | None = None) -> Dict[str, Any]:
+        positions, closed_pl, session_closed_pl, account_snap = self._fresh_account_state(mt5, account, closed_pl_fallback)
+        base["positions"] = positions
+        base["open_positions_count"] = len(positions)
+        base["account"] = account_snap
+        base["session_closed_pl"] = round(session_closed_pl, 2)
+        base["floating_pl"] = account_snap.get("floating_pl", 0.0)
+        base["combined_session_pl"] = account_snap.get("combined_session_pl", 0.0)
+        return base
 
-            # Max daily loss / hard kill-switch
-            locked_already = bool(account_state.get("risk_locked"))
-            max_loss_hit, live_loss, loss_reason, risk_details = self._max_loss_hit(
-                snapshot,
-                positions,
-                mt5=mt5,
-                account_state=account_state,
-            )
 
-            if locked_already:
-                max_loss_hit = True
-                loss_reason = str(account_state.get("risk_lock_reason") or loss_reason or "previous max-loss lock")
-                live_loss = max(float(live_loss or 0), float(account_state.get("risk_locked_loss", 0) or 0))
+    # Public API
+    def connect_only(self) -> Dict[str, Any]:
+        ok, message, account, mt5 = self._connect()
+        if not ok:
+            return {"ok": False, "phase": "connect", "event": "Connection Failed", "message": message, "thinking": message, "mode": self.rules.get("mode", "Demo"), "symbol": self.symbol}
+        positions = self._positions(mt5) if mt5 is not None else []
+        closed_pl = self._closed_pl_today(mt5) if mt5 is not None else 0.0
+        _, _, session_closed = self._risk_session_pl(closed_pl)
+        return {"ok": True, "phase": "connect", "event": "Connected", "message": message, "thinking": message, "mode": self.rules.get("mode", "Demo"), "symbol": self.symbol, "user_key": self.user_key, "user_id": self.user_id, "output_scope": self.output_scope, "account": self._account_snapshot(account or {}, positions, closed_pl, session_closed), "open_positions_count": len(positions), "positions": positions}
 
-            result["risk_details"] = risk_details
-            # _max_loss_hit updates persistent loss memory every cycle. Save it
-            # even when the limit has not been reached yet, so closed trades are
-            # remembered on the very next tick/rerun.
-            self._save_state(state)
+    def disconnect_only(self) -> Dict[str, Any]:
+        self.disconnect()
+        return {"ok": True, "phase": "disconnect", "event": "Disconnected", "message": "MT5 connection closed. You can now switch Demo/Live safely.", "thinking": "Disconnected from MT5.", "mode": self.rules.get("mode", "Demo"), "symbol": self.symbol, "agent_off": True, "decision": {"action": "OFF", "reason": "Disconnected."}}
 
-            if max_loss_hit:
-                account_state["risk_locked"] = True
-                account_state["risk_locked_loss"] = round(float(live_loss), 2)
-                account_state["risk_lock_reason"] = loss_reason
-                account_state["risk_locked_at"] = datetime.now(timezone.utc).isoformat()
-                self._save_state(state)
-
-                result.update({
-                    "max_daily_loss_reached": True,
-                    "risk_lock_reason": loss_reason,
-                    "event":   "Max Loss Reached",
-                    "message": f"Max loss limit reached by {loss_reason}: ${live_loss}. Agent stopped and tracked trades are being closed.",
-                    "thinking": f"Risk lock: {loss_reason} ${live_loss}. Realized/open losses are counted together for this session. No new trades until the agent is manually turned back on.",
-                })
-                result["risk_blocks"].append(f"Max Loss ({loss_reason}): ${live_loss}")
-                closes = []
-                if execution_enabled and positions:
-                    for pos in positions:
-                        ticket = pos.get("ticket")
-                        if ticket not in (None, ""):
-                            closes.append(self._close_position(mt5, ticket))
-
-                    # Re-read positions after close attempts so the UI/log reflects
-                    # what is still open, if anything failed to close.
-                    positions = self._positions(mt5)
-                    snapshot = self._account_snapshot(account or {}, positions)
-                    result["positions"] = positions
-                    result["position_summary"] = self._position_summary(positions, m1)
-                    result["open_positions_count"] = len(positions)
-                    result["account"] = snapshot
-
-                result["order_result"] = closes
-                result["order_sent"]   = any(isinstance(c, dict) and c.get("ok") for c in closes)
-                result["closed_for_risk"] = closes
-                self._write_draws(ctx, result)
-                return result
-
-            # Get signal
-            signal, info = self._strategy_signal(rates_multi, positions, neutral_inputs)
-            result["decision"]      = asdict(signal)
-            result["strategy"]      = info.get("strategy")
-            result["strategy_info"] = info
-            thoughts = info.get("thoughts") or []
-            result["thinking"] = " | ".join(thoughts[-4:]) or signal.reason
-            result["message"]  = signal.reason or result["message"]
-
-            if info.get("loader_error"):
-                result["strategy_loader_note"] = info.get("loader_error")
-
-            # Build draw payload
-            raw_decision = dict(info.get("_signal_data") or {})
-            raw_decision.update({"action": signal.action, "reason": signal.reason,
-                                  "sl": signal.sl, "tp": signal.tp})
-
-            # Write draws every cycle
-            cmd_count = self._write_draws(ctx, raw_decision)
-            self._write_debug(ctx, raw_decision, cmd_count)
-            result["draw_command_count"] = cmd_count
-
-            # state/account_state already loaded above for persistent risk tracking.
-            # ── SCAN — just display status ─────────
-            if signal.action == "SCAN":
-                result["event"]   = "Scanning"
-                result["message"] = signal.reason
-                return result
-
-            # ── HOLD ──────────────────────────────
-            if signal.action == "HOLD":
-                result["event"]   = "Tracking" if positions else "Scanning"
-                result["message"] = signal.reason
-                return result
-
-            # ── CLOSE ─────────────────────────────
-            if signal.action == "CLOSE" and signal.close_ticket:
-                result["event"] = "Exit Signal"
-                if execution_enabled:
-                    cr = self._close_position(mt5, signal.close_ticket)
-                    result.update({"order_result": cr, "order_sent": bool(cr.get("ok")),
-                                   "message": cr.get("message", signal.reason)})
-                    if cr.get("ok"):
-                        account_state["last_exit_time"]   = datetime.now(timezone.utc).isoformat()
-                        account_state["last_exit_ticket"] = signal.close_ticket
-                        self._save_state(state)
-                return result
-
-            # ── BUY / SELL ────────────────────────
-            if signal.action not in ("BUY", "SELL"):
-                result["event"] = "Strategy Scan"
-                return result
-
-            # Max open trades
-            max_open = int(self.rules.get("max_open_trades", 1) or 1)
-            if len(positions) >= max_open:
-                result.update({"event": "Risk Blocked",
-                                "message": f"Max open trades {len(positions)}/{max_open}.",
-                                "thinking": "Waiting for open trade to close."})
-                return result
-
-            # ── DEDUP: use entry_candle_time from strategy signal ──
-            # This is the TIME of the actual trigger candle, NOT the last closed M1.
-            # Prevents the same candle firing twice while allowing the very next
-            # different candle to fire immediately.
-            trigger_ct    = int(signal.entry_candle_time or 0)
-            last_entry_ct = int(account_state.get("last_entry_candle_time", 0) or 0)
-
-            if trigger_ct and trigger_ct == last_entry_ct:
-                result.update({"event": "Tracking",
-                                "message": "Trigger candle already processed — waiting for next setup.",
-                                "thinking": "Dedup: same trigger candle time seen before."})
-                return result
-
-            if not execution_enabled:
-                result.update({"event": "Preview",
-                                "message": f"{signal.action} setup — execution is off."})
-                return result
-
-            # Fire the order
-            self._mark_entry_attempt(account_state, signal)
-            self._save_state(state)
-
-            order_result = self._send_order(mt5, signal)
-            result.update({
-                "event":        "Order Sent" if order_result.get("ok") else "Order Failed",
-                "order_sent":   bool(order_result.get("ok")),
-                "order_result": order_result,
-                "message":      order_result.get("message", signal.reason),
+    def run_cycle(self, execution_enabled: bool = True) -> Dict[str, Any]:
+        ok, message, account, mt5 = self._connect()
+        mode = self.rules.get("mode", self.profile.get("mode", "Demo"))
+        if not ok or mt5 is None:
+            return {"ok": False, "phase": "connect", "event": "Connection Failed", "message": message, "thinking": message, "mode": mode, "symbol": self.symbol, "user_key": self.user_key, "user_id": self.user_id, "output_scope": self.output_scope, "decision": {"action": "NONE", "reason": message}}
+        rates = self._rates_multi(mt5)
+        positions = self._positions(mt5)
+        closed_pl = self._closed_pl_today(mt5)
+        risk_session_id, risk_baseline_closed_pl, session_closed_pl = self._risk_session_pl(closed_pl)
+        account_snap = self._account_snapshot(account or {}, positions, closed_pl, session_closed_pl)
+        floating = float(account_snap.get("floating_pl", 0) or 0)
+        combined_session_pl = session_closed_pl + floating
+        max_loss = abs(float(self.rules.get("max_daily_loss_amount") or self.rules.get("max_daily_loss") or 0))
+        market_open, market_reason, market_time_et = self._market_status()
+        base = {"ok": True, "phase": "scan", "event": "TradeSmart Agent Scan", "mode": mode, "symbol": self.symbol, "account": account_snap, "positions": positions, "open_positions_count": len(positions), "risk_session_id": risk_session_id, "risk_baseline_closed_pl": risk_baseline_closed_pl, "market_open": market_open, "market_reason": market_reason, "market_time_et": market_time_et, "last_closed_m1": (rates.get("M1", [])[-2] if len(rates.get("M1", [])) >= 2 else {}), "user_key": self.user_key, "user_id": self.user_id, "output_scope": self.output_scope}
+        if max_loss > 0 and combined_session_pl <= -max_loss:
+            close_results = self._close_all(mt5, positions, reason="TradeSmart max loss") if positions else []
+            try:
+                time.sleep(0.25)
+            except Exception:
+                pass
+            self._refresh_base_account(base, mt5, account or {}, closed_pl)
+            base.update({
+                "event": "Risk Stop",
+                "message": f"Max daily loss reached this session: floating + session closed P/L {combined_session_pl:.2f} <= -{max_loss:.2f}. Agent must stay OFF until manually toggled on.",
+                "thinking": "Risk stop hit for the current toggle-on session. Closing TradeSmart positions and stopping new entries.",
+                "decision": {"action": "CLOSE", "reason": "Max daily loss reached for current risk session."},
+                "close_results": close_results,
+                "max_daily_loss_reached": True,
+                "agent_off": True,
             })
+            return base
+        context = self._strategy_context(rates, positions, account_snap)
+        decision, strategy_info = self._choose_signal(context)
+        action = str(decision.get("action") or "SCAN").upper()
+        base.update({"decision": decision, "strategy": strategy_info.get("winner"), "strategy_info": strategy_info, "thinking": decision.get("reason"), "message": decision.get("reason")})
+        if not execution_enabled:
+            base["event"] = "Live Strategy Scan"
+            return base
+        if not market_open:
+            base["event"] = "Market Closed"
+            base["phase"] = "market_closed"
+            base["message"] = market_reason
+            base["thinking"] = "Execution blocked: " + market_reason
+            base["decision"] = {**decision, "action": "OFF", "reason": market_reason}
+            base["agent_off"] = True
+            return base
+        # Strategy close action is executed by the agent, but the decision came from strategy/risk inputs.
+        if action == "CLOSE":
+            ticket = decision.get("close_ticket")
+            targets = [p for p in positions if not ticket or str(p.get("ticket")) == str(ticket)]
+            base["close_results"] = self._close_all(mt5, targets, reason="TradeSmart strategy close")
+            try:
+                time.sleep(0.20)
+            except Exception:
+                pass
+            self._refresh_base_account(base, mt5, account or {}, closed_pl)
+            base["event"] = "Trade Close"
+            return base
+        if action in ("BUY", "SELL"):
+            if len(positions) >= self._max_open():
+                base["event"] = "Risk Gate"
+                base["message"] = f"Max open trades reached ({len(positions)}/{self._max_open()}). Strategy signal blocked."
+                base["thinking"] = base["message"]
+                return base
+            if not self._dedup_ok(decision):
+                base["event"] = "Duplicate Candle Block"
+                base["message"] = "Signal already executed on this trigger candle. Waiting for the next closed candle."
+                base["thinking"] = base["message"]
+                return base
+            order = self._send_order(mt5, decision)
+            base["order_result"] = order
+            base["order_sent"] = bool(order.get("ok"))
+            base["event"] = "Order Sent" if order.get("ok") else "Order Rejected"
+            if order.get("ok"):
+                self._mark_entry(decision)
+                try:
+                    time.sleep(0.20)
+                except Exception:
+                    pass
+            self._refresh_base_account(base, mt5, account or {}, closed_pl)
+        return base
 
-            if order_result.get("ok"):
-                now_dt = datetime.now(timezone.utc)
-                # Stamp trigger candle time — prevents same setup firing twice
-                if trigger_ct:
-                    account_state["last_entry_candle_time"] = trigger_ct
-                account_state["last_entry_action"] = signal.action
-                account_state["last_entry_time"]   = now_dt.isoformat()
-                account_state["last_entry_epoch"]  = now_dt.timestamp()
-                account_state["last_entry_sl"]     = signal.sl
-                account_state["last_entry_tp"]     = signal.tp
-                self._save_state(state)
-
-            return result
-
-        finally:
-            self.disconnect()
+    def snapshot_only(self) -> Dict[str, Any]:
+        return self.run_cycle(execution_enabled=False)
