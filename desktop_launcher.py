@@ -69,6 +69,96 @@ def _port_open() -> bool:
         return False
 
 
+def _pid_using_port() -> int | None:
+    """Return the Windows PID currently bound to HOST:PORT, when available."""
+    if os.name != "nt":
+        return None
+    try:
+        proc = subprocess.run(
+            ["netstat", "-ano", "-p", "tcp"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        needle_1 = f"{HOST}:{PORT}"
+        needle_2 = f"0.0.0.0:{PORT}"
+        for line in proc.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[0].upper().startswith("TCP"):
+                local_addr = parts[1]
+                state = parts[3].upper() if len(parts) >= 4 else ""
+                pid_text = parts[-1]
+                if (needle_1 in local_addr or needle_2 in local_addr) and state == "LISTENING":
+                    try:
+                        return int(pid_text)
+                    except Exception:
+                        return None
+    except Exception as exc:
+        log(f"Could not inspect port {PORT}: {exc}")
+    return None
+
+
+def _process_name(pid: int) -> str:
+    if os.name != "nt" or not pid:
+        return ""
+    try:
+        proc = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        line = (proc.stdout or "").strip().splitlines()[0]
+        return line.split(",", 1)[0].strip().strip('"')
+    except Exception:
+        return ""
+
+
+def _clear_desktop_streamlit_cache() -> None:
+    """Clear only this desktop app's Streamlit/runtime cache, never user data."""
+    cache_roots = [
+        USER_DATA_DIR / "streamlit_cache",
+        USER_DATA_DIR / ".streamlit",
+        USER_DATA_DIR / "runtime_cache",
+        Path(os.environ.get("TEMP", str(USER_DATA_DIR))) / f"{APP_NAME}_streamlit_cache",
+    ]
+    for root in cache_roots:
+        try:
+            if root.exists():
+                import shutil
+                shutil.rmtree(root, ignore_errors=True)
+                log(f"Cleared runtime cache: {root}")
+        except Exception as exc:
+            log(f"Could not clear runtime cache {root}: {exc}")
+
+
+def _stop_stale_port_owner() -> None:
+    """Prevent the browser from opening a stale local Streamlit server on 8501."""
+    if os.environ.get("DROPZ_SKIP_PORT_CLEANUP", "").lower() in {"1", "true", "yes", "on"}:
+        return
+    pid = _pid_using_port()
+    if not pid or pid == os.getpid():
+        return
+    name = _process_name(pid).lower()
+    safe_names = ("python", "python.exe", "streamlit", "dropzuniversalagent", "dropzuniversalagent.exe")
+    if any(part in name for part in safe_names) or not name:
+        try:
+            log(f"Port {PORT} is already in use by PID {pid} ({name or 'unknown'}). Stopping stale server.")
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/F", "/T"],
+                capture_output=True,
+                timeout=10,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            time.sleep(1.0)
+        except Exception as exc:
+            log(f"Could not stop stale port owner PID {pid}: {exc}")
+    else:
+        log(f"Port {PORT} is used by PID {pid} ({name}); not stopping unknown process.")
+
+
 def _find_app_file() -> Path:
     candidates = [
         BASE_DIR / "streamlit_app.py",
@@ -86,8 +176,20 @@ def _configure_runtime() -> None:
     os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
     os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
     os.environ.setdefault("STREAMLIT_GLOBAL_DEVELOPMENT_MODE", "false")
+    os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")
+    os.environ.setdefault("STREAMLIT_SERVER_RUN_ON_SAVE", "false")
+    os.environ.setdefault("STREAMLIT_SERVER_ADDRESS", HOST)
+    os.environ.setdefault("STREAMLIT_SERVER_PORT", str(PORT))
     os.environ.setdefault("DROPZ_DESKTOP_MODE", "true")
     os.environ.setdefault("DROPZ_USER_DATA_DIR", str(USER_DATA_DIR))
+    os.environ.setdefault("XDG_CACHE_HOME", str(USER_DATA_DIR / "streamlit_cache"))
+    os.environ.setdefault("STREAMLIT_CACHE_DIR", str(USER_DATA_DIR / "streamlit_cache"))
+
+    # Make frozen EXE imports resolve exactly like local `streamlit run` imports.
+    for path in (BASE_DIR, EXE_DIR, EXE_DIR / "_internal"):
+        path_text = str(path)
+        if path.exists() and path_text not in sys.path:
+            sys.path.insert(0, path_text)
 
     installed = _installed_info()
     os.environ.setdefault("DROPZ_APP_VERSION", str(installed.get("version") or "1.0.0"))
@@ -329,6 +431,11 @@ def _start_update_check_in_background() -> None:
             build_id = str(remote.get("signature") or remote.get("asset_id") or remote.get("asset_updated_at") or latest)
 
             log(f"Update available: {reason}. Starting updater in background.")
+            # Stable updater protocol:
+            # Keep this argument list simple and compatible forever.
+            # Extra metadata is encoded into build_id/update state, not passed as
+            # raw JSON flags, so older cached updater builds cannot crash on
+            # unknown command-line arguments.
             args = [
                 str(updater),
                 "--app-dir", str(EXE_DIR),
@@ -338,8 +445,7 @@ def _start_update_check_in_background() -> None:
                 "--download-url", download_url,
                 "--sha256", str(remote.get("sha256", "") or ""),
                 "--build-id", build_id,
-                    "--wait-pid", str(os.getpid()),
-                "--background",
+                "--wait-pid", str(os.getpid()),
             ]
             subprocess.Popen(args, cwd=str(EXE_DIR), close_fds=True)
         except Exception as exc:
@@ -361,8 +467,14 @@ def _run_streamlit_in_process(app_file: Path) -> None:
         "--server.headless", "true",
         "--browser.gatherUsageStats", "false",
         "--global.developmentMode", "false",
+        "--server.fileWatcherType", "none",
+        "--server.runOnSave", "false",
     ]
-    log("Starting Streamlit in-process.")
+    try:
+        os.chdir(str(app_file.parent))
+    except Exception:
+        pass
+    log(f"Starting Streamlit in-process at {URL} from {app_file.parent}.")
     stcli.main()
 
 
@@ -395,6 +507,10 @@ def main() -> int:
     try:
         app_file = _find_app_file()
         log(f"Using app file: {app_file}")
+
+        _configure_runtime()
+        _clear_desktop_streamlit_cache()
+        _stop_stale_port_owner()
 
         browser_thread = threading.Thread(target=_wait_and_open_browser, daemon=True)
         browser_thread.start()
