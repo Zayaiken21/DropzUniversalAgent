@@ -204,17 +204,37 @@ def rejection_trigger(m1: List[Dict[str, Any]], m5: List[Dict[str, Any]], side: 
 
 
 def rr_plan(side: str, entry: float, rng: Dict[str, Any], target: Optional[float] = None) -> Dict[str, float]:
+    """Always target 1:1 R:R with a tight, realistic SL.
+
+    SL is placed just beyond the first15 range boundary plus a small buffer.
+    TP is set equal to the risk distance (1:1) so the trade has a balanced
+    risk/reward that doesn't require price to travel too far.  This reduces
+    SL hits before profit because we are not over-targeting.
+    """
     high = f(rng.get("range_high"))
     low = f(rng.get("range_low"))
     size = max(high - low, 0.5)
-    buffer = max(0.35, min(2.0, size * 0.25))
+    # Buffer: tight — just enough to absorb spread and minor wick noise.
+    # Capped at 1.50 so XAUUSD SL is never more than a few dollars beyond the zone.
+    buffer = max(0.20, min(1.50, size * 0.15))
     if side == BUY:
         sl = round(low - buffer, 2)
-        tp = round(target if target and target > entry else max(high, entry + (entry - sl) * 2.0), 2)
+        risk = max(entry - sl, 0.50)
+        # 1:1 TP; if range high is closer than risk distance use range high,
+        # otherwise use exact 1:1 — never aim beyond 1:1 unless range structure allows it.
+        natural_tp = round(entry + risk, 2)
+        tp = round(min(natural_tp, high) if high > entry else natural_tp, 2)
+        # Ensure TP is at least at 1:1
+        if tp < entry + risk * 0.90:
+            tp = natural_tp
     else:
         sl = round(high + buffer, 2)
-        tp = round(target if target and target < entry else min(low, entry - (sl - entry) * 2.0), 2)
-    return {"sl": sl, "tp": tp, "risk": round(abs(entry - sl), 2), "reward": round(abs(tp - entry), 2)}
+        risk = max(sl - entry, 0.50)
+        natural_tp = round(entry - risk, 2)
+        tp = round(max(natural_tp, low) if low < entry else natural_tp, 2)
+        if tp > entry - risk * 0.90:
+            tp = natural_tp
+    return {"sl": sl, "tp": tp, "risk": round(risk, 2), "reward": round(abs(tp - entry), 2)}
 
 
 def draw_commands(data: Dict[str, Any], decision: Dict[str, Any]) -> List[Dict[str, Any]]:
