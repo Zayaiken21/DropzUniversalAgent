@@ -140,41 +140,16 @@ def extract_update(zip_path: Path, version: str, build_id: str = "") -> Path:
     return extract_dir
 
 
-def _write_state_files(src: Path, remote_state_json: str, version: str, build_id: str) -> None:
-    try:
-        state = json.loads(remote_state_json) if remote_state_json else {}
-        if not isinstance(state, dict):
-            state = {}
-    except Exception:
-        state = {}
-
-    state.setdefault("version", version)
-    state.setdefault("signature", build_id)
-    state.setdefault("build_id", build_id)
-    state["installed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-    for name in ("update_state.json", "installed_update_state.json"):
-        try:
-            (src / name).write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
-        except Exception:
-            pass
-
-    try:
-        local_state = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME / "update_state.json"
-        local_state.parent.mkdir(parents=True, exist_ok=True)
-        local_state.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
-    except Exception:
-        pass
-
-
-
-def _write_installed_state(src: Path, version: str, build_id: str = "", remote_state_json: str = "") -> None:
-    """Writes update metadata into the extracted update so it is copied into app_dir.
+def _write_installed_state(src: Path, version: str, build_id: str = "", remote_state_json: str = "") -> dict:
+    """Writes update metadata into the extracted update so it is copied into app_dir,
+    AND mirrors it to the local %LOCALAPPDATA% update_state.json used by the launcher's
+    same-version/changed-asset detection (_should_update in desktop_launcher.py).
 
     This lets future launches compare the installed build against GitHub asset metadata,
-    even when the visible version number stays the same.
+    even when the visible version number stays the same. Returns the final state dict
+    that was written, for logging/verification.
     """
-    state = {}
+    state: dict = {}
     if remote_state_json:
         try:
             parsed = json.loads(remote_state_json)
@@ -186,13 +161,25 @@ def _write_installed_state(src: Path, version: str, build_id: str = "", remote_s
     state.setdefault("version", version)
     state.setdefault("build_id", build_id)
     state.setdefault("signature", build_id)
-    state.setdefault("installed_at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    state["installed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
+    # Written into the update payload itself, so it ends up inside app_dir after robocopy.
     for name in ("installed_update_state.json", "update_state.json", "build_info.json"):
         try:
             (src / name).write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
         except Exception as exc:
-            log(f"Could not write {name}: {exc}")
+            log(f"Could not write {name} into update payload: {exc}")
+
+    # Also written directly to %LOCALAPPDATA%, since that's what the launcher reads
+    # immediately on next start (before re-deriving it from build_info.json next to the exe).
+    try:
+        local_state = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME / "update_state.json"
+        local_state.parent.mkdir(parents=True, exist_ok=True)
+        local_state.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    except Exception as exc:
+        log(f"Could not write local update_state.json: {exc}")
+
+    return state
 
 
 def _desktop_runtime_cache_roots() -> list[Path]:
@@ -215,13 +202,15 @@ def _clear_runtime_caches() -> None:
             log(f"Could not clear runtime cache {root}: {exc}")
 
 
-def _write_finish_cmd(src: Path, app_dir: Path, main_exe: Path, wait_pid: int) -> Path:
+def _write_finish_cmd(src: Path, app_dir: Path, main_exe: Path, wait_pid: int, expected_signature: str = "") -> Path:
     cmd_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME / "updates"
     cmd_dir.mkdir(parents=True, exist_ok=True)
     cmd = cmd_dir / "finish_update.cmd"
+    main_exe_name = main_exe.name
+    expected_sig_escaped = expected_signature.replace('"', "")
 
     script = f"""@echo off
-setlocal
+setlocal EnableDelayedExpansion
 title Dropz Universal Agent Update Installer
 echo Installing Dropz Universal Agent update...
 echo Please keep this window open.
@@ -240,21 +229,48 @@ rmdir /s /q "%LOCALAPPDATA%\\DropzUniversalAgent\\runtime_cache" 2>nul
 for /d %%D in ("%TEMP%\\DropzUniversalAgent_streamlit_cache*") do rmdir /s /q "%%D" 2>nul
 echo Copying update files...
 robocopy "{src}" "{app_dir}" /MIR /R:30 /W:1 /NFL /NDL /NP
-if %ERRORLEVEL% LEQ 7 (
-  echo Update installed successfully.
-  echo Starting Dropz Universal Agent...
-  start "" "{main_exe}"
-) else (
-  echo Update copy failed with code %ERRORLEVEL%.
+set RC_COPY=%ERRORLEVEL%
+if %RC_COPY% GTR 7 (
+  echo Update copy failed with code %RC_COPY%.
   pause
+  exit /b 1
 )
+echo Verifying installed update...
+if not exist "{app_dir}\\{main_exe_name}" (
+  echo Verification failed: {main_exe_name} not found after copy.
+  pause
+  exit /b 1
+)
+if not exist "{app_dir}\\build_info.json" (
+  echo Verification failed: build_info.json not found after copy.
+  pause
+  exit /b 1
+)
+findstr /C:"{expected_sig_escaped}" "{app_dir}\\build_info.json" >nul
+if errorlevel 1 if not "{expected_sig_escaped}"=="" (
+  echo Warning: build_info.json signature does not match expected update signature.
+  echo Expected to find: {expected_sig_escaped}
+  echo Continuing anyway, but please verify the installed version if issues occur.
+)
+echo Update installed and verified successfully.
+echo Starting Dropz Universal Agent...
+start "" "{main_exe}"
 endlocal
 """
     cmd.write_text(script, encoding="utf-8")
     return cmd
 
 
-def main() -> int:
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Builds the updater's argument parser.
+
+    IMPORTANT: each --flag must be added exactly once. A duplicate
+    add_argument() call for the same flag raises argparse.ArgumentError
+    at startup (before any try/except in main() can catch it), which
+    crashes the updater immediately. If you need to add a new flag,
+    add it once here; do not copy-paste an existing add_argument line
+    without removing/renaming it.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--app-dir", required=True)
     parser.add_argument("--main-exe", required=True)
@@ -266,8 +282,21 @@ def main() -> int:
     parser.add_argument("--remote-state-json", default="")
     parser.add_argument("--wait-pid", type=int, default=0)
     parser.add_argument("--background", action="store_true")
+    return parser
+
+
+def main() -> int:
+    # Building the parser can itself raise argparse.ArgumentError if a flag
+    # were ever declared twice (e.g. from a bad merge/edit). Catch that here
+    # too so a malformed updater build fails with a clear log line instead
+    # of an opaque PyInstaller traceback with no recovery.
+    try:
+        parser = _build_arg_parser()
+    except argparse.ArgumentError as exc:
+        log(f"FATAL: updater argument parser is misconfigured (duplicate flag?): {exc}")
+        return 1
+
     # Backward/forward compatibility: ignore unknown future launcher args instead of crashing.
-    # --remote-state-json is already declared above; parse_known_args keeps forward compatibility.
     args, unknown = parser.parse_known_args()
     if unknown:
         log(f"Ignoring unsupported updater arguments: {unknown}")
@@ -300,11 +329,12 @@ def main() -> int:
 
         zip_path = download_cached(args.download_url, args.latest_version, args.build_id, args.sha256)
         src = extract_update(zip_path, args.latest_version, args.build_id)
-        _write_state_files(src, args.remote_state_json, args.latest_version, args.build_id)
+        written_state = _write_installed_state(src, args.latest_version, args.build_id, args.remote_state_json)
+        log(f"Installed state recorded: version={written_state.get('version')} signature={written_state.get('signature')}")
         _clear_runtime_caches()
 
         log("Preparing safe installer handoff.")
-        finish_cmd = _write_finish_cmd(src, app_dir, main_exe, args.wait_pid)
+        finish_cmd = _write_finish_cmd(src, app_dir, main_exe, args.wait_pid, written_state.get("signature", ""))
 
         flags = 0
         if os.name == "nt":
@@ -320,6 +350,8 @@ def main() -> int:
                     shutil.copytree(item, dest)
                 else:
                     shutil.copy2(item, dest)
+            if not (app_dir / "build_info.json").exists():
+                log("Warning: build_info.json missing from app_dir after dev-mode copy.")
             subprocess.Popen([str(main_exe)], cwd=str(app_dir))
 
         log("Installer launched. Updater can close.")
