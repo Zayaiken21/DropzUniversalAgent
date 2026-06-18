@@ -138,6 +138,176 @@ def volume_profile(rows: List[Dict[str, Any]], bins: int = 24) -> Dict[str, Any]
     return {"valid": True, "poc": price(poc_i), "vah": price(high_i), "val": price(low_i), "high": round(hi, 2), "low": round(lo, 2)}
 
 
+def recent_atr(rows: List[Dict[str, Any]], n: int = 14) -> float:
+    """Average true-range-style volatility measure used to scale tolerances
+    instead of a single fixed-dollar tolerance, so the strategy adapts to
+    quiet vs fast XAUUSD conditions instead of using one tolerance for both.
+    """
+    sample = closed(rows)[-n:]
+    if len(sample) < 2:
+        return 0.0
+    trs = []
+    prev_close = f(sample[0].get("close"))
+    for c in sample[1:]:
+        hi, lo, cl = f(c.get("high")), f(c.get("low")), f(c.get("close"))
+        tr = max(hi - lo, abs(hi - prev_close), abs(lo - prev_close))
+        trs.append(tr)
+        prev_close = cl
+    return sum(trs) / len(trs) if trs else 0.0
+
+
+def liquidity_sweep(rows: List[Dict[str, Any]], lookback: int = 30, recent: int = 3) -> Dict[str, Any]:
+    """Detect a swing high/low sweep with rejection — the classic SMC
+    'stop hunt then reverse' event, not just a touch of an old extreme.
+
+    A sweep is valid when:
+      1) a prior swing high/low (from the lookback window, excluding the
+         most recent `recent` candles) is taken out, and
+      2) the candle that took it out closes back inside the prior range
+         (rejection), showing the breakout failed to hold.
+    """
+    sample = closed(rows)[-lookback:]
+    if len(sample) < recent + 5:
+        return {"valid": False}
+    history = sample[:-recent]
+    tail = sample[-recent:]
+    if not history or not tail:
+        return {"valid": False}
+    prior_high = max(f(c.get("high")) for c in history)
+    prior_low = min(f(c.get("low")) for c in history)
+    result = {"valid": True, "prior_high": round(prior_high, 2), "prior_low": round(prior_low, 2),
+               "swept_high": False, "swept_low": False, "sweep_time": 0}
+    for c in tail:
+        hi, lo, cl, op = f(c.get("high")), f(c.get("low")), f(c.get("close")), f(c.get("open"))
+        ts = int(c.get("time", 0) or 0)
+        if hi > prior_high and cl < prior_high:
+            result["swept_high"] = True
+            result["sweep_time"] = ts
+            result["sweep_price"] = round(hi, 2)
+        if lo < prior_low and cl > prior_low:
+            result["swept_low"] = True
+            result["sweep_time"] = ts
+            result["sweep_price"] = round(lo, 2)
+    return result
+
+
+def order_blocks(rows: List[Dict[str, Any]], lookback: int = 40, displacement_mult: float = 1.6) -> Dict[str, Any]:
+    """Find the most recent bullish and bearish order blocks: the last
+    opposing candle before a displacement move (a candle whose range is
+    meaningfully larger than the local average), which is the standard
+    SMC definition rather than just "any candle before a big move".
+    """
+    sample = closed(rows)[-lookback:]
+    out: Dict[str, Any] = {"bullish": None, "bearish": None}
+    if len(sample) < 6:
+        return out
+    ranges = [max(f(c.get("high")) - f(c.get("low")), 0.0) for c in sample]
+    avg_range = sum(ranges) / len(ranges) if ranges else 0.0
+    if avg_range <= 0:
+        return out
+    for i in range(1, len(sample)):
+        candle = sample[i]
+        rng = ranges[i]
+        if rng < avg_range * displacement_mult:
+            continue
+        op, cl = f(candle.get("open")), f(candle.get("close"))
+        prev = sample[i - 1]
+        p_op, p_cl, p_hi, p_lo = f(prev.get("open")), f(prev.get("close")), f(prev.get("high")), f(prev.get("low"))
+        ts = int(prev.get("time", 0) or 0)
+        if cl > op and p_cl < p_op:
+            out["bullish"] = {"high": round(p_hi, 2), "low": round(p_lo, 2), "time": ts}
+        elif cl < op and p_cl > p_op:
+            out["bearish"] = {"high": round(p_hi, 2), "low": round(p_lo, 2), "time": ts}
+    return out
+
+
+def fair_value_gaps(rows: List[Dict[str, Any]], lookback: int = 40, current_price: float = 0.0) -> Dict[str, Any]:
+    """Detect the most recent unfilled bullish/bearish fair value gaps using
+    the standard 3-candle imbalance definition: candle1.high < candle3.low
+    (bullish gap) or candle1.low > candle3.high (bearish gap). A gap is
+    treated as filled once price has traded back through it.
+    """
+    sample = closed(rows)[-lookback:]
+    out: Dict[str, Any] = {"bullish": None, "bearish": None}
+    if len(sample) < 3:
+        return out
+    for i in range(2, len(sample)):
+        c1, c3 = sample[i - 2], sample[i]
+        hi1, lo1 = f(c1.get("high")), f(c1.get("low"))
+        hi3, lo3 = f(c3.get("high")), f(c3.get("low"))
+        ts = int(sample[i - 1].get("time", 0) or 0)
+        if hi1 < lo3:
+            gap = {"top": round(lo3, 2), "bottom": round(hi1, 2), "time": ts}
+            filled = current_price > 0 and current_price <= gap["bottom"]
+            if not filled:
+                out["bullish"] = gap
+        elif lo1 > hi3:
+            gap = {"top": round(lo1, 2), "bottom": round(hi3, 2), "time": ts}
+            filled = current_price > 0 and current_price >= gap["top"]
+            if not filled:
+                out["bearish"] = gap
+    return out
+
+
+def session_range(m1: List[Dict[str, Any]], start_hour: int, end_hour: int, ref_ts: Optional[int] = None) -> Dict[str, Any]:
+    """Generalized UTC-hour session range builder (Asia/London/etc.) using
+    the same shape as first15_hour_range so draw_commands() can render any
+    number of session ranges with one loop instead of one hardcoded range.
+    Handles sessions that wrap past midnight (start_hour > end_hour).
+    """
+    if not m1:
+        return {"valid": False, "reason": "No M1 data."}
+    from datetime import datetime, timezone
+    ts = int(ref_ts if ref_ts is not None else (m1[-1].get("time") or time.time()))
+    day_start = ts - (ts % 86400)
+    win_start = day_start + start_hour * HOUR_SECONDS
+    win_end = day_start + end_hour * HOUR_SECONDS if end_hour > start_hour else day_start + 86400 + end_hour * HOUR_SECONDS
+    # If the window already fully passed today, use yesterday's window instead
+    # so a session range is always available rather than going stale at the
+    # very start of a new UTC day.
+    if ts >= win_end:
+        win_start -= 86400
+        win_end -= 86400
+    window = [c for c in m1 if win_start <= int(c.get("time", 0) or 0) < min(ts, win_end)]
+    if not window:
+        return {"valid": False, "reason": "No candles in session window yet.", "range_start": win_start, "range_end": win_end}
+    hi = max(f(c.get("high")) for c in window)
+    lo = min(f(c.get("low")) for c in window)
+    if hi <= lo:
+        return {"valid": False, "reason": "Session window has no size yet.", "range_start": win_start, "range_end": win_end}
+    return {
+        "valid": True,
+        "range_start": win_start,
+        "range_end": win_end,
+        "range_high": round(hi, 2),
+        "range_low": round(lo, 2),
+        "range_mid": round((hi + lo) / 2.0, 2),
+        "range_size": round(hi - lo, 2),
+        "complete": ts >= win_end,
+    }
+
+
+def previous_day_range(d1: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Previous completed daily candle's high/low/mid — a standard SMC
+    reference level (PDH/PDL) independent of the intraday session ranges.
+    """
+    sample = closed(d1)
+    if not sample:
+        return {"valid": False, "reason": "No D1 history."}
+    bar = sample[-1]
+    hi, lo = f(bar.get("high")), f(bar.get("low"))
+    if hi <= lo:
+        return {"valid": False, "reason": "Previous day candle has no size."}
+    return {
+        "valid": True,
+        "range_start": int(bar.get("time", 0) or 0),
+        "range_high": round(hi, 2),
+        "range_low": round(lo, 2),
+        "range_mid": round((hi + lo) / 2.0, 2),
+        "range_size": round(hi - lo, 2),
+    }
+
+
 def first15_hour_range(m1: List[Dict[str, Any]], m15: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not m1:
         return {"valid": False, "reason": "No M1 data."}
@@ -189,18 +359,32 @@ def rejection_trigger(m1: List[Dict[str, Any]], m5: List[Dict[str, Any]], side: 
     if not last1:
         return {"ok": False, "reason": "No closed M1 trigger."}
     op, cl, hi, lo = f(last1.get("open")), f(last1.get("close")), f(last1.get("high")), f(last1.get("low"))
+    body = abs(cl - op)
+    candle_range = max(hi - lo, 0.01)
+    # Displacement: the close needs to recover a meaningful share of the
+    # candle's own range away from the zone, not just barely close back
+    # over the line. This filters out weak one-tick reclaims that the old
+    # touch+reclaim check would have accepted.
     if side == BUY:
         touched = lo <= zone + tol
         reclaimed = cl >= zone - tol
+        recovery = (cl - lo) / candle_range if candle_range else 0.0
+        displaced = recovery >= 0.45
         candle_ok = cl >= op or abs(cl - op) <= max((hi - lo) * 0.25, 0.05)
         m5_stall = bool(last5) and f(last5.get("low")) <= zone + tol and f(last5.get("close")) >= zone - tol
     else:
         touched = hi >= zone - tol
         reclaimed = cl <= zone + tol
+        recovery = (hi - cl) / candle_range if candle_range else 0.0
+        displaced = recovery >= 0.45
         candle_ok = cl <= op or abs(cl - op) <= max((hi - lo) * 0.25, 0.05)
         m5_stall = bool(last5) and f(last5.get("high")) >= zone - tol and f(last5.get("close")) <= zone + tol
-    ok = touched and reclaimed and (candle_ok or m5_stall)
-    return {"ok": ok, "touched": touched, "reclaimed": reclaimed, "candle_ok": candle_ok, "m5_stall": m5_stall, "entry_candle_time": int(last1.get("time", 0) or 0)}
+    ok = touched and reclaimed and (candle_ok or m5_stall) and (displaced or m5_stall)
+    return {
+        "ok": ok, "touched": touched, "reclaimed": reclaimed, "candle_ok": candle_ok,
+        "m5_stall": m5_stall, "displaced": displaced, "recovery": round(recovery, 2),
+        "entry_candle_time": int(last1.get("time", 0) or 0),
+    }
 
 
 def rr_plan(side: str, entry: float, rng: Dict[str, Any], target: Optional[float] = None) -> Dict[str, float]:
@@ -254,6 +438,46 @@ def draw_commands(data: Dict[str, Any], decision: Dict[str, Any]) -> List[Dict[s
             {"type": "ray", "name": "TS_RANGE_MID", "time1": start, "price1": mid, "color": "yellow", "width": 1, "text": f"EQ {mid:.2f}"},
             {"type": "ray", "name": "TS_RANGE_LOW", "time1": start, "price1": low, "color": "green", "width": 2, "text": f"L {low:.2f}"},
         ]
+    # Best SMC ranges: Asia / London / previous-day, drawn as lighter boxes so
+    # the active first15/1H range above remains the visually dominant zone.
+    smc_range_style = (
+        ("asia_range", "TS_ASIA_RANGE", "aqua"),
+        ("london_range", "TS_LONDON_RANGE", "violet"),
+        ("prev_day_range", "TS_PDH_PDL", "white"),
+    )
+    for key, name, color in smc_range_style:
+        zone = data.get(key) or {}
+        if not zone.get("valid"):
+            continue
+        z_high, z_low = f(zone.get("range_high")), f(zone.get("range_low"))
+        z_start = int(zone.get("range_start", now - HOUR_SECONDS))
+        z_end = int(zone.get("range_end", now))
+        cmds.append({"type": "box", "name": name, "time1": z_start, "time2": z_end, "price1": z_high, "price2": z_low, "color": color, "text": key.replace("_", " ").upper()})
+        cmds.append({"type": "ray", "name": f"{name}_HIGH", "time1": z_start, "price1": z_high, "color": color, "width": 1, "text": f"{key.split('_')[0].upper()} H {z_high:.2f}"})
+        cmds.append({"type": "ray", "name": f"{name}_LOW", "time1": z_start, "price1": z_low, "color": color, "width": 1, "text": f"{key.split('_')[0].upper()} L {z_low:.2f}"})
+    # Liquidity sweep marker — shows where a stop-hunt swept a prior swing
+    # extreme and rejected back inside, the core SMC entry trigger event.
+    sweep = data.get("liquidity_sweep") or {}
+    if sweep.get("valid") and (sweep.get("swept_high") or sweep.get("swept_low")):
+        side_label = "SWEEP HIGH" if sweep.get("swept_high") else "SWEEP LOW"
+        sweep_color = "red" if sweep.get("swept_high") else "green"
+        cmds.append({
+            "type": "text", "name": "TS_LIQUIDITY_SWEEP",
+            "time": int(sweep.get("sweep_time", now)), "price": f(sweep.get("sweep_price")),
+            "color": sweep_color, "text": side_label,
+        })
+    # Order blocks — last opposing candle before a displacement move.
+    obs = data.get("order_blocks") or {}
+    for side_key, label, color in (("bullish", "TS_BULLISH_OB", "lime"), ("bearish", "TS_BEARISH_OB", "orange")):
+        ob = obs.get(side_key)
+        if ob:
+            cmds.append({"type": "box", "name": label, "time1": int(ob.get("time", now)), "time2": now, "price1": f(ob.get("high")), "price2": f(ob.get("low")), "color": color, "text": side_key.upper() + " OB"})
+    # Fair value gaps — unfilled 3-candle imbalances.
+    fvgs = data.get("fair_value_gaps") or {}
+    for side_key, label, color in (("bullish", "TS_BULLISH_FVG", "teal"), ("bearish", "TS_BEARISH_FVG", "purple")):
+        gap = fvgs.get(side_key)
+        if gap:
+            cmds.append({"type": "box", "name": label, "time1": int(gap.get("time", now)), "time2": now, "price1": f(gap.get("top")), "price2": f(gap.get("bottom")), "color": color, "text": side_key.upper() + " FVG"})
     if profile.get("valid"):
         for key, label, color in (("poc", "POC", "blue"), ("vah", "VAH", "orange"), ("val", "VAL", "cyan")):
             lv = f(profile.get(key))
@@ -286,17 +510,37 @@ class XAUUSDEventTriggerStrategy:
         tfs = context.get("timeframes") or {}
         m1, m5, m15 = tfs.get("M1", []), tfs.get("M5", []), tfs.get("M15", [])
         h1, h4, d1 = tfs.get("H1", []), tfs.get("H4", []), tfs.get("D1", [])
+        # Robustness guard: require enough M1/M15 history AND make sure the
+        # most recent M1 candle actually has real OHLC (not a zero/empty
+        # placeholder row), which previously could slip through and corrupt
+        # tolerance/score math downstream.
         if len(m1) < 20 or len(m15) < 2:
             return self._result(SCAN, 0.0, "Waiting for M1/M15 history.", {}, context)
-        price = f(m1[-1].get("close"))
+        last_m1 = m1[-1] or {}
+        if f(last_m1.get("high")) <= 0 or f(last_m1.get("low")) <= 0 or f(last_m1.get("high")) < f(last_m1.get("low")):
+            return self._result(SCAN, 0.0, "Latest M1 candle data looks invalid; skipping this cycle.", {}, context)
+        price = f(last_m1.get("close"))
+        if price <= 0:
+            return self._result(SCAN, 0.0, "Latest price is non-positive; skipping this cycle.", {}, context)
         rng = first15_hour_range(m1, m15)
-        session = session_name(int(m1[-1].get("time", time.time()) or time.time()))
-        hour_start = int((rng or {}).get("range_start", floor_1h(int(m1[-1].get("time", time.time())))))
+        ref_ts = int(last_m1.get("time", time.time()) or time.time())
+        session = session_name(ref_ts)
+        hour_start = int((rng or {}).get("range_start", floor_1h(ref_ts)))
         hour_m1 = [c for c in m1 if hour_start <= int(c.get("time", 0) or 0) < hour_start + HOUR_SECONDS]
         profile = volume_profile(hour_m1 or closed(m1)[-80:])
+        # Best SMC ranges: Asia (00:00-07:00 UTC), London (07:00-12:00 UTC),
+        # and the previous completed daily candle, all computed alongside
+        # the existing first15/1H range rather than replacing it.
+        asia_rng = session_range(m1, 0, 7, ref_ts)
+        london_rng = session_range(m1, 7, 12, ref_ts)
+        pdr = previous_day_range(d1)
+        atr_m1 = recent_atr(m1, 14)
         data = {
             "price": round(price, 2),
             "range": rng,
+            "asia_range": asia_rng,
+            "london_range": london_rng,
+            "prev_day_range": pdr,
             "session": session,
             "d1_context": wick_targets(d1, price, 20),
             "h4_context": wick_targets(h4, price, 20),
@@ -304,11 +548,19 @@ class XAUUSDEventTriggerStrategy:
             "volume_profile": profile,
             "volume_ratio_m1": volume_ratio(m1),
             "volume_ratio_m5": volume_ratio(m5),
+            "atr_m1": round(atr_m1, 2),
+            "liquidity_sweep": liquidity_sweep(m1),
+            "order_blocks": order_blocks(m1),
+            "fair_value_gaps": fair_value_gaps(m1, current_price=price),
         }
         if not rng.get("valid"):
             return self._result(SCAN, 0.0, f"Building hourly first15 range: {rng.get('reason')}", data, context)
         high, low, mid, size = f(rng.get("range_high")), f(rng.get("range_low")), f(rng.get("range_mid")), f(rng.get("range_size"))
-        tol = max(0.35, size * 0.22)
+        # Tolerance now scales with recent ATR as well as range size, so a
+        # quiet overnight range and a fast NY session don't share one fixed
+        # 0.35 floor that was either too tight or too loose depending on
+        # conditions.
+        tol = max(0.35, size * 0.22, atr_m1 * 0.35)
         location = "DISCOUNT" if price <= mid else "PREMIUM"
         data["location"] = location
         d1c, h4c, h1c = data["d1_context"], data["h4_context"], data["h1_context"]
@@ -320,9 +572,34 @@ class XAUUSDEventTriggerStrategy:
         vol_ok = data["volume_ratio_m1"] >= 0.45 or data["volume_ratio_m5"] >= 0.45
         profile_buy_ok = not profile.get("valid") or price <= f(profile.get("poc"), mid) or low <= f(profile.get("val"), low) + tol
         profile_sell_ok = not profile.get("valid") or price >= f(profile.get("poc"), mid) or high >= f(profile.get("vah"), high) - tol
-        # Event triggers: premium/discount first, then trigger, then soft MTF vote.
-        buy_score = 0.20 + (0.22 if location == "DISCOUNT" else 0.04) + (0.25 if buy_trigger["ok"] else 0.0) + (0.10 if vol_ok else 0.0) + (0.10 if profile_buy_ok else 0.0) + min(0.18, bull_votes * 0.06) + session["quality"] * 0.05
-        sell_score = 0.20 + (0.22 if location == "PREMIUM" else 0.04) + (0.25 if sell_trigger["ok"] else 0.0) + (0.10 if vol_ok else 0.0) + (0.10 if profile_sell_ok else 0.0) + min(0.18, bear_votes * 0.06) + session["quality"] * 0.05
+        # SMC confluence: a real liquidity sweep of the low/high, a bullish/
+        # bearish order block sitting near the zone, or an unfilled FVG in
+        # the trade direction all add small score bonuses on top of the
+        # core first15 event trigger, rewarding setups with more real SMC
+        # evidence instead of treating every trigger as equally strong.
+        sweep = data["liquidity_sweep"]
+        obs = data["order_blocks"]
+        fvgs = data["fair_value_gaps"]
+        buy_sweep_ok = bool(sweep.get("valid") and sweep.get("swept_low"))
+        sell_sweep_ok = bool(sweep.get("valid") and sweep.get("swept_high"))
+        buy_ob_ok = bool(obs.get("bullish"))
+        sell_ob_ok = bool(obs.get("bearish"))
+        buy_fvg_ok = bool(fvgs.get("bullish"))
+        sell_fvg_ok = bool(fvgs.get("bearish"))
+        # Event triggers: premium/discount first, then trigger, then soft MTF vote,
+        # then SMC confluence (sweep/OB/FVG) as smaller additive bonuses.
+        buy_score = (
+            0.20 + (0.22 if location == "DISCOUNT" else 0.04) + (0.25 if buy_trigger["ok"] else 0.0)
+            + (0.10 if vol_ok else 0.0) + (0.10 if profile_buy_ok else 0.0) + min(0.18, bull_votes * 0.06)
+            + session["quality"] * 0.05
+            + (0.06 if buy_sweep_ok else 0.0) + (0.04 if buy_ob_ok else 0.0) + (0.04 if buy_fvg_ok else 0.0)
+        )
+        sell_score = (
+            0.20 + (0.22 if location == "PREMIUM" else 0.04) + (0.25 if sell_trigger["ok"] else 0.0)
+            + (0.10 if vol_ok else 0.0) + (0.10 if profile_sell_ok else 0.0) + min(0.18, bear_votes * 0.06)
+            + session["quality"] * 0.05
+            + (0.06 if sell_sweep_ok else 0.0) + (0.04 if sell_ob_ok else 0.0) + (0.04 if sell_fvg_ok else 0.0)
+        )
         min_score = f((context.get("risk") or context.get("rules") or {}).get("min_strategy_score"), 0.62)
         if buy_score >= min_score and buy_score >= sell_score:
             entry = round(price, 2)
